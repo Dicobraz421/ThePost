@@ -7,6 +7,7 @@ import { Button, Form, Input, Modal, Popconfirm, Select, Space, Spin, Switch, Ta
 import { type ReactNode, useState } from "react";
 
 import type { Schemas } from "../api/client";
+import { useOrgs } from "../components/orgs";
 import { PolicyForm } from "../components/policy-form";
 import { useReadOnly } from "../providers/access";
 
@@ -336,6 +337,7 @@ export function TransportPage() {
   const { data: roles } = usePermissions<Schemas["AdminRole"][]>({});
   const installation = Boolean(roles?.includes("installation_admin"));
   const readOnly = useReadOnly("transport");
+  const orgs = useOrgs();
   const domains = useCustom<{ version: number; domains: Domain[] }>({ url: `${ORG}/domains`, method: "get" });
   const sources = useCustom<{ version: number; sources: Source[] }>({ url: `${ORG}/sources`, method: "get" });
   const routes = useCustom<{ version: number; routes: Route[] }>({ url: `${ORG}/routes`, method: "get" });
@@ -368,7 +370,7 @@ export function TransportPage() {
       columns={
         <>
           {sourceColumns}
-          {!own && <Table.Column<Source> title="Владелец" render={(_, s) => s.tenant ?? "кластер"} />}
+          {!own && <Table.Column<Source> title="Владелец" render={(_, s) => (s.tenant ? orgs.name(s.tenant) : "кластер")} />}
         </>
       }
       fields={(editing) => <SourceFields editing={editing} cluster={!own} />}
@@ -471,7 +473,7 @@ export function TransportPage() {
                 </Typography.Title>
                 <Table<Domain> dataSource={cluster.result.data?.domains} rowKey="id" pagination={false}>
                   {domainColumns}
-                  <Table.Column dataIndex="tenant" title="Организация" />
+                  <Table.Column<Domain> title="Организация" render={(_, d) => orgs.name(d.tenant)} />
                 </Table>
               </>
             ),

@@ -3,25 +3,23 @@ import type { AuthProvider } from "@refinedev/core";
 
 import { API, getOrg, loadSession, request, saveSession, type Schemas, setOrg, whoami } from "../api/client";
 
-/**
- * Ответ `GET /api/v1/session`: поставщик OIDC, если настроен. Операции в схеме узла пока нет —
- * форма ответа предложена консолью (см. «Решения для владельца» в PR console-01).
- */
-export type SessionInfo = { oidc?: { issuer: string; client_id: string; scope?: string } };
-export type LoginParams = { token: string } | { oidc: NonNullable<SessionInfo["oidc"]>; callback?: boolean };
+/** Способы входа узла (`GET /api/v1/session`): поставщик OIDC, если настроен. */
+export type SessionInfo = Schemas["SessionInfo"];
+type Oidc = Schemas["OidcLogin"];
+export type LoginParams = { token: string } | { oidc: Oidc; callback?: boolean };
 
 const redirectUri = () => `${location.origin}${import.meta.env.BASE_URL}login`;
 
-/** Способы входа узла; ошибка или отсутствие операции — только токен. */
+/** Способы входа узла; узел недоступен — вход только токеном (ошибка придёт при входе). */
 export async function sessionInfo(): Promise<SessionInfo> {
   try {
-    return (await request<SessionInfo>(`${API}/session`)).data ?? {};
+    return (await request<SessionInfo>(`${API}/session`)).data;
   } catch {
-    return {};
+    return { oidc: null };
   }
 }
 
-async function oidcManager(p: NonNullable<SessionInfo["oidc"]>) {
+async function oidcManager(p: Oidc) {
   const { UserManager, WebStorageStateStore } = await import("oidc-client-ts");
   return new UserManager({
     authority: p.issuer,

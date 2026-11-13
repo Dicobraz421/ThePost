@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+    "/api/v1/orgs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Организации, доступные вошедшему администратору: по областям его ролей среди организаций инсталляции (без модуля
+         *     «Мультитенантность» — только организация по умолчанию).
+         */
+        get: operations["list_orgs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/orgs/{org}": {
         parameters: {
             query?: never;
@@ -12,36 +32,7 @@ export interface paths {
             cookie?: never;
         };
         /** Организация и её политика. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Organization"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["get_org"];
         put?: never;
         post?: never;
         delete?: never;
@@ -62,110 +53,14 @@ export interface paths {
          *     имени входа (фильтр `prefix`); есть продолжение — заголовок `Link: <…&after=…>; rel="next"` (RFC 8288), нет
          *     заголовка — страница последняя. `login` вместе с параметрами списка — 400.
          */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`. */
-                    login: string | null;
-                    /** @description Список: имя входа начинается с префикса (без учёта регистра). */
-                    prefix: string | null;
-                    /** @description Список: продолжение после этого имени входа — `after` из ссылки `rel="next"` предыдущей страницы. */
-                    after: string | null;
-                    /** @description Список: размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`). */
-                    limit: number | null;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        /** @description Следующая страница списка: `<ссылка>; rel="next"`; нет — страница последняя */
-                        Link?: string;
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AccountInfo"][];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_accounts"];
         put?: never;
         /**
          * Создаёт локальную учётную запись (без каталога) в принятом домене организации. Имя занято — 409; домен адреса
          *     не принят организацией — 400; настройки транспорта не подключены — 503. Пароль — пароль приложения
          *     (`POST .../app-passwords`).
          */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["NewAccount"];
-                };
-            };
-            responses: {
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AccountInfo"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["create_account"];
         delete?: never;
         options?: never;
         head?: never;
@@ -180,44 +75,18 @@ export interface paths {
             cookie?: never;
         };
         /** Учётная запись: квота и политики ящика. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AccountInfo"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["get_account"];
         put?: never;
         post?: never;
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Изменяет локальную учётную запись: отображаемое имя и блокировка входа (`enabled: false` — вход запрещён).
+         *     Пустое тело (`{}`) — 422. У записи каталога (`external_id` задан) оба поля ведёт каталог: синхронизация
+         *     перезаписывает и имя, и признак блокировки, поэтому изменение — 409 с пояснением.
+         */
+        patch: operations["patch_account"];
         trace?: never;
     };
     "/api/v1/orgs/{org}/accounts/{account}/app-passwords": {
@@ -228,93 +97,10 @@ export interface paths {
             cookie?: never;
         };
         /** Пароли приложений учётной записи, включая отозванные. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AppPasswordInfo"][];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_app_passwords"];
         put?: never;
         /** Выпускает пароль; значение — только в этом ответе. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["NewAppPassword"];
-                };
-            };
-            responses: {
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["IssuedAppPassword"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description предел действующих паролей */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["issue"];
         delete?: never;
         options?: never;
         head?: never;
@@ -332,38 +118,26 @@ export interface paths {
         put?: never;
         post?: never;
         /** Отзывает пароль; повторный отзыв — не ошибка. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Идентификатор пароля */
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
+        delete: operations["revoke"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/audit-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
         };
+        /** Действующая политика аудита ящика (ящика, иначе организации, иначе по умолчанию). */
+        get: operations["get_audit_policy"];
+        /** Задаёт политику аудита ящика (приоритетнее политики организации). */
+        put: operations["put_audit_policy"];
+        post?: never;
+        /** Сбрасывает политику аудита ящика: действует политика организации. */
+        delete: operations["delete_audit_policy"];
         options?: never;
         head?: never;
         patch?: never;
@@ -378,42 +152,25 @@ export interface paths {
         };
         get?: never;
         /** Задаёт политику ящика (локальные атрибуты: квота, срок корзины, лимиты) целиком. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["PolicyBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["PolicyBody"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
+        put: operations["put_account_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/accounts/{account}/senders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
         };
+        /** Списки отправителей ящика. */
+        get: operations["get_senders"];
+        /** Заменяет списки отправителей ящика целиком; ответ — хранимый вид. */
+        put: operations["put_senders"];
         post?: never;
         delete?: never;
         options?: never;
@@ -431,44 +188,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Снимает активность со всех скриптов учётной записи. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["deactivate"];
         delete?: never;
         options?: never;
         head?: never;
@@ -483,46 +203,7 @@ export interface paths {
             cookie?: never;
         };
         /** Скрипты учётной записи. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Script"][];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_scripts"];
         put?: never;
         post?: never;
         delete?: never;
@@ -539,171 +220,12 @@ export interface paths {
             cookie?: never;
         };
         /** Скрипт с текстом. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Имя скрипта */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ScriptBody"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["read"];
         /** Создаёт или заменяет скрипт (активность сохраняется); текст проверяется до записи. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Имя скрипта (до 128 символов, без управляющих) */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["ScriptText"];
-                };
-            };
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description недопустимое имя */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description ошибки в тексте */
-                422: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ScriptProblem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description лимит числа скриптов или размера текста */
-                507: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["put"];
         post?: never;
         /** Удаляет скрипт; активный — 409 (сначала снять активность). */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Имя скрипта */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description скрипт активен */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        delete: operations["remove"];
         options?: never;
         head?: never;
         patch?: never;
@@ -719,46 +241,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Делает скрипт активным; прежний активный становится неактивным. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Имя скрипта */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["activate"];
         delete?: never;
         options?: never;
         head?: never;
@@ -773,42 +256,7 @@ export interface paths {
             cookie?: never;
         };
         /** Корзина ящика и действующий срок корзины. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Смещение от начала списка. */
-                    offset: number;
-                    /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                    limit: number | null;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["TrashPage"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_trash"];
         put?: never;
         post?: never;
         delete?: never;
@@ -825,38 +273,7 @@ export interface paths {
             cookie?: never;
         };
         /** Настройка `trash.purge` ящика: правило администратора, выбор пользователя, действующее значение. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["TrashPurgeInfo"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["trash_purge"];
         put?: never;
         post?: never;
         delete?: never;
@@ -873,42 +290,7 @@ export interface paths {
             cookie?: never;
         };
         /** Скрытые письма ящика («очистить корзину» с `hide`): пользователь их не видит, хранятся до конца срока корзины. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Смещение от начала списка. */
-                    offset: number;
-                    /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                    limit: number | null;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["TrashPage"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_hidden"];
         put?: never;
         post?: never;
         delete?: never;
@@ -930,40 +312,7 @@ export interface paths {
          * Восстанавливает скрытое (или видимое) письмо корзины в исходную папку (нет — во «Входящие»);
          *     письма нет в корзине — 404.
          */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Письмо (UUID) */
-                    message: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["RestoredMessage"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["restore_hidden"];
         delete?: never;
         options?: never;
         head?: never;
@@ -980,48 +329,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Восстанавливает письмо из корзины; письмо не в корзине — 400. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                    /** @description Письмо (UUID) */
-                    message: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["RestoredMessage"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["restore"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1036,99 +344,9 @@ export interface paths {
             cookie?: never;
         };
         /** Автоответ учётной записи; не задан — выключен. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["VacationBody"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["vacation"];
         /** Заменяет автоответ учётной записи целиком. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Учётная запись (UUID) */
-                    account: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["VacationBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["VacationBody"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["set_vacation"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1144,63 +362,47 @@ export interface paths {
             cookie?: never;
         };
         /** Журнал аудита организации. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Начало интервала (RFC 3339), включительно. */
-                    since: string | null;
-                    /** @description Конец интервала (RFC 3339), не включительно. */
-                    until: string | null;
-                    /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                    limit: number | null;
-                    /** @description Продолжение: `next` предыдущей страницы. */
-                    after: number | null;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AuditPage"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["search_audit"];
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/contacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Почтовые контакты организации. */
+        get: operations["list_contacts"];
+        put?: never;
+        /** Создаёт локальный почтовый контакт. */
+        post: operations["create_contact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/contacts/{contact}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Почтовый контакт. */
+        get: operations["get_contact"];
+        /** Заменяет локальный контакт целиком; контакт каталога — 409. */
+        put: operations["put_contact"];
+        post?: never;
+        /** Удаляет локальный контакт; контакт каталога — 409. */
+        delete: operations["delete_contact"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1214,60 +416,60 @@ export interface paths {
             cookie?: never;
         };
         /** Поиск в журнале доставки организации. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Отправитель конверта (точно, без учёта регистра ASCII). */
-                    sender: string | null;
-                    /** @description Один из получателей (точно, без учёта регистра ASCII). */
-                    recipient: string | null;
-                    /** @description Message-ID без угловых скобок (точно). */
-                    message_id: string | null;
-                    /** @description Начало интервала (RFC 3339), включительно. */
-                    since: string | null;
-                    /** @description Конец интервала (RFC 3339), не включительно. */
-                    until: string | null;
-                    /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                    limit: number | null;
-                    /** @description Продолжение: `next` предыдущей страницы с теми же условиями. */
-                    after: string | null;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["DeliveryResults"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["search_delivery"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/disabled-accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Отключённые ящики организации по сроку хранения. */
+        get: operations["list_disabled"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/disabled-accounts/{account}/attach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Подключает отключённый ящик к учётной записи `to`: ящик получает её вход и адрес, её запись удаляется. */
+        post: operations["attach_disabled"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/disabled-accounts/{account}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Восстанавливает отключённый ящик (действующий — без изменений). */
+        post: operations["restore_disabled"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1282,80 +484,10 @@ export interface paths {
             cookie?: never;
         };
         /** Группы организации. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["GroupInfo"][];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_groups"];
         put?: never;
         /** Создаёт группу (не из каталога). */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["NewGroup"];
-                };
-            };
-            responses: {
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["GroupInfo"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["create_group"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1370,134 +502,86 @@ export interface paths {
             cookie?: never;
         };
         /** Группа. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Группа (UUID) */
-                    group: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["GroupInfo"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["get_group"];
         put?: never;
         post?: never;
         /** Удаляет группу (не из каталога); письма её очереди модерации отклоняются с уведомлением. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Группа (UUID) */
-                    group: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        delete: operations["delete_group"];
         options?: never;
         head?: never;
         /** Изменяет группу: ограничения, модераторы, скрытие; имя, адрес и участники — только у групп не из каталога. */
-        patch: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Группа (UUID) */
-                    group: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["GroupPatch"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["GroupInfo"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
+        patch: operations["patch_group"];
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/groups/{group}/filter": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
         };
+        /** Фильтр динамической группы; группа не динамическая — 404. */
+        get: operations["get_filter"];
+        /** Задаёт фильтр состава группы рассылки (группа становится динамической); у группы есть статические участники — 409. */
+        put: operations["put_filter"];
+        post?: never;
+        /** Снимает фильтр: группа снова статическая; группа не динамическая — 404. */
+        delete: operations["delete_filter"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/groups/{group}/filter/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Текущий состав динамической группы (вычисляется по фильтру). */
+        get: operations["filter_members"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/mailbox-audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Выборка журнала аудита доступа к ящикам организации. */
+        get: operations["search_mailbox_audit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/mailbox-audit/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Задаёт политику аудита ящиков организации. */
+        put: operations["put_org_audit_policy"];
+        post?: never;
+        /** Сбрасывает политику аудита организации: действует политика по умолчанию (только действия не владельца). */
+        delete: operations["delete_org_audit_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/orgs/{org}/moderation": {
@@ -1508,40 +592,7 @@ export interface paths {
             cookie?: never;
         };
         /** Очередь модерации организации или группы. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Только письма группы (UUID). */
-                    group: string | null;
-                    /** @description Размер (по умолчанию и наибольший — из конфигурации). */
-                    limit: number | null;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["HeldInfo"][];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_held"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1560,52 +611,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Одобряет письмо: доставка участникам группы. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Письмо (UUID) */
-                    held: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["approve"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1622,56 +628,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Отклоняет письмо: уведомление отправителю с причиной. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Письмо (UUID) */
-                    held: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": components["schemas"]["Rejection"] | null;
-                };
-            };
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["reject"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1687,48 +644,7 @@ export interface paths {
         };
         get?: never;
         /** Задаёт политику организации целиком. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["PolicyBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["PolicyBody"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["put_org_policy"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1744,125 +660,46 @@ export interface paths {
             cookie?: never;
         };
         /** Скрипт организации; не задан — 404. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ScriptText"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["org_script"];
         /** Задаёт скрипт организации; текст проверяется до записи. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["ScriptText"];
-                };
-            };
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description ошибки в тексте */
-                422: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ScriptProblem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description лимит размера текста */
-                507: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["set_org_script"];
         post?: never;
         /** Удаляет скрипт организации; повторное удаление — не ошибка. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                204: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
+        delete: operations["remove_org_script"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/sync-hold": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
         };
+        /** Остановленная синхронизация каталога; нет остановки — 404. */
+        get: operations["get_sync_hold"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/sync-hold/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Подтверждает отключение учётных записей сверх порога: следующая синхронизация его выполнит. */
+        post: operations["approve_sync"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1876,89 +713,10 @@ export interface paths {
             cookie?: never;
         };
         /** Принятые домены организации и версия снимка кластера. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["DomainList"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_domains"];
         put?: never;
         /** Добавляет принятый домен (идентификатор выдаёт сервер). Имя занято — 409. */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["DomainBody"];
-                };
-            };
-            responses: {
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["DomainWritten"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия или имя занято */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["create_domain"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1974,120 +732,10 @@ export interface paths {
         };
         get?: never;
         /** Заменяет имя и вид принятого домена организации. Нет — 404, имя занято — 409. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Домен (UUID) */
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["DomainBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["DomainWritten"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия или имя занято */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["replace_domain"];
         post?: never;
         /** Удаляет принятый домен организации. Нет — 404. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Домен (UUID) */
-                    id: string;
-                    /** @description Версия снимка из последнего чтения. */
-                    version: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        delete: operations["delete_domain"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2101,99 +749,9 @@ export interface paths {
             cookie?: never;
         };
         /** Политика принятого домена и действующая политика (наложение организация → домен). Нет домена — 404. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Домен (UUID) */
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Policies"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["get_domain_policy"];
         /** Задаёт политику принятого домена целиком. Нет домена — 404. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Домен (UUID) */
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["PolicyBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["PolicyBody"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["put_domain_policy"];
         post?: never;
         delete?: never;
         options?: never;
@@ -2209,36 +767,7 @@ export interface paths {
             cookie?: never;
         };
         /** Политики доменов назначения организации и версия её снимка. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["RouteList"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_routes"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2256,112 +785,10 @@ export interface paths {
         };
         get?: never;
         /** Создаёт или заменяет политику домена назначения. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description `example.org`, `*.example.org` (поддомены) или `*` (все внешние) */
-                    pattern: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["RouteBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["put_route"];
         post?: never;
         /** Удаляет политику домена назначения. Нет — 404. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Шаблон */
-                    pattern: string;
-                    /** @description Версия снимка из последнего чтения. */
-                    version: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        delete: operations["delete_route"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2375,36 +802,7 @@ export interface paths {
             cookie?: never;
         };
         /** Доверенные источники организации и версия снимка кластера. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["SourceList"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["list_sources"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2422,112 +820,63 @@ export interface paths {
         };
         get?: never;
         /** Создаёт или заменяет доверенный источник организации. Имя занято другим владельцем — 409. */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Имя источника ([a-z0-9._-], до 64 символов) */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["SourceBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия или имя занято */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["put_org_source"];
         post?: never;
         /** Удаляет доверенный источник организации. Нет — 404. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Организация (UUID) */
-                    org: string;
-                    /** @description Имя источника */
-                    name: string;
-                    /** @description Версия снимка из последнего чтения. */
-                    version: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
+        delete: operations["delete_org_source"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/units": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
         };
+        /** Подразделения организации (дерево — по `parent`). */
+        get: operations["list_units"];
+        put?: never;
+        /** Создаёт подразделение. */
+        post: operations["create_unit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/units/{unit}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Заменяет локальное подразделение (название, вышестоящее); подразделение каталога — 409. */
+        put: operations["put_unit"];
+        post?: never;
+        /** Удаляет локальное подразделение; есть вложенные или подразделение каталога — 409. */
+        delete: operations["delete_unit"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/units/{unit}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Учётные записи подразделения по старшинству. */
+        get: operations["unit_members"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2540,47 +889,14 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа. */
+        get: operations["session_info"];
         put?: never;
         /**
          * Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
          *     первой проверкой; повтор, срок, отзыв — 401.
          */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AdminSession"];
-                    };
-                };
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        post: operations["exchange"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2595,41 +911,7 @@ export interface paths {
             cookie?: never;
         };
         /** Снимок уровня кластера: домены всех организаций, все источники. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ClusterView"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["cluster"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2647,124 +929,10 @@ export interface paths {
         };
         get?: never;
         /** Создаёт или заменяет источник кластера (общий шлюз; источник приложения — только у организации, 400). */
-        put: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Имя источника ([a-z0-9._-], до 64 символов) */
-                    name: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": components["schemas"]["SourceBody"];
-                };
-            };
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия или имя занято */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        put: operations["put_cluster_source"];
         post?: never;
         /** Удаляет источник кластера. Нет — 404. */
-        delete: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Имя источника */
-                    name: string;
-                    /** @description Версия снимка из последнего чтения. */
-                    version: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Written"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                /** @description устаревшая версия */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        delete: operations["delete_cluster_source"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2778,41 +946,7 @@ export interface paths {
             cookie?: never;
         };
         /** Текущий администратор и его роли. */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["WhoAmI"];
-                    };
-                };
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Problem"];
-                    };
-                };
-            };
-        };
+        get: operations["whoami"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2841,6 +975,13 @@ export interface components {
             login: string;
             /** @description Квота. */
             quota: components["schemas"]["QuotaInfo"];
+        };
+        /** @description Изменение учётной записи: заданные поля заменяются, отсутствующие — без изменений; хотя бы одно поле обязательно. */
+        AccountPatch: {
+            /** @description Отображаемое имя (непустое, одна строка); у записи каталога — 409. */
+            display_name?: string | null;
+            /** @description Вход разрешён; `false` — учётная запись заблокирована. У записи каталога — 409. */
+            enabled?: boolean | null;
         };
         /**
          * @description Роль администратора.
@@ -2882,7 +1023,13 @@ export interface components {
              */
             revoked_at?: string | null;
         };
-        /** @description Запись журнала с порядковым номером. */
+        /** @description Подключение отключённого ящика к учётной записи. */
+        AttachBody: {
+            existing?: components["schemas"]["ExistingMode"] | null;
+            /** @description Учётная запись, к которой подключается ящик (её запись удаляется, вход и адрес переходят к ящику). */
+            to: string;
+        };
+        /** @description Запись журнала с номером в ответе API. */
         AuditEntry: components["schemas"]["AuditRecord"] & {
             /**
              * Format: int64
@@ -2890,7 +1037,7 @@ export interface components {
              */
             seq: number;
         };
-        /** @description Страница журнала аудита. */
+        /** @description Страница журнала аудита в ответе API. */
         AuditPage: {
             /** @description Записи по возрастанию `seq`. */
             entries: components["schemas"]["AuditEntry"][];
@@ -2900,7 +1047,14 @@ export interface components {
              */
             next?: number | null;
         };
-        /** @description Запись журнала аудита. */
+        /** @description Политика аудита ящика. */
+        AuditPolicyBody: {
+            /** @description Записывать действия не владельца (представители, администраторы). */
+            non_owner: boolean;
+            /** @description Записываемые действия владельца: `delete`, `move`, `send`, `change_rules`, `change_forwarding`. */
+            owner: string[];
+        };
+        /** @description Запись журнала аудита в ответе API и в экспорте в SIEM ([`AdminAuditRecord`] контракта). */
         AuditRecord: {
             /** @description Учётная запись администратора. */
             actor: string;
@@ -2913,13 +1067,22 @@ export interface components {
              * @description Момент (UTC).
              */
             at: string;
+            /**
+             * Format: int64
+             * @description Доступ к содержимому писем (`include=subject`, [`crate::retention`], [`crate::groups`]): число писем, тема и
+             *     отправитель которых запрошены; `None` — запрос содержимое не отдаёт. Самих тем в записи нет.
+             */
+            content_messages?: number | null;
             /** @description Метод HTTP. */
             method: string;
             /** @description Путь запроса. */
             path: string;
-            /** @description Роли администратора на момент операции; пусто — ролей нет (отказ). */
-            roles: components["schemas"]["AdminRole"][];
-            /** @description Шаблон маршрута (`/api/v1/orgs/{org}/domains`); неизвестный маршрут — путь. */
+            /**
+             * @description Роли администратора на момент операции (`installation_admin`, `organization_admin`, `operator`,
+             *     `auditor`); пусто — ролей нет (отказ).
+             */
+            roles: string[];
+            /** @description Шаблон маршрута (`/api/v1/orgs/{org}/transport/domains`); неизвестный маршрут — путь. */
             route: string;
             /**
              * Format: int32
@@ -2940,6 +1103,40 @@ export interface components {
              * @description Версия снимка.
              */
             version: number;
+        };
+        /** @description Контакт без идентификатора: создание и замена целиком. */
+        ContactBody: {
+            /** @description Атрибуты (имя ASCII → значение). */
+            attributes?: {
+                [key: string]: string;
+            };
+            /** @description Отображаемое имя (1–255 символов без управляющих). */
+            display_name: string;
+            /** @description Внешний адрес; уникален в организации. */
+            email: string;
+            /** @description Группы рассылки организации. */
+            groups?: string[];
+            /** @description Скрыт из GAL. */
+            hidden_from_gal?: boolean;
+        };
+        /** @description Почтовый контакт. */
+        ContactInfo: {
+            /** @description Атрибуты адресной книги и фильтров. */
+            attributes: {
+                [key: string]: string;
+            };
+            /** @description Отображаемое имя. */
+            display_name: string;
+            /** @description Внешний адрес. */
+            email: string;
+            /** @description Идентификатор в каталоге; `null` — создан через API. */
+            external_id?: string | null;
+            /** @description Группы рассылки, в составе которых контакт. */
+            groups: string[];
+            /** @description Скрыт из GAL. */
+            hidden_from_gal: boolean;
+            /** @description Идентификатор. */
+            id: string;
         };
         /** @description Событие журнала доставки. */
         DeliveryEntry: {
@@ -2971,6 +1168,22 @@ export interface components {
             events: components["schemas"]["DeliveryEntry"][];
             /** @description `after` следующей страницы; `null` — записей больше нет. */
             next?: string | null;
+        };
+        /** @description Отключённый ящик. */
+        DisabledInfo: {
+            /** @description Отображаемое имя. */
+            display_name: string;
+            /** @description Идентификатор в каталоге. */
+            external_id?: string | null;
+            /** @description Учётная запись. */
+            id: string;
+            /** @description Имя входа. */
+            login: string;
+            /**
+             * Format: date-time
+             * @description Срок хранения: после него ящик удаляется окончательно.
+             */
+            until: string;
         };
         /** @description Принятый домен: создание или замена. */
         DomainBody: {
@@ -3007,6 +1220,28 @@ export interface components {
              */
             version: number;
         };
+        /** @description Состав динамической группы. */
+        DynamicMembers: {
+            /** @description Учётные записи. */
+            accounts: string[];
+            /** @description Почтовые контакты. */
+            contacts: string[];
+        };
+        /**
+         * @description Содержимое ящика учётной записи, к которой подключается отключённый ящик.
+         * @enum {string}
+         */
+        ExistingMode: "keep" | "delete";
+        /** @description Фильтр динамической группы. */
+        FilterBody: {
+            /** @description Включать почтовые контакты, подходящие под фильтр. */
+            contacts?: boolean;
+            /**
+             * @description Условие состава: `{"equals": {"attribute", "value"}}`, `{"prefix": {...}}`, `{"present": {"attribute"}}`,
+             *     `{"unit": {"unit", "subtree"}}`, `{"all": [...]}`, `{"any": [...]}`, `{"not": {...}}`.
+             */
+            filter: Record<string, never>;
+        };
         /** @description Группа рассылки. */
         GroupInfo: {
             /** @description Адрес рассылки; `null` — группа без почты (только вложенная). */
@@ -3018,13 +1253,28 @@ export interface components {
             /** @description Идентификатор. */
             id: string;
             /** @description Участники: `{"account": UUID}` или `{"group": UUID}`. */
-            members: Record<string, never>[];
+            members: components["schemas"]["GroupMember"][];
             /** @description Модераторы; непусто — письма не от модераторов ждут одобрения. */
             moderators: string[];
             /** @description Отображаемое имя. */
             name: string;
+            /**
+             * @description Имена по идентификатору (UUID) для `members`, `senders` и `moderators`: учётная запись — имя входа,
+             *     группа — её имя. Идентификатора нет в словаре — учётной записи или группы уже нет.
+             */
+            names: {
+                [key: string]: string;
+            };
             /** @description Кто может писать: `"anyone"`, `"internal"`, `{"only": {"accounts": [...], "groups": [...]}}`. */
-            senders: Record<string, never>;
+            senders: components["schemas"]["SenderRestriction"];
+        };
+        /** @description Участник группы: учётная запись или вложенная группа. */
+        GroupMember: {
+            /** @description Учётная запись организации (UUID). */
+            account: string;
+        } | {
+            /** @description Вложенная группа (UUID). */
+            group: string;
         };
         /** @description Изменение группы: заданные поля заменяются, отсутствующие — без изменений. */
         GroupPatch: {
@@ -3033,13 +1283,12 @@ export interface components {
             /** @description Скрыта из адресной книги. */
             hidden_from_gal?: boolean | null;
             /** @description Участники (не для групп каталога). */
-            members?: Record<string, never>[] | null;
+            members?: components["schemas"]["GroupMember"][] | null;
             /** @description Модераторы. */
             moderators?: string[] | null;
             /** @description Отображаемое имя (не для групп каталога). */
             name?: string | null;
-            /** @description Ограничение отправителей. */
-            senders?: Record<string, never> | null;
+            senders?: components["schemas"]["SenderRestriction"] | null;
         };
         /** @description Письмо в очереди модерации. */
         HeldInfo: {
@@ -3071,11 +1320,49 @@ export interface components {
             size: number;
             /** @description Источник задержки: `group` — модерируемая группа, `flow_rule` — правило потока почты. */
             source: string;
+            /**
+             * @description Тема письма (заголовок `Subject`, декодированный, обрезанный). Поле есть только с `include=subject`;
+             *     `null` — заголовка нет или письмо недоступно.
+             */
+            subject?: string | null;
         };
         /** @description Выпущенный пароль: значение показывается один раз. */
         IssuedAppPassword: components["schemas"]["AppPasswordInfo"] & {
             /** @description Значение пароля. */
             password: string;
+        };
+        /** @description Запись аудита ящика. */
+        MailboxAuditEntry: {
+            /** @description Ящик (учётная запись). */
+            account: string;
+            /** @description Действие. */
+            action: string;
+            /** @description Исполнитель. */
+            actor: string;
+            /** @description Учётная запись исполнителя; `null` — администратор. */
+            actor_account?: string | null;
+            /** @description Кто относительно ящика. */
+            actor_kind: string;
+            /**
+             * Format: date-time
+             * @description Момент действия.
+             */
+            at: string;
+            /** @description Клиент: протокол и адрес. */
+            client?: string | null;
+            /** @description Пояснение (Message-ID, адрес, право). */
+            detail?: string | null;
+            /** @description Папка. */
+            mailbox?: string | null;
+            /** @description Письмо. */
+            message?: string | null;
+        };
+        /** @description Страница журнала аудита ящиков. */
+        MailboxAuditPage: {
+            /** @description Записи по возрастанию времени. */
+            entries: components["schemas"]["MailboxAuditEntry"][];
+            /** @description Продолжение (`after` следующего запроса); `null` — записей больше нет. */
+            next?: string | null;
         };
         /** @description Новая локальная учётная запись (без каталога). */
         NewAccount: {
@@ -3096,13 +1383,22 @@ export interface components {
             /** @description Скрыта из адресной книги. */
             hidden_from_gal?: boolean;
             /** @description Участники. */
-            members?: Record<string, never>[];
+            members?: components["schemas"]["GroupMember"][];
             /** @description Модераторы. */
             moderators?: string[];
             /** @description Отображаемое имя. */
             name: string;
             /** @description Ограничение отправителей (по умолчанию — без ограничений). */
-            senders?: Record<string, never>;
+            senders?: components["schemas"]["SenderRestriction"];
+        };
+        /** @description Вход в консоль через поставщика OIDC: издатель из `auth.oidc`, клиент из `admin.oidc`. */
+        OidcLogin: {
+            /** @description Идентификатор публичного клиента консоли у поставщика. */
+            client_id: string;
+            /** @description Издатель (`iss`) — тот, чьи токены проверяет Admin API (`auth.oidc.issuer`). */
+            issuer: string;
+            /** @description Запрашиваемые области через пробел; нет — `openid`. */
+            scope?: string | null;
         };
         /** @description Организация. */
         Organization: components["schemas"]["Policies"] & {
@@ -3284,6 +1580,30 @@ export interface components {
             /** @description Текст (RFC 5228). */
             text: string;
         };
+        /** @description Списки отправителей ящика. */
+        SenderListBody: {
+            /** @description Заблокированные адреса и домены. */
+            blocked?: string[];
+            /** @description Надёжные адреса и домены (`user@example.com`, `example.com`). */
+            safe?: string[];
+        };
+        /**
+         * @description Кто может писать в группу: `"anyone"` — все, `"internal"` — учётные записи организации,
+         *     `{"only": {"accounts": [...], "groups": [...]}}` — перечисленные учётные записи и участники групп.
+         */
+        SenderRestriction: "anyone" | "internal" | {
+            /** @description Только перечисленные. */
+            only: {
+                /** @description Учётные записи (UUID). */
+                accounts: string[];
+                /** @description Группы (UUID). */
+                groups: string[];
+            };
+        };
+        /** @description Способы входа консоли. */
+        SessionInfo: {
+            oidc?: components["schemas"]["OidcLogin"] | null;
+        };
         /** @description Доверенный источник: создание или замена (имя — в пути). */
         SourceBody: {
             /**
@@ -3309,6 +1629,26 @@ export interface components {
              */
             version: number;
         };
+        /** @description Синхронизация каталога, остановленная массовым удалением учётных записей. */
+        SyncHold: {
+            /** @description Подтверждено: следующая синхронизация выполнит отключение. */
+            approved: boolean;
+            /**
+             * Format: date-time
+             * @description Обнаружено.
+             */
+            detected_at: string;
+            /**
+             * Format: int64
+             * @description Учётных записей к отключению.
+             */
+            removed: number;
+            /**
+             * Format: int64
+             * @description Учётных записей в организации.
+             */
+            total: number;
+        };
         /** @description Элемент корзины. */
         TrashEntry: {
             /**
@@ -3321,6 +1661,8 @@ export interface components {
              * @description Окончательное удаление не раньше этого момента.
              */
             expires_at: string;
+            /** @description Отправитель (заголовок `From`: `Имя <адрес>`). Поле есть только с `include=subject`; `null` — как у темы. */
+            from?: string | null;
             /** @description Письмо (идентификатор сохраняется при восстановлении). */
             message: string;
             /** @description Исходная папка. */
@@ -3335,6 +1677,11 @@ export interface components {
              * @description Размер, байт.
              */
             size: number;
+            /**
+             * @description Тема письма (заголовок `Subject`, декодированный, обрезанный). Поле есть только с `include=subject`;
+             *     `null` — заголовка нет или письмо недоступно.
+             */
+            subject?: string | null;
         };
         /** @description Страница корзины. */
         TrashPage: {
@@ -3362,6 +1709,40 @@ export interface components {
             mode: components["schemas"]["PurgeMode"];
             /** @description Пользователь может выбрать своё значение; иначе действует `mode`. */
             user_can_choose?: boolean;
+        };
+        /** @description Подразделение без идентификатора: создание и замена целиком. */
+        UnitBody: {
+            /** @description Название (1–255 символов без управляющих). */
+            name: string;
+            /** @description Вышестоящее подразделение; нет — корневое. */
+            parent?: string | null;
+        };
+        /** @description Подразделение. */
+        UnitInfo: {
+            /** @description Идентификатор в каталоге; `null` — создано через API. */
+            external_id?: string | null;
+            /** @description Идентификатор. */
+            id: string;
+            /** @description Название. */
+            name: string;
+            /** @description Вышестоящее подразделение; `null` — корневое. */
+            parent?: string | null;
+        };
+        /** @description Учётная запись подразделения. */
+        UnitMember: {
+            /** @description Учётная запись. */
+            account: string;
+            /** @description Подразделение. */
+            department?: string | null;
+            /** @description Руководитель. */
+            manager?: string | null;
+            /**
+             * Format: int32
+             * @description Старшинство (больше — выше).
+             */
+            seniority?: number | null;
+            /** @description Должность. */
+            title?: string | null;
         };
         /** @description Автоответ учётной записи (модель JMAP `VacationResponse`, RFC 8621 §8); выполняется до активного скрипта. */
         VacationBody: {
@@ -3411,4 +1792,3355 @@ export interface components {
     pathItems: never;
 }
 export type $defs = Record<string, never>;
-export type operations = Record<string, never>;
+export interface operations {
+    list_orgs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Organization"][];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_org: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Organization"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_accounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`. */
+                login: string | null;
+                /** @description Список: имя входа начинается с префикса (без учёта регистра). */
+                prefix: string | null;
+                /** @description Список: продолжение после этого имени входа — `after` из ссылки `rel="next"` предыдущей страницы. */
+                after: string | null;
+                /** @description Список: размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`). */
+                limit: number | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    /** @description Следующая страница списка: `<ссылка>; rel="next"`; нет — страница последняя */
+                    Link?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountInfo"][];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAccount"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountInfo"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    patch_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_app_passwords: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppPasswordInfo"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAppPassword"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuedAppPassword"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description предел действующих паролей */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    revoke: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Идентификатор пароля */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPolicyBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuditPolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPolicyBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_account_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_senders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SenderListBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_senders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SenderListBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SenderListBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    deactivate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_scripts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Script"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Имя скрипта */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Имя скрипта (до 128 символов, без управляющих) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScriptText"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description недопустимое имя */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description ошибки в тексте */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptProblem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description лимит числа скриптов или размера текста */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    remove: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Имя скрипта */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description скрипт активен */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    activate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Имя скрипта */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_trash: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Смещение от начала списка. */
+                offset: number;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit: number | null;
+                /**
+                 * @description `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
+                 *     журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
+                 */
+                include: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrashPage"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    trash_purge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrashPurgeInfo"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_hidden: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Смещение от начала списка. */
+                offset: number;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit: number | null;
+                /**
+                 * @description `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
+                 *     журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
+                 */
+                include: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrashPage"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    restore_hidden: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Письмо (UUID) */
+                message: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoredMessage"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    restore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+                /** @description Письмо (UUID) */
+                message: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoredMessage"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    vacation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VacationBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_vacation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VacationBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VacationBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    search_audit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Начало интервала (RFC 3339), включительно. */
+                since: string | null;
+                /** @description Конец интервала (RFC 3339), не включительно. */
+                until: string | null;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit: number | null;
+                /** @description Продолжение: `next` предыдущей страницы. */
+                after: number | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPage"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactInfo"][];
+                };
+            };
+        };
+    };
+    create_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContactBody"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description адрес занят */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Контакт (UUID) */
+                contact: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactInfo"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Контакт (UUID) */
+                contact: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContactBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description контакт каталога или адрес занят */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Контакт (UUID) */
+                contact: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description контакт каталога */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    search_delivery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Отправитель конверта (точно, без учёта регистра ASCII). */
+                sender: string | null;
+                /** @description Один из получателей (точно, без учёта регистра ASCII). */
+                recipient: string | null;
+                /** @description Message-ID без угловых скобок (точно). */
+                message_id: string | null;
+                /** @description Начало интервала (RFC 3339), включительно. */
+                since: string | null;
+                /** @description Конец интервала (RFC 3339), не включительно. */
+                until: string | null;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit: number | null;
+                /** @description Продолжение: `next` предыдущей страницы с теми же условиями. */
+                after: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryResults"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_disabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DisabledInfo"][];
+                };
+            };
+        };
+    };
+    attach_disabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Отключённый ящик (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountInfo"];
+                };
+            };
+            /** @description ящик действует или ящик `to` не пуст без `existing` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description учётная запись `to` отключена */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    restore_disabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Учётная запись (UUID) */
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_groups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupInfo"][];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewGroup"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupInfo"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    patch_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_filter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FilterBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_filter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FilterBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FilterBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description у группы есть статические участники */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_filter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    filter_members: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Группа (UUID) */
+                group: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DynamicMembers"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    search_mailbox_audit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Ящик (UUID учётной записи). */
+                account: string | null;
+                /** @description Исполнитель (имя входа или субъект администратора). */
+                actor: string | null;
+                /** @description Кто относительно ящика: `owner`, `delegate`, `admin`. */
+                actor_kind: string | null;
+                /**
+                 * @description Действие (`login`, `read`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,
+                 *     `change_rules`, `change_forwarding`).
+                 */
+                action: string | null;
+                /** @description Начало интервала (RFC 3339), включительно. */
+                since: string | null;
+                /** @description Конец интервала (RFC 3339), не включительно. */
+                until: string | null;
+                /** @description Размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`). */
+                limit: number | null;
+                /** @description Продолжение — `next` предыдущей страницы. */
+                after: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MailboxAuditPage"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_org_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuditPolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPolicyBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_org_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_held: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Только письма группы (UUID). */
+                group: string | null;
+                /** @description Размер (по умолчанию и наибольший — из конфигурации). */
+                limit: number | null;
+                /**
+                 * @description `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
+                 *     к содержимому; размер — не больше `admin.content_page_size`.
+                 */
+                include: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HeldInfo"][];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    approve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Письмо (UUID) */
+                held: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    reject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Письмо (UUID) */
+                held: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["Rejection"] | null;
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_org_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    org_script: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptText"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_org_script: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScriptText"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description ошибки в тексте */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScriptProblem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description лимит размера текста */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    remove_org_script: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_sync_hold: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncHold"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    approve_sync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncHold"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_domains: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainList"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DomainBody"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainWritten"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия или имя занято */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    replace_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Домен (UUID) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DomainBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainWritten"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия или имя занято */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Домен (UUID) */
+                id: string;
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_domain_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Домен (UUID) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Policies"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_domain_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Домен (UUID) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyBody"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_routes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RouteList"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_route: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description `example.org`, `*.example.org` (поддомены) или `*` (все внешние) */
+                pattern: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RouteBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_route: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Шаблон */
+                pattern: string;
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_sources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceList"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_org_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Имя источника ([a-z0-9._-], до 64 символов) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия или имя занято */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_org_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Имя источника */
+                name: string;
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_units: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnitInfo"][];
+                };
+            };
+        };
+    };
+    create_unit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnitBody"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnitInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_unit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Подразделение (UUID) */
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnitBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnitInfo"];
+                };
+            };
+            /** @description цикл, неизвестное вышестоящее */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description подразделение каталога */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_unit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Подразделение (UUID) */
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description есть вложенные или подразделение каталога */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    unit_members: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Подразделение (UUID) */
+                unit: string;
+                /** @description С вложенными подразделениями. */
+                subtree: boolean;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnitMember"][];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    session_info: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionInfo"];
+                };
+            };
+        };
+    };
+    exchange: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSession"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cluster: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterView"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_cluster_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Имя источника ([a-z0-9._-], до 64 символов) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceBody"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия или имя занято */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_cluster_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Имя источника */
+                name: string;
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Written"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description устаревшая версия */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    whoami: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhoAmI"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+}

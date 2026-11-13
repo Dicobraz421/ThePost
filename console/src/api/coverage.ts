@@ -4,8 +4,10 @@
  * ни здесь, ни там (критерий Ф2: список ожидания пуст).
  */
 export const covered: Record<string, string> = {
+  "GET /api/v1/session": "pages/login.tsx",
   "POST /api/v1/session": "pages/login.tsx",
   "GET /api/v1/whoami": "components/header.tsx",
+  "GET /api/v1/orgs": "components/orgs.tsx",
   "GET /api/v1/orgs/{org}": "pages/organization.tsx",
   "PUT /api/v1/orgs/{org}/policy": "pages/organization.tsx",
   "GET /api/v1/orgs/{org}/accounts": "pages/accounts.tsx",

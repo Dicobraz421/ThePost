@@ -1,11 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, expect, test } from "vitest";
 
 import { saveSession, setOrg } from "../api/client";
 import { App } from "../App";
 import { toBody } from "../components/policy-form";
-import { type Call, ORG, session, stubApi, whoami } from "../test-api";
+import { type Call, ORG, orgs, OTHER, session, stubApi, whoami } from "../test-api";
 
 const BASE = `/api/v1/orgs/${ORG}`;
 const empty = {
@@ -20,11 +20,11 @@ const empty = {
   trash_retention: null,
 };
 
-function open(path: string, routes: Parameters<typeof stubApi>[0]) {
+function open(path: string, routes: Parameters<typeof stubApi>[0], roles = whoami.roles) {
   const s = session();
   saveSession({ token: s.session, expires_at: s.expires_at });
   setOrg(ORG);
-  const calls = stubApi({ "GET /api/v1/whoami": { body: whoami }, ...routes });
+  const calls = stubApi({ "GET /api/v1/whoami": { body: { ...whoami, roles } }, "GET /api/v1/orgs": { body: orgs }, ...routes });
   render(
     <MemoryRouter initialEntries={[path]}>
       <App />
@@ -65,6 +65,27 @@ test("организация: политика по схеме OpenAPI, сохр
     expect(sent(calls, "PUT", `${BASE}/policy`)?.body).toEqual({ ...empty, quota_bytes: 100, trash_retention: "7d" }),
   );
   expect(await screen.findByText("Политика организации сохранена")).toBeTruthy();
+});
+
+test("организация выбирается из GET /api/v1/orgs: запросы экранов — уже для неё", async () => {
+  const org = (id: string) => ({ id, default: id === ORG, policy: empty, effective: empty });
+  const calls = open("/", { [`GET ${BASE}`]: { body: org(ORG) }, [`GET /api/v1/orgs/${OTHER}`]: { body: org(OTHER) } });
+  await screen.findByText(ORG);
+  const select = await screen.findByRole("combobox", { name: "Организация" });
+  expect(await within(select.closest(".ant-select") as HTMLElement).findByText("по умолчанию")).toBeTruthy();
+  fireEvent.mouseDown(select);
+  // Пункты списка — имена организаций (выбранная — и в поле выбора); выбор — вторая организация.
+  expect(await screen.findAllByTitle("по умолчанию")).toHaveLength(2);
+  fireEvent.click(await screen.findByTitle(OTHER));
+  expect(await screen.findByText("нет")).toBeTruthy();
+  expect(sent(calls, "GET", `/api/v1/orgs/${OTHER}`)).toBeTruthy();
+  expect(localStorage.getItem("thepost.org")).toBe(OTHER);
+});
+
+test("администратор организации: имя организации из списка, выбора нет", async () => {
+  open("/", { [`GET ${BASE}`]: { body: { id: ORG, default: true, policy: empty, effective: empty } } }, ["organization_admin"]);
+  expect(await screen.findByText("по умолчанию")).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "Организация" })).toBeNull();
 });
 
 test("навигация: экрана «Домены» нет — домены организации на экране транспорта", async () => {

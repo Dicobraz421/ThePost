@@ -14,6 +14,12 @@ test("типы schema.d.ts совпадают со схемой openapi.json (np
   expect(readFileSync(here("./schema.d.ts"), "utf8")).toBe(await generate());
 });
 
+test("operationId операций схемы уникальны: по ним названы типы `operations` в schema.d.ts", () => {
+  const ids = Object.values(spec.paths).flatMap((item) => Object.values(item).map((op: { operationId?: string }) => op.operationId));
+  expect(ids.filter((id) => !id)).toEqual([]);
+  expect(ids.filter((id, i) => ids.indexOf(id) !== i), "повторы").toEqual([]);
+});
+
 test("каждая операция OpenAPI — экран консоли или строка в coverage-pending.txt", () => {
   const methods = ["get", "post", "put", "patch", "delete"];
   const operations = Object.entries(spec.paths).flatMap(([path, item]) =>

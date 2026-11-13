@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router";
 
 import { saveSession, setOrg } from "./api/client";
 import { App } from "./App";
-import { type Call, ORG, session, stubApi, whoami } from "./test-api";
+import { type Call, ORG, orgs, session, stubApi, whoami } from "./test-api";
 
 export const BASE = `/api/v1/orgs/${ORG}`;
 
@@ -13,7 +13,7 @@ export function open(path: string, routes: Parameters<typeof stubApi>[0], roles:
   const s = session();
   saveSession({ token: s.session, expires_at: s.expires_at });
   setOrg(ORG);
-  const calls = stubApi({ "GET /api/v1/whoami": { body: { ...whoami, roles } }, ...routes });
+  const calls = stubApi({ "GET /api/v1/whoami": { body: { ...whoami, roles } }, "GET /api/v1/orgs": { body: orgs }, ...routes });
   render(
     <MemoryRouter initialEntries={[path]}>
       <App />

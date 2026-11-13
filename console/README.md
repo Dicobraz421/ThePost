@@ -28,10 +28,13 @@ THEPOST_ADMIN=http://127.0.0.1:8080 npm run dev
 
 ## Схема Admin API
 
-`src/api/openapi.json` — копия `GET /api/openapi.json` узла. После изменения API: скачать схему с узла
-(`curl -s $THEPOST_ADMIN/api/openapi.json > src/api/openapi.json`), выполнить `npm run gen:api`; тест сверяет типы
-со схемой. Каждая операция схемы — экран консоли (`src/api/coverage.ts`) или строка в `coverage-pending.txt`
-(список пуст с UI-09: новая операция Admin API без экрана — красный тест).
+`src/api/openapi.json` — схема Admin API узла (`GET /api/openapi.json`). После изменения API: выгрузить её без
+запуска узла — `thepost admin openapi --output console/src/api/openapi.json` (APP-37; из корня репозитория:
+`cargo run -p thepost -- admin openapi --output console/src/api/openapi.json`; на Windows `thepost` не собирается —
+в Linux или WSL), выполнить `npm run gen:api`; тест
+сверяет типы со схемой. Типы операций (`operations` в `schema.d.ts`) названы по `operationId` — они уникальны (ADM-27),
+тест это проверяет. Каждая операция схемы — экран консоли (`src/api/coverage.ts`) или строка в `coverage-pending.txt`
+(новая операция Admin API без экрана и без такой строки — красный тест).
 
 ## Роли
 

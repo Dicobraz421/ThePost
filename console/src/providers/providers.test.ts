@@ -47,12 +47,15 @@ test("отказ во входе — ошибка с текстом API; ист�
   expect(await authProvider.onError({ statusCode: 409 })).toEqual({});
 });
 
-test("поставщик OIDC — из GET /api/v1/session; операции нет — только токен", async () => {
-  const oidc = { issuer: "https://idp.example.org", client_id: "thepost-console" };
-  stubApi({ "GET /api/v1/session": { body: { oidc } } });
+test("поставщик OIDC — из GET /api/v1/session (SessionInfo); не настроен или узел недоступен — только токен", async () => {
+  const oidc = { issuer: "https://idp.example.org", client_id: "thepost-console", scope: "openid profile" };
+  const calls = stubApi({ "GET /api/v1/session": { body: { oidc } } });
   expect(await sessionInfo()).toEqual({ oidc });
-  stubApi({ "GET /api/v1/session": { status: 405, body: { status: 405, title: "Method Not Allowed" } } });
-  expect(await sessionInfo()).toEqual({});
+  expect(calls[0]).toMatchObject({ method: "GET", path: "/api/v1/session" });
+  stubApi({ "GET /api/v1/session": { body: { oidc: null } } });
+  expect(await sessionInfo()).toEqual({ oidc: null });
+  stubApi({ "GET /api/v1/session": { status: 503, body: { status: 503, title: "Service Unavailable" } } });
+  expect(await sessionInfo()).toEqual({ oidc: null });
 });
 
 test("список: организация в пути, курсор after/limit, продолжение из Link", async () => {

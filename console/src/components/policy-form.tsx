@@ -17,7 +17,8 @@ type Schema = {
   minimum?: number;
 };
 
-const schemas = spec.components.schemas as Record<string, Schema>;
+// Тип JSON-модуля выводится по значениям (у вариантов `oneOf` — разные поля), а читаются только поля `Schema`.
+const schemas = spec.components.schemas as unknown as Record<string, Schema>;
 const types = (s: Schema) => [s.type ?? []].flat();
 const nullable = (s: Schema) => types(s).includes("null") || !!s.oneOf?.some(nullable);
 
