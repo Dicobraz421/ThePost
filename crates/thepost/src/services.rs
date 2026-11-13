@@ -453,7 +453,7 @@ impl Services {
 
     /// Обработчик очереди роли smtp-out: доставка на MX с MTA-STS и DANE, уведомления — в ту же очередь; политики
     /// доменов назначения организаций (SMTP-15) и внутренняя ретрансляция — из снимков узла [`Services::routes`]
-    /// (перечитывает их `Routes::watch` узла, у роли своей подписки нет).
+    /// (перечитывает их `Routes::watch` узла); шина узла — для сигналов очереди `QueueReady` (APP-66, SMTP-42).
     pub fn queue_worker(&self, smtp: &SmtpConfig) -> Result<QueueWorker> {
         let transport = tp_smtp::queue::send::MxTransport::new(
             system_resolver()?,
@@ -471,7 +471,7 @@ impl Services {
         .with_dsn(self.queue.clone())
         .with_metrics(self.smtp_metrics.clone())
         .with_tracking(self.tracking.clone())
-        .with_routes(self.routes.clone(), None))
+        .with_routes(self.routes.clone(), Some(self.bus.clone())))
     }
 
     /// Зависимости IMAP.
