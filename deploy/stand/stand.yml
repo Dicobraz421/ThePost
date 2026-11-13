@@ -21,16 +21,18 @@
         file: thresholds.yml
 
     # Профиль порогов (stand_profiles) накладывает прогон (run.yml) — здесь только общее для обоих профилей.
-    - name: Apply common stand parameters and relay of outgoing mail to smtp-sink
+    # Генератор — доверенный для ограничения частоты (ratelimit.trusted, решение 109): его ansible_host — IP-адрес.
+    - name: Apply common stand parameters, trusted generator and relay of outgoing mail to smtp-sink
       ansible.builtin.set_fact:
         thepost_config_extra: >-
           {{ stand_common
-             | combine({'smtp': {'queue': {'relay': stand_relay}}}, recursive=true)
+             | combine({'ratelimit': {'trusted': [stand_generator_address] + stand_trusted}}, recursive=true)
+             | combine({'smtp': {'queue': {'relay': stand_generator_address ~ ':' ~ stand_sink_port | default(2525)}}},
+                       recursive=true)
              | combine(stand_config_extra | default({}), recursive=true, list_merge='replace') }}
       vars:
         stand_generator: "{{ groups['generator'] | first }}"
-        stand_relay: >-
-          {{ hostvars[stand_generator].ansible_host | default(stand_generator) }}:{{ stand_sink_port | default(2525) }}
+        stand_generator_address: "{{ hostvars[stand_generator].ansible_host | default(stand_generator) }}"
       when: inventory_hostname in groups['smb']
 
 - name: SMB node
