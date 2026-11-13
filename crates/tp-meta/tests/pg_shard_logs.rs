@@ -432,6 +432,61 @@ async fn busy_blobs_ahead_do_not_hide_free_candidate() {
     t.drop_db().await;
 }
 
+/// META-79: срок следующего прохода GC — по всем шардам среди объектов без ссылок. Самый ранний обнулённый
+/// объект занят вторым шардом, следующий свободен: срок — по свободному (не `None`), проход удаляет его и
+/// оставляет занятый. Объект, обнулённый на втором шарде позже, получает срок по позднему обнулению.
+#[tokio::test]
+async fn next_gc_due_skips_blob_held_by_another_shard() {
+    const W: Duration = Duration::from_secs(3600);
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let (tenant, _, _) = t.tenant().await;
+    let base = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_000).expect("ts");
+    let (busy, free) = (hash(), hash());
+    put_blobs(t.main.meta.pool(), tenant, &[busy], 0, &[base]).await;
+    put_blobs(&t.shard_pool, tenant, &[busy], 1, &[base]).await;
+    let free_zero = base + Duration::from_secs(60);
+    put_blobs(t.main.meta.pool(), tenant, &[free], 0, &[free_zero]).await;
+    assert_eq!(t.meta.next_gc_due(W).await, Ok(Some(free_zero + W)));
+
+    // Проход GC в срок: кандидат — только свободный объект.
+    let older_than = free_zero + Duration::from_micros(1);
+    let (busy, free) = (initial(tenant, busy), initial(tenant, free));
+    let keys = t
+        .meta
+        .gc_candidates(older_than, 100)
+        .await
+        .expect("candidates");
+    assert_eq!(keys, vec![free]);
+    assert!(t.meta.mark_deleting(&free, older_than).await.expect("mark"));
+    assert!(t.meta.finalize_delete(&free).await.expect("finalize"));
+    assert!(!t.meta.exists(&free).await.expect("exists"));
+    assert!(t.meta.exists(&busy).await.expect("exists"));
+    assert_eq!(t.meta.next_gc_due(W).await, Ok(None));
+
+    // Обнулён на обоих шардах: срок — по второму, обнулённому позже.
+    let late = hash();
+    let late_zero = base + Duration::from_secs(600);
+    put_blobs(t.main.meta.pool(), tenant, &[late], 0, &[base]).await;
+    put_blobs(&t.shard_pool, tenant, &[late], 0, &[late_zero]).await;
+    assert_eq!(t.meta.next_gc_due(W).await, Ok(Some(late_zero + W)));
+    assert!(
+        t.meta
+            .gc_candidates(late_zero, 100)
+            .await
+            .expect("candidates")
+            .is_empty()
+    );
+    assert_eq!(
+        t.meta
+            .gc_candidates(late_zero + Duration::from_micros(1), 100)
+            .await,
+        Ok(vec![initial(tenant, late)])
+    );
+    t.drop_db().await;
+}
+
 #[tokio::test]
 async fn signals_from_every_shard() {
     let Some(t) = common::two_shards().await else {
