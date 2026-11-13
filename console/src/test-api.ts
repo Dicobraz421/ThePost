@@ -43,4 +43,10 @@ export const session = (expiresIn = HOUR) => ({
   login: "admin@example.org",
   roles: ["installation_admin"],
 });
+/** Организации `GET /api/v1/orgs`: по умолчанию и вторая (модуль «Мультитенантность»). */
+export const OTHER = "00000000-0000-0000-0000-000000000002";
+export const orgs = [
+  { id: ORG, default: true },
+  { id: OTHER, default: false },
+];
 export const whoami = { tenant: ORG, account: "a1", login: "admin@example.org", roles: ["installation_admin"] };

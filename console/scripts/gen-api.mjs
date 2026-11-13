@@ -8,9 +8,6 @@ const file = (name) => fileURLToPath(new URL(`../src/api/${name}`, import.meta.u
 
 export async function generate() {
   const spec = JSON.parse(readFileSync(file("openapi.json"), "utf8"));
-  // operationId в схеме узла повторяются (list_domains — у доменов и у transport/domains и др.), а типы операций
-  // openapi-typescript именует по operationId: без него типы операций встраиваются в `paths` и не сталкиваются.
-  for (const item of Object.values(spec.paths)) for (const op of Object.values(item)) delete op.operationId;
   return COMMENT_HEADER + astToString(await openapiTS(spec));
 }
 

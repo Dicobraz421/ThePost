@@ -1,3 +1,35 @@
 # Операции Admin API без экрана консоли (UI-02): «МЕТОД путь», по одной в строке.
 # Экран готов — строку убрать и добавить операцию в src/api/coverage.ts.
-# Список пуст: консоль покрывает Admin API (UI-09, критерий Ф2).
+
+# ADM-10 (контакты, динамические группы, оргструктура, отключённые ящики, аудит ящиков; маршруты — PR #643):
+# в схеме с волны admin-parity, экранов консоли ещё нет — карточки нет.
+GET /api/v1/orgs/{org}/contacts
+POST /api/v1/orgs/{org}/contacts
+GET /api/v1/orgs/{org}/contacts/{contact}
+PUT /api/v1/orgs/{org}/contacts/{contact}
+DELETE /api/v1/orgs/{org}/contacts/{contact}
+GET /api/v1/orgs/{org}/groups/{group}/filter
+PUT /api/v1/orgs/{org}/groups/{group}/filter
+DELETE /api/v1/orgs/{org}/groups/{group}/filter
+GET /api/v1/orgs/{org}/groups/{group}/filter/members
+GET /api/v1/orgs/{org}/units
+POST /api/v1/orgs/{org}/units
+PUT /api/v1/orgs/{org}/units/{unit}
+DELETE /api/v1/orgs/{org}/units/{unit}
+GET /api/v1/orgs/{org}/units/{unit}/members
+GET /api/v1/orgs/{org}/disabled-accounts
+POST /api/v1/orgs/{org}/disabled-accounts/{account}/attach
+POST /api/v1/orgs/{org}/disabled-accounts/{account}/restore
+GET /api/v1/orgs/{org}/accounts/{account}/senders
+PUT /api/v1/orgs/{org}/accounts/{account}/senders
+GET /api/v1/orgs/{org}/accounts/{account}/audit-policy
+PUT /api/v1/orgs/{org}/accounts/{account}/audit-policy
+DELETE /api/v1/orgs/{org}/accounts/{account}/audit-policy
+GET /api/v1/orgs/{org}/mailbox-audit
+PUT /api/v1/orgs/{org}/mailbox-audit/policy
+DELETE /api/v1/orgs/{org}/mailbox-audit/policy
+GET /api/v1/orgs/{org}/sync-hold
+POST /api/v1/orgs/{org}/sync-hold/approve
+
+# Изменение и блокировка учётной записи (ADM-18) — экран UI-15.
+PATCH /api/v1/orgs/{org}/accounts/{account}
