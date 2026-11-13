@@ -159,7 +159,7 @@ async fn milter_profile_from_policy() {
         let mut e = envelope(Mode::Submission, &["bob@example.org"]);
         e.mail_from = ALICE.into();
         e.principal = Some(principal(&env).await);
-        let r = d.data(&e, Bytes::from_static(MAIL)).await;
+        let r = d.data(&e, Bytes::from_static(OWN)).await;
         assert_eq!(r.code, 250, "{r:?}");
         assert!(!rspamd.codes().await.is_empty(), "{profile:?}");
         assert_eq!(!dlp.codes().await.is_empty(), dlp_called, "{profile:?}");

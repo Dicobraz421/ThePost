@@ -379,7 +379,7 @@ impl Session {
         match req {
             Request::Ehlo { host } => self.ehlo(host, true, out),
             Request::Helo { host } => self.ehlo(host, false, out),
-            Request::Mail { from } => self.mail(from, out),
+            Request::Mail { from } => self.mail(from, out).await,
             Request::Rcpt { to } => self.rcpt(to.address, out).await,
             Request::Data => return self.data(out),
             Request::Bdat {
@@ -456,7 +456,7 @@ impl Session {
         }
     }
 
-    fn mail(&mut self, from: MailFrom<String>, out: &mut Vec<u8>) {
+    async fn mail(&mut self, from: MailFrom<String>, out: &mut Vec<u8>) {
         if self.helo.is_none() {
             return self.fail(reply(503, [5, 5, 1], "Send EHLO first"), out);
         }
@@ -498,6 +498,18 @@ impl Session {
                 out,
             );
         }
+        let tx = Tx {
+            mail_from: from.address,
+            rcpts: Vec::new(),
+            smtputf8,
+            started_at: OffsetDateTime::now_utc(),
+            body: Vec::new(),
+            bdat: false,
+        };
+        // Отправитель конверта (submission — свой адрес или право отправки, SMTP-45) — до лимитов: отказ их не тратит.
+        if let Some(r) = self.ctx.handler.sender(&self.envelope(&tx)).await {
+            return self.fail(r, out);
+        }
         if let Some(r) = self.mail_rate_limit() {
             push(out, &r);
             return;
@@ -516,14 +528,7 @@ impl Session {
             );
             return;
         }
-        self.tx = Some(Tx {
-            mail_from: from.address,
-            rcpts: Vec::new(),
-            smtputf8,
-            started_at: OffsetDateTime::now_utc(),
-            body: Vec::new(),
-            bdat: false,
-        });
+        self.tx = Some(tx);
         push(out, &reply(250, [2, 1, 0], "OK"));
     }
 
