@@ -487,6 +487,25 @@ async fn next_gc_due_skips_blob_held_by_another_shard() {
     t.drop_db().await;
 }
 
+/// META-73, META-79: общий набор GC по ссылкам всех шардов (KIT-11) на `PgMeta::with_shards`.
+#[tokio::test]
+async fn passes_sharded_gc_suite() {
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let (tenant, _, _) = t.tenant().await;
+    let second = t.meta.on_shard(t.shard).await.expect("shard");
+    tp_testkit::suite::blob_gc_shards(
+        &t.meta,
+        &second,
+        tenant,
+        &tp_testkit::SystemClock,
+        &tp_testkit::suite::RealTime,
+    )
+    .await;
+    t.drop_db().await;
+}
+
 #[tokio::test]
 async fn signals_from_every_shard() {
     let Some(t) = common::two_shards().await else {
