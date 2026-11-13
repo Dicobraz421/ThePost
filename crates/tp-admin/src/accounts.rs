@@ -443,7 +443,28 @@ async fn create_account(
     Path(org): Path<TenantId>,
     Json(body): Json<NewAccount>,
 ) -> ApiResult<(StatusCode, Json<AccountInfo>)> {
-    let (login, domain) = split_login(&body.login)?;
+    let acc = create_local(
+        &a,
+        org,
+        &body.login,
+        body.display_name.as_deref(),
+        AccountKind::User,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
+}
+
+/// Создаёт локальную учётную запись вида `kind` в принятом домене организации (`POST …/accounts`, ресурсы —
+/// [`crate::resources`]). Не адрес — `Invalid`; домен не принят организацией — `Invalid` с подсказкой; имя занято —
+/// `Conflict`; настройки транспорта не подключены — `Unavailable`.
+pub(crate) async fn create_local(
+    a: &Admin,
+    org: TenantId,
+    login: &str,
+    display_name: Option<&str>,
+    kind: AccountKind,
+) -> Result<Account> {
+    let (login, domain) = split_login(login)?;
     let t = a.transport.as_deref().ok_or(Error::UNAVAILABLE)?;
     let snap = t.cluster().await?;
     let d = snap
@@ -455,32 +476,28 @@ async fn create_account(
             ))
         })?;
     if a.d.accounts.by_login(org, &login).await?.is_some() {
-        return Err(Error::Conflict.into());
+        return Err(Error::Conflict);
     }
-    let display_name = body
-        .display_name
-        .as_deref()
+    let display_name = display_name
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .unwrap_or(&login)
         .to_owned();
-    let acc =
-        a.d.accounts
-            .upsert(
-                org,
-                AccountUpsert {
-                    domain: d.id,
-                    login,
-                    display_name,
-                    external_id: None,
-                    enabled: true,
-                    aliases: Vec::new(),
-                    kind: AccountKind::User,
-                    hidden_from_gal: false,
-                },
-            )
-            .await?;
-    Ok((StatusCode::CREATED, Json(account_info(&a, acc).await?)))
+    a.d.accounts
+        .upsert(
+            org,
+            AccountUpsert {
+                domain: d.id,
+                login,
+                display_name,
+                external_id: None,
+                enabled: true,
+                aliases: Vec::new(),
+                kind,
+                hidden_from_gal: false,
+            },
+        )
+        .await
 }
 
 pub(crate) async fn account_info(a: &Admin, acc: Account) -> Result<AccountInfo> {

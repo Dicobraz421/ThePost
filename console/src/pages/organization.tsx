@@ -5,6 +5,7 @@ import { Alert, Button, Descriptions, Divider, Popconfirm } from "antd";
 import type { Schemas } from "../api/client";
 import { when } from "../components/format";
 import { PolicyForm } from "../components/policy-form";
+import { SharingPolicyForm } from "../components/sharing-policy";
 import { useReadOnly } from "../providers/access";
 
 const ORG = "/api/v1/orgs/{org}";
@@ -52,7 +53,7 @@ function SyncHold() {
   );
 }
 
-/** Организация, остановка синхронизации каталога и политика организации. */
+/** Организация, остановка синхронизации каталога, политика организации и политика общего доступа к календарям. */
 export function OrganizationPage() {
   const { result: org, query } = useCustom<Schemas["Organization"]>({ url: ORG, method: "get" });
   const { mutate, mutation } = useCustomMutation<Schemas["PolicyBody"]>();
@@ -79,6 +80,8 @@ export function OrganizationPage() {
           )
         }
       />
+      <Divider orientation="left">Общий доступ к календарям и адресным книгам</Divider>
+      <SharingPolicyForm />
     </Show>
   );
 }
