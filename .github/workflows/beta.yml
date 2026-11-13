@@ -14,6 +14,7 @@
 # базовый x86-64 без AVX2, бинарь x86_64 запускается на qemu Nehalem — падение валит сборку.
 # CI-13 (решение 111): образ ещё и с тегом версии выпуска — appVersion из deploy/helm/thepost/Chart.yaml (источник
 # версии; чарт по умолчанию берёт тот же тег). Все теги — один digest: подпись cosign и SBOM образа — на все.
+# CI-12 (решение 107): build и repro — с фичей gssapi (release-build, libkrb5 в образе cross).
 name: Beta
 
 on:
