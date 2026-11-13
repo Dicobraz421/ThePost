@@ -2775,6 +2775,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-auth"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3a38e106bc724fb87601fce70bef65c12498b19cdb320994330eae1080d035f"
+dependencies = [
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "encodify",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "hashify 0.3.2",
+ "hickory-resolver",
+ "idna",
+ "mail-parser 1.0.1",
+ "memchr",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "simdutf8",
+ "similar 3.2.1",
+]
+
+[[package]]
 name = "mail-builder"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2825,7 +2848,7 @@ checksum = "1a428956cced7e5493be6631590e009825635f6ffc3f19edbbf9e07418f8f2e2"
 dependencies = [
  "encodify",
  "gethostname",
- "mail-auth",
+ "mail-auth 0.14.1",
  "mail-builder 2.0.1",
  "md5",
  "rand 0.9.5",
@@ -5396,7 +5419,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "mail-auth",
+ "mail-auth 0.15.1",
  "mail-parser 0.11.9",
  "prometheus-client",
  "reqwest",
@@ -6022,7 +6045,7 @@ dependencies = [
  "bytes",
  "futures",
  "insta",
- "mail-auth",
+ "mail-auth 0.15.1",
  "mail-builder 1.0.0",
  "mail-parser 0.11.9",
  "mail-send",

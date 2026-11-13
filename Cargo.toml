@@ -68,7 +68,7 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 libgssapi = "0.11.0"
 # Без rayon: извлечение текста PDF — в подпроцессе под seccomp, где потоки запрещены (SRCH-07).
 lopdf = { version = "0.46.0", default-features = false }
-mail-auth = "0.14.1"
+mail-auth = "0.15.1"
 mail-builder = "1.0.0"
 # 0.11 в коде крейтов; 1.0 (через mail-auth 0.14 и mail-send 0.7) меняет API разбора — отдельная карточка (DEPS-02).
 mail-parser = "0.11.9"
