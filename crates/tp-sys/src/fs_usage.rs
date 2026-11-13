@@ -1,12 +1,10 @@
-//! Объём и свободное место файловой системы (`statvfs(3)`, SYS-13).
+//! Объём и свободное место файловой системы (`statvfs(3)` из `nix`, SYS-13, SYS-14).
 
-use std::ffi::CString;
 use std::io;
-use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use nix::libc;
+use nix::errno::Errno;
+use nix::sys::statvfs::statvfs;
 
 /// Объём файловой системы, в байтах.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,28 +23,16 @@ pub struct FsUsage {
 /// Ошибка `statvfs` (нет пути, нет прав, ошибка ввода-вывода); путь с нулевым байтом —
 /// [`io::ErrorKind::InvalidInput`].
 pub fn fs_usage(path: &Path) -> io::Result<FsUsage> {
-    let c_path = CString::new(path.as_os_str().as_bytes())?;
-    let mut buf = MaybeUninit::<libc::statvfs>::uninit();
-    loop {
-        // SAFETY: `c_path` — строка с завершающим нулём, живёт до конца вызова; `buf` — память под
-        // одну структуру `statvfs`, ядро заполняет её целиком при успехе.
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) };
-        if rc == 0 {
-            break;
+    let st = loop {
+        match statvfs(path) {
+            Err(Errno::EINTR) => {}
+            res => break res?,
         }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
-    // SAFETY: `statvfs` вернул 0 — структура заполнена.
-    #[allow(unsafe_code)]
-    let st = unsafe { buf.assume_init() };
+    };
     // Счётчики блоков — в единицах `f_frsize` (POSIX).
     Ok(FsUsage {
-        total: st.f_blocks.saturating_mul(st.f_frsize),
-        available: st.f_bavail.saturating_mul(st.f_frsize),
+        total: st.blocks().saturating_mul(st.fragment_size()),
+        available: st.blocks_available().saturating_mul(st.fragment_size()),
     })
 }
 
