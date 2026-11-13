@@ -579,7 +579,7 @@ async fn single_recipient_received_for() {
         "alice@example.org",
     ));
     e.conn.client = "[2001:db8::1]:5000".parse().expect("addr");
-    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(d.data(&e, Bytes::from_static(OWN)).await.code, 250);
     let raw = &env.inbox("bob@example.org").await[0];
     assert!(raw.contains("Received: from client.example.net ([IPv6:2001:db8::1])\r\n\tby mx.example.org (The Post) with ESMTPSA id test1\r\n\tfor <bob@example.org>;\r\n\t"), "{raw}");
 }
@@ -751,14 +751,14 @@ async fn submission_decision_hook() {
         TenantId::DEFAULT,
         "alice@example.org",
     ));
-    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(d.data(&e, Bytes::from_static(OWN)).await.code, 250);
     let inbox = env.inbox("bob@example.org").await;
     assert!(inbox[0].starts_with("X-Journal: yes\r\n"), "{}", inbox[0]);
     let queued = env.queue.0.lock().expect("lock").clone();
     assert_eq!(queued[0].1, ["x@example.net", "archive@example.com"]);
     // Запрет — отказ всему письму, ничего не доставлено и не поставлено в очередь.
     hook.set_submission(Decision::Deny("dlp".into()));
-    let r = d.data(&e, Bytes::from_static(MAIL)).await;
+    let r = d.data(&e, Bytes::from_static(OWN)).await;
     assert_eq!((r.code, r.esc), (550, [5, 7, 1]));
     assert_eq!(env.inbox("bob@example.org").await.len(), 1);
     assert_eq!(env.queue.0.lock().expect("lock").len(), 1);
@@ -796,6 +796,11 @@ fn rcpts(list: &[&str]) -> Vec<String> {
 }
 
 const OWN: &[u8] = b"From: alice@example.org\r\nSubject: hi\r\n\r\nbody\r\n";
+
+/// Письмо от `login` (`From` — его адрес): submission после входа принимает только свои адреса (SMTP-45).
+fn own(login: &str) -> Bytes {
+    Bytes::from(format!("From: {login}\r\nSubject: hi\r\n\r\nbody\r\n"))
+}
 
 #[tokio::test]
 async fn submit_local_recipient_delivered_without_queue() {
@@ -1067,7 +1072,7 @@ async fn submission_copy_to_local_address() {
         "carol@example.org",
     ));
     e.mail_from = "carol@example.org".into();
-    assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+    assert_eq!(d.data(&e, own("carol@example.org")).await.code, 250);
     assert_eq!(env.inbox("bob@example.org").await.len(), 1);
     assert_eq!(env.inbox("alice@example.org").await.len(), 1);
     // Неизвестный адрес копии — без уведомления отправителю (адрес копии ему не раскрывается).
@@ -1230,7 +1235,7 @@ mod groups {
         assert_eq!(d.rcpt(&sub, "board@example.org").await.code, 250);
         sub.rcpts = vec!["staff@example.org".into()];
         sub.mail_from = "bob@example.org".into();
-        assert_eq!(d.data(&sub, Bytes::from_static(MAIL)).await.code, 250);
+        assert_eq!(d.data(&sub, own("bob@example.org")).await.code, 250);
         assert_eq!(env.inbox("alice@example.org").await.len(), 1);
         assert_eq!(env.inbox("bob@example.org").await.len(), 1);
         // Отправка вне сессии от внешнего адреса в закрытую группу — отказ с уведомлением.
@@ -1286,7 +1291,7 @@ mod groups {
         e.principal = Some(env.principal("carol@example.org").await);
         e.mail_from = "carol@example.org".into();
         e.rcpts = vec!["news@example.org".into()];
-        assert_eq!(d.data(&e, Bytes::from_static(MAIL)).await.code, 250);
+        assert_eq!(d.data(&e, own("carol@example.org")).await.code, 250);
         assert_eq!(env.inbox("alice@example.org").await.len(), 1);
         // Отправка вне сессии не модератором — статус «в очереди», письмо ждёт модератора.
         let sent = d
@@ -1468,5 +1473,6 @@ mod org_policy;
 mod rcpt_rate;
 mod rules;
 mod scheduled;
+mod sender_login;
 mod senders;
 mod wave;

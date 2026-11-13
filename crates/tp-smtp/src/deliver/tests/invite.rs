@@ -26,10 +26,10 @@ fn invite(from: &str, organizer: &str) -> String {
 
 /// Права отправки от чужого адреса: (имя входа, адрес `From`) → право.
 #[derive(Default)]
-struct SendRights(Mutex<HashMap<(String, String), SendRight>>);
+pub(super) struct SendRights(Mutex<HashMap<(String, String), SendRight>>);
 
 impl SendRights {
-    fn grant(&self, login: &str, from: &str, right: SendRight) {
+    pub(super) fn grant(&self, login: &str, from: &str, right: SendRight) {
         self.0
             .lock()
             .expect("lock")
@@ -65,11 +65,16 @@ fn delivery(env: &Env, rights: Option<Arc<SendRights>>) -> (Delivery, FakeItip) 
 
 /// Письмо `raw` bob через submission: вошла alice, отправитель конверта — она же.
 async fn submission(env: &Env, d: &Delivery, raw: &str) {
+    let r = submission_reply(env, d, raw).await;
+    assert_eq!(r.code, 250, "{r:?}");
+}
+
+/// Ответ на письмо `raw` bob через submission от alice.
+async fn submission_reply(env: &Env, d: &Delivery, raw: &str) -> Reply {
     let mut e = envelope(Mode::Submission, &[BOB]);
     e.mail_from = ALICE.into();
     e.principal = Some(super::org_policy::principal(env).await);
-    let r = d.data(&e, Bytes::from(raw.to_owned())).await;
-    assert_eq!(r.code, 250, "{r:?}");
+    d.data(&e, Bytes::from(raw.to_owned())).await
 }
 
 /// Отправка вне сессии SMTP (JMAP `EmailSubmission`) от alice.
@@ -143,11 +148,13 @@ async fn foreign_from_without_right_stays_mail() {
     rights.grant("bob@example.org", "carol@example.org", SendRight::SendAs);
     for authz in [None, Some(rights)] {
         let (d, itip) = delivery(&env, authz);
-        submission(&env, &d, &raw).await;
+        // Submission письмо от чужого имени не принимает (SMTP-45); JMAP проверяет `From` сам.
+        let r = submission_reply(&env, &d, &raw).await;
+        assert_eq!((r.code, r.esc), (550, [5, 7, 1]), "{r:?}");
         submit(&d, &raw).await;
         assert!(itip.calls().is_empty());
     }
-    assert_eq!(env.inbox(BOB).await.len(), 4);
+    assert_eq!(env.inbox(BOB).await.len(), 2);
 }
 
 #[tokio::test]

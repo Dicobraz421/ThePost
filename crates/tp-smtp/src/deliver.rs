@@ -10,6 +10,10 @@
 //!   почтовые контакты — внешним адресатам; динамическая группа — по фильтру на момент доставки (SMTP-26);
 //! - внешний получатель: smtp-in — `550 5.7.1` (не открытый релей), submission — в очередь исходящей почты
 //!   ([`Outbound`], [`crate::queue::Queue`]); узел без очереди (`Deps::outbound` = `None`) — `451 4.3.2`;
+//! - submission после входа — только адреса отправителя вошедшего пользователя (SMTP-45, аналог
+//!   `reject_sender_login_mismatch`): `MAIL FROM` — свой адрес, псевдоним или право Send As, иначе `553 5.7.1`;
+//!   `From` — ещё и Send on Behalf (без `Sender` узел добавляет его), `Sender` — как `MAIL FROM`, иначе `550 5.7.1`
+//!   на данных; права — `Authorizer::send_right` ([`Delivery::with_authz`], общий с JMAP). smtp-in не проверяется;
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
 //!   заголовки в начало письма, копии в папки и внешним адресам);
 //! - журнал доставки ([`Delivery::with_tracking`], [`crate::tracking`]): приём, отказы, доставка, модерация,
@@ -72,7 +76,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tp_contracts::auth::{Authorizer, DirChange, DirCursor, Directory, Principal};
+use tp_contracts::auth::{Authorizer, DirChange, DirCursor, Directory, Principal, SendRight};
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::ext::{CopyTo, Decision, DecisionHooks, SubmissionInfo};
 use tp_contracts::groups::DistributionGroup;
@@ -387,9 +391,9 @@ impl Delivery {
         self
     }
 
-    /// Права отправки от чужого адреса (`Authorizer::send_right`) для приглашений из почтового клиента
-    /// ([`Delivery::with_itip`], SMTP-36). Без них внутренним приглашением считается только письмо со своим адресом
-    /// или псевдонимом в `From`.
+    /// Права отправки от чужого адреса (`Authorizer::send_right`): адреса отправителя сеанса submission (SMTP-45) и
+    /// приглашения из почтового клиента ([`Delivery::with_itip`], SMTP-36). Без них submission принимает и
+    /// внутренним приглашением считает только свой адрес или псевдоним.
     pub fn with_authz(mut self, authz: Arc<dyn Authorizer>) -> Self {
         self.authz = Some(authz);
         self
@@ -423,9 +427,9 @@ impl Delivery {
                 return;
             }
             ItipOrigin::Internal { account, principal } => {
-                match self.owns_from(account, principal, &msg.from).await {
-                    Ok(true) => ItipSource::Internal,
-                    Ok(false) => {
+                match self.sender_right(account, principal, &msg.from).await {
+                    Ok(Some(_)) => ItipSource::Internal,
+                    Ok(None) => {
                         tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
                         return;
                     }
@@ -472,24 +476,29 @@ impl Delivery {
         }
     }
 
-    /// Адрес `from` принадлежит учётной записи `account` организации узла (решение 78): её адрес или псевдоним
-    /// (`Account::addresses`), иначе право отправки от него ([`Delivery::with_authz`]). Субъект проверки прав —
-    /// `principal` сеанса submission; без него (отправка вне сессии SMTP) — учётная запись без групп.
-    async fn owns_from(
+    /// Право учётной записи `account` организации узла на адрес отправителя `from` (решение 78, SMTP-45): её адрес
+    /// или псевдоним (`Account::addresses`) — [`SendRight::SendAs`], иначе право Send As / Send on Behalf из ACL
+    /// узла (`Authorizer::send_right`, [`Delivery::with_authz`]; та же проверка, что у JMAP). `None` — адрес чужой.
+    /// Субъект проверки прав — `principal` сеанса submission; без него (отправка вне сессии SMTP) — учётная запись
+    /// без групп (CTR-82).
+    async fn sender_right(
         &self,
         account: AccountId,
         principal: Option<&Principal>,
         from: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<SendRight>> {
+        if principal.is_some_and(|p| p.account == account && p.login.eq_ignore_ascii_case(from)) {
+            return Ok(Some(SendRight::SendAs));
+        }
         let tenant = self.deps.tenant;
         let Some(acc) = self.deps.accounts.get(tenant, account).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if acc.addresses().iter().any(|a| a.eq_ignore_ascii_case(from)) {
-            return Ok(true);
+            return Ok(Some(SendRight::SendAs));
         }
         let Some(authz) = &self.authz else {
-            return Ok(false);
+            return Ok(None);
         };
         let own;
         let principal = match principal {
@@ -505,7 +514,78 @@ impl Delivery {
                 &own
             }
         };
-        Ok(authz.send_right(principal, from).await?.is_some())
+        authz.send_right(principal, from).await
+    }
+
+    /// Отправитель конверта сеанса submission (SMTP-45, аналог `reject_sender_login_mismatch`): пустой (`<>`), свой
+    /// адрес, псевдоним или адрес с правом Send As ([`Delivery::sender_right`]); иначе — `553 5.7.1`. Send on Behalf
+    /// конверт не меняет: письмо от имени владельца уходит с адресом представителя (как `forbiddenMailFrom` JMAP).
+    /// smtp-in и приложение без входа (адреса — `sources`) не проверяются.
+    async fn check_mail_from(&self, env: &Envelope) -> Result<Option<Reply>> {
+        let Some(p) = submitter(env) else {
+            return Ok(None);
+        };
+        if env.mail_from.is_empty() {
+            return Ok(None);
+        }
+        let right = if p.tenant == self.deps.tenant {
+            self.sender_right(p.account, Some(p), &env.mail_from)
+                .await?
+        } else {
+            None
+        };
+        if right == Some(SendRight::SendAs) {
+            return Ok(None);
+        }
+        tracing::info!(id = %env.id, account = %p.account, "smtp: отправитель конверта не принадлежит вошедшему пользователю");
+        Ok(Some(reply(
+            553,
+            [5, 7, 1],
+            "Sender address not owned by authenticated user",
+        )))
+    }
+
+    /// Заголовки `From` и `Sender` письма сеанса submission (SMTP-45): каждый адрес `From` — свой, псевдоним или с
+    /// правом Send As / Send on Behalf, адрес `Sender` — свой, псевдоним или с правом Send As ([`Delivery::sender_right`]);
+    /// иначе — `550 5.7.1` (RFC 5321, 4.3.2: `553` на `DATA` не предусмотрен). `From` по праву Send on Behalf без
+    /// `Sender` — `Ok(Some(адрес))`: заголовок `Sender` с именем входа добавляется к письму, как у JMAP. Нет `From` —
+    /// нечего подделывать, письмо принимается.
+    async fn check_headers(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+    ) -> Result<std::result::Result<Option<String>, Reply>> {
+        let Some(p) = submitter(env) else {
+            return Ok(Ok(None));
+        };
+        let refuse = |what: &str| -> Result<std::result::Result<Option<String>, Reply>> {
+            tracing::info!(id = %env.id, account = %p.account, header = what, "smtp: заголовок отправителя не принадлежит вошедшему пользователю");
+            Ok(Err(reply(
+                550,
+                [5, 7, 1],
+                format!("{what} address not owned by authenticated user"),
+            )))
+        };
+        if p.tenant != self.deps.tenant {
+            return refuse("From");
+        }
+        let fields = sender_fields(raw);
+        let mut on_behalf = false;
+        for (name, addrs) in &fields {
+            // Поле без адреса (группа без участников, неразборчивое значение) — не проверить, отказ.
+            if addrs.is_empty() {
+                return refuse(name);
+            }
+            for addr in addrs {
+                match self.sender_right(p.account, Some(p), addr).await? {
+                    Some(SendRight::SendAs) => {}
+                    Some(SendRight::SendOnBehalf) if *name == "From" => on_behalf = true,
+                    Some(SendRight::SendOnBehalf) | None => return refuse(name),
+                }
+            }
+        }
+        let has_sender = fields.iter().any(|(name, _)| *name == "Sender");
+        Ok(Ok((on_behalf && !has_sender).then(|| p.login.clone())))
     }
 
     /// Пересылка наружу: SRS-переписывание отправителя и ARC-подпись ([`crate::forward`], SMTP-23); приём
@@ -1350,6 +1430,11 @@ impl Delivery {
     async fn accept(&self, env: &Envelope, raw: Bytes, trail: &mut Trail) -> Result<Option<Reply>> {
         let received_at = OffsetDateTime::now_utc();
         trail.message_id = tracking::message_id(&raw);
+        // Адреса отправителя в заголовках — до проверок и фильтров: письмо от чужого имени дальше не идёт.
+        let sender_header = match self.check_headers(env, &raw).await? {
+            Ok(s) => s,
+            Err(r) => return Ok(Some(r)),
+        };
         let app = sources::application(env.source.as_deref()).is_some();
         let check = match (&self.deps.authcheck, env.mode) {
             // Приложение организации: проверки отправителя не нужны.
@@ -1380,6 +1465,10 @@ impl Delivery {
         let forged = check.as_ref().is_some_and(|c| c.junk);
         let mut junk = forged;
         let mut headers = self.trace_headers(env, received_at);
+        if let Some(login) = &sender_header {
+            // Send on Behalf: `Sender` — вошедший пользователь (RFC 5322, 3.6.2).
+            headers.push_str(&format!("Sender: {}\r\n", clean(login)));
+        }
         if let Some(c) = &check {
             // Authentication-Results и Received-SPF — выше Received этого узла (RFC 8601, 7208).
             headers.insert_str(0, &c.headers);
@@ -2514,6 +2603,17 @@ impl Handler for Delivery {
             .await
     }
 
+    async fn sender(&self, env: &Envelope) -> Option<Reply> {
+        let r = match self.check_mail_from(env).await {
+            Ok(r) => r?,
+            Err(e) => temporary(&e),
+        };
+        let step =
+            Step::new(Ek::Reject, tracking::decision(&r), Vec::new()).reason(tracking::reason(&r));
+        self.track(&env.mail_from, None, vec![step]).await;
+        Some(r)
+    }
+
     async fn limited(&self, env: &Envelope, reply: &Reply) {
         let step = Step::new(Ek::Reject, tracking::decision(reply), env.rcpts.clone())
             .reason(tracking::reason(reply));
@@ -2797,6 +2897,42 @@ fn sender_account(env: &Envelope, tenant: TenantId) -> Option<AccountId> {
         .as_ref()
         .filter(|p| env.mode == Mode::Submission && p.tenant == tenant)
         .map(|p| p.account)
+}
+
+/// Вошедший пользователь сеанса submission (SMTP-45): его адреса отправителя проверяются; smtp-in и приложение без
+/// входа — `None`.
+fn submitter(env: &Envelope) -> Option<&Principal> {
+    env.principal
+        .as_ref()
+        .filter(|_| env.mode == Mode::Submission)
+}
+
+/// Поля `From` и `Sender` письма (каждое вхождение, по порядку) с их адресами; адресов нет — поле не разобрано.
+fn sender_fields(raw: &[u8]) -> Vec<(&'static str, Vec<String>)> {
+    use mail_parser::HeaderName;
+    let Some(msg) = mail_parser::MessageParser::default().parse_headers(raw) else {
+        return Vec::new();
+    };
+    msg.headers()
+        .iter()
+        .filter_map(|h| match h.name {
+            HeaderName::From => Some(("From", &h.value)),
+            HeaderName::Sender => Some(("Sender", &h.value)),
+            _ => None,
+        })
+        .map(|(name, value)| {
+            let addrs = value
+                .as_address()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|a| a.address())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, addrs)
+        })
+        .collect()
 }
 
 /// Временная ошибка (`451 4.3.0`): хранилище или каталог недоступны.

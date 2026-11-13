@@ -128,6 +128,13 @@ impl fmt::Debug for Envelope {
 /// Обработчик транзакций сессии: проверка получателя и приём письма.
 #[async_trait]
 pub trait Handler: Send + Sync + 'static {
+    /// Проверяет отправителя конверта `env.mail_from` команды `MAIL` (получателей ещё нет): `Some` — отказ с этим
+    /// ответом. По умолчанию — принят.
+    async fn sender(&self, env: &Envelope) -> Option<Reply> {
+        let _ = env;
+        None
+    }
+
     /// Проверяет получателя `rcpt` для транзакции `env` (принятые ранее — в `env.rcpts`).
     /// Положительный ответ — получатель принят.
     async fn rcpt(&self, env: &Envelope, rcpt: &str) -> Reply;
