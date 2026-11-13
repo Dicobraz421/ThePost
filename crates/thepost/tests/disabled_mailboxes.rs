@@ -4,7 +4,6 @@
 //!
 //! Без `TEST_DATABASE_URL` тест пропускается.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
