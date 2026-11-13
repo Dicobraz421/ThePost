@@ -1,10 +1,14 @@
-//! Волна smtp-13: приём iMIP (SMTP-33) на заглушке `FakeItip` — приглашения и ответы извне.
+//! Волна smtp-13: приём iMIP (SMTP-33) на заглушке `FakeItip` — приглашения и ответы извне; событие `Itip` журнала
+//! доставки (SMTP-37).
 
+use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
+use tp_contracts::membership::NodeId;
 use tp_contracts::schedule::{ItipMethod, ItipOutcome, ItipSource};
-use tp_testkit::FakeItip;
+use tp_testkit::{FakeItip, MemDeliveryLog};
 
 use super::*;
 use crate::authcheck::tests as fx;
+use crate::tracking::Tracking;
 
 /// Письмо iMIP от `sender@example.com` получателю `bob@example.org`.
 fn imip(method: &str, organizer: &str, attendee: &str) -> String {
@@ -132,4 +136,62 @@ async fn each_recipient_account_once_without_subaddress() {
     let mut to: Vec<String> = itip.calls().into_iter().map(|c| c.to).collect();
     to.sort();
     assert_eq!(to, ["alice@example.org", "bob@example.org"]);
+}
+
+/// Доставка [`delivery`] с журналом доставки.
+fn tracked(env: &Env) -> (Delivery, FakeItip, MemDeliveryLog) {
+    let (d, itip) = delivery(env);
+    let log = MemDeliveryLog::new();
+    let node = NodeId::new("node-1").expect("node");
+    (
+        d.with_tracking(Tracking::new(Arc::new(log.clone()), node)),
+        itip,
+        log,
+    )
+}
+
+/// События `Itip` журнала.
+fn itip_events(log: &MemDeliveryLog) -> Vec<DeliveryEvent> {
+    log.events()
+        .into_iter()
+        .filter(|e| e.kind == DeliveryEventKind::Itip)
+        .collect()
+}
+
+/// SMTP-37: приём `REQUEST` — событие `Itip` получателю (метод, итог) рядом с доставкой в ящик.
+#[tokio::test]
+async fn request_is_tracked() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let (d, _itip, log) = tracked(&env);
+    let request = imip("REQUEST", "sender@example.com", "bob@example.org");
+    assert_eq!(send(&d, &request).await, 250);
+    let events = itip_events(&log);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let e = &events[0];
+    assert_eq!(e.decision, DeliveryDecision::Accept);
+    assert_eq!(e.reason.as_deref(), Some("REQUEST"));
+    assert_eq!(e.recipients, ["bob@example.org"]);
+    assert!(
+        log.events()
+            .iter()
+            .any(|e| e.kind == DeliveryEventKind::Deliver)
+    );
+}
+
+/// SMTP-37: пропуск — `Discard` с причиной; сбой приёма и письмо без доверия к `From` — без события `Itip`.
+#[tokio::test]
+async fn ignored_is_tracked_with_reason() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let (d, itip, log) = tracked(&env);
+    let request = imip("REQUEST", "sender@example.com", "bob@example.org");
+    itip.set("bob@example.org", ItipOutcome::Ignored("stale".into()));
+    assert_eq!(send(&d, &request).await, 250);
+    itip.fail_next(Error::UNAVAILABLE);
+    assert_eq!(send(&d, &request).await, 250);
+    let forged = imip("REQUEST", "boss@example.com", "bob@example.org");
+    assert_eq!(send(&d, &forged).await, 250);
+    let events = itip_events(&log);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].decision, DeliveryDecision::Discard);
+    assert_eq!(events[0].reason.as_deref(), Some("REQUEST: stale"));
 }
