@@ -373,7 +373,7 @@ mod tests {
     use tp_contracts::dav::{
         Collection, CollectionKind, Component, DavStore, ObjectIndex, Precondition, Span,
     };
-    use tp_contracts::meta::{AccountScope, AccountStore, AccountUpsert};
+    use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
     use tp_contracts::schedule::{BusyKind, BusyPeriod};
 
     use crate::testenv::Env;
@@ -397,8 +397,14 @@ mod tests {
         OffsetDateTime::parse(s, &Rfc3339).expect("time")
     }
 
-    /// Учётная запись организации с отображаемым именем.
-    async fn user(env: &Env, login: &str, name: &str, enabled: bool) -> AccountScope {
+    /// Учётная запись организации с отображаемым именем и видом.
+    async fn user(
+        env: &Env,
+        login: &str,
+        name: &str,
+        enabled: bool,
+        kind: AccountKind,
+    ) -> AccountScope {
         let scope = env.meta.account(login).await.expect("account");
         let cur = env
             .meta
@@ -413,7 +419,7 @@ mod tests {
             external_id: cur.external_id,
             enabled,
             aliases: cur.aliases,
-            kind: cur.kind,
+            kind,
             hidden_from_gal: false,
         };
         env.meta.upsert(scope.tenant, data).await.expect("upsert");
@@ -501,10 +507,31 @@ mod tests {
     async fn get_and_query() {
         let env = Env::new().await;
         let acc = env.account();
-        user(&env, "user@example.org", "Иван Петров", true).await;
-        let anna = user(&env, "anna@example.org", "Анна Смирнова", true).await;
-        let room = user(&env, "room-3@example.org", "Переговорная 3", true).await;
-        let off = user(&env, "gone@example.org", "Уволен", false).await;
+        user(
+            &env,
+            "user@example.org",
+            "Иван Петров",
+            true,
+            AccountKind::User,
+        )
+        .await;
+        let anna = user(
+            &env,
+            "anna@example.org",
+            "Анна Смирнова",
+            true,
+            AccountKind::User,
+        )
+        .await;
+        let room = user(
+            &env,
+            "room-3@example.org",
+            "Переговорная 3",
+            true,
+            AccountKind::Resource,
+        )
+        .await;
+        let off = user(&env, "gone@example.org", "Уволен", false, AccountKind::User).await;
         let id = |s: AccountScope| s.account.to_string();
 
         let g = call(&env, "Principal/get", json!({"accountId": acc})).await;
@@ -541,6 +568,18 @@ mod tests {
             g["list"][1]["capabilities"]["urn:ietf:params:jmap:calendars"]["accountId"],
             acc
         );
+        // Переговорная — участник вида «ресурс».
+        let g = call(
+            &env,
+            "Principal/get",
+            json!({"accountId": acc, "ids": [id(room)], "properties": ["type", "name"]}),
+        )
+        .await;
+        assert_eq!(
+            g["list"],
+            json!([{"id": id(room), "type": "resource", "name": "Переговорная 3"}]),
+            "{g}"
+        );
 
         let q = |args: Value| async {
             let mut a = args;
@@ -557,7 +596,7 @@ mod tests {
         .await;
         assert_eq!(r["ids"], json!([id(room), acc]), "{r}");
         assert_eq!(r["total"], 3);
-        // Переговорная находится по имени и адресу (вид «ресурс» — после CTR-48).
+        // Переговорная находится по имени и адресу.
         assert_eq!(
             q(json!({"filter": {"name": "переговорная"}})).await["ids"],
             json!([id(room)])
@@ -574,16 +613,17 @@ mod tests {
             q(json!({"filter": {"accountIds": [acc, id(anna)]}})).await["ids"],
             json!([acc])
         );
+        // Вид участника — по виду учётной записи: переговорная — ресурс (приёмка JMAP-30, JMAP-38).
         assert_eq!(
-            q(json!({"filter": {"type": "individual"}})).await["ids"]
-                .as_array()
-                .map(Vec::len),
-            Some(3)
+            q(json!({"filter": {"type": "individual"}})).await["ids"],
+            json!([id(anna), acc])
         );
         assert_eq!(
             q(json!({"filter": {"type": "resource"}})).await["ids"],
-            json!([])
+            json!([id(room)])
         );
+        let both = json!({"operator": "AND", "conditions": [{"type": "resource"}, {"text": "переговорная"}]});
+        assert_eq!(q(json!({"filter": both})).await["ids"], json!([id(room)]));
         let both = json!({"operator": "OR", "conditions": [{"name": "анна"}, {"name": "иван"}]});
         assert_eq!(
             q(json!({"filter": both})).await["ids"],
@@ -604,8 +644,8 @@ mod tests {
     async fn availability_of_two_users() {
         let env = Env::new().await;
         let acc = env.account();
-        let anna = user(&env, "anna@example.org", "Анна", true).await;
-        let off = user(&env, "gone@example.org", "Уволен", false).await;
+        let anna = user(&env, "anna@example.org", "Анна", true, AccountKind::User).await;
+        let off = user(&env, "gone@example.org", "Уволен", false, AccountKind::User).await;
         event(
             &env,
             env.scope,
