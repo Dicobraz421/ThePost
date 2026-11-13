@@ -20,6 +20,7 @@ pub mod commits;
 pub mod credentials;
 pub mod dav;
 pub mod delivery;
+mod directory;
 pub mod doctor;
 pub mod events;
 pub mod failover;
