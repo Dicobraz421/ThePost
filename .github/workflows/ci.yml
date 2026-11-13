@@ -126,23 +126,32 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
+      - run: cargo test --doc --workspace --locked
       # Схема Admin API = копия консоли (решение 74, CI-11): `thepost admin openapi` (APP-37, без узла) — бинарь,
-      # собранный nextest для интеграционных тестов thepost, без отдельной сборки.
-      - name: Схема Admin API = console/src/api/openapi.json
+      # собранный nextest для интеграционных тестов thepost, без отдельной сборки. Сравнение — по содержанию (jq -S):
+      # копию снимают и `curl` с узла (console/README.md), порядок ключей там не алфавитный. Свежая схема при
+      # расхождении — артефакт openapi.json.
+      - id: openapi
+        name: Схема Admin API = console/src/api/openapi.json
         if: needs.changes.outputs.openapi == 'true'
         shell: bash
         run: |
           bin=target/debug/thepost
           [ -x "$bin" ] || { echo "::error::$bin не собран nextest — сверять схему нечем"; exit 1; }
           "$bin" admin openapi -o "$RUNNER_TEMP/openapi.json"
-          if ! diff -u console/src/api/openapi.json "$RUNNER_TEMP/openapi.json"; then
+          if ! diff -u --label console/src/api/openapi.json --label 'thepost admin openapi' \
+            <(jq -S . console/src/api/openapi.json) <(jq -S . "$RUNNER_TEMP/openapi.json"); then
             echo "::error file=console/src/api/openapi.json::схема Admin API разошлась с копией консоли —" \
               "перегенерировать схему консоли: thepost admin openapi -o console/src/api/openapi.json," \
               "затем (cd console && npm run gen:api)"
             exit 1
           fi
           echo "схема Admin API совпадает с console/src/api/openapi.json"
-      - run: cargo test --doc --workspace --locked
+      - if: failure() && steps.openapi.outcome == 'failure'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: openapi.json
+          path: ${{ runner.temp }}/openapi.json
 
   # Поставка без интерпретаторов (решение 2026-11-01, SRS 7.2; CI-05): самопроверка interp_check.py и базовый
   # образ последней стадии deploy/docker/Dockerfile. Готовый образ и архивы проверяет beta.yml до публикации.
