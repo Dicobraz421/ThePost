@@ -590,7 +590,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | blob-10 | BLOB-17 | A | — | 4 |
 | deploy-35 | DEP-49 | A | app-39, app-37 | 4 |
 | docs-05 | DOC-05 | A | deploy-35 | 1 |
-| ✅ app-50 | APP-56 | A | auth-12 | 2 |
+| app-50 | APP-56 | A | auth-12 | 2 |
 | contracts-48 (ветка `x/contracts-48`) | CTR-72 | B | — | 1 |
 
 Влиты: `app-49` — #555, `mailstore-13` — #574 (issues #475, #468 закрыты).
