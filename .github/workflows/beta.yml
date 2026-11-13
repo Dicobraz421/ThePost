@@ -10,12 +10,12 @@
 # CI-06: build и repro собирают console/dist (.github/actions/console) до cross build (фича `console` крейта thepost).
 # CI-08: образ — с консолью (deploy/docker/Dockerfile, CONSOLE=1 по умолчанию, DEP-35); build (x86_64) и image
 # проверяют, что thepost отвечает на GET /console/ страницей консоли (.github/actions/console-check).
+# CI-10 (решение 68): архив веб-консоли thepost-console-<тег>.tar.gz (и .sha256) — console/dist сборки x86_64, что
+# вшита в бинарь (console-check сверяет index.html); repro сверяет sha256 архива; подписан, как остальные.
 # CI-14 (решение 116): сборка build и repro — .github/actions/release-build (её же берёт артефакт ci.yml): cross под
 # базовый x86-64 без AVX2, бинарь x86_64 запускается на qemu Nehalem — падение валит сборку.
 # CI-13 (решение 111): образ ещё и с тегом версии выпуска — appVersion из deploy/helm/thepost/Chart.yaml (источник
 # версии; чарт по умолчанию берёт тот же тег). Все теги — один digest: подпись cosign и SBOM образа — на все.
-# CI-10 (решение 68): архив веб-консоли thepost-console-<тег>.tar.gz (и .sha256) — console/dist сборки x86_64, что
-# вшита в бинарь (console-check сверяет index.html); repro сверяет sha256 архива; подписан, как остальные.
 name: Beta
 
 on:

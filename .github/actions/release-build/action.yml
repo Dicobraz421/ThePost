@@ -50,6 +50,18 @@ runs:
         ARGS: ${{ steps.console.outputs.cargo-args }}
         RUSTFLAGS: ''
       run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
+    # qemu-user и гостевая система — из Debian 12 (glibc под базовый x86-64), в контейнере: на раннере ubuntu-26.04
+    # загрузчик и libc собраны под x86-64-v3 и под Nehalem падают сами, ещё до бинаря (qemu -L не спасает).
+    - name: Запуск на старом процессоре (qemu Nehalem, без AVX)
+      if: inputs.target == 'x86_64-unknown-linux-gnu'
+      shell: bash
+      env:
+        BIN: target/${{ inputs.target }}/release/thepost
+        GUEST: debian:12-slim
+      run: |
+        docker run --rm -v "$PWD/$BIN:/thepost:ro" "$GUEST" sh -c 'apt-get update -qq &&
+          apt-get install -y -qq --no-install-recommends qemu-user >/dev/null &&
+          qemu-x86_64 -cpu Nehalem /thepost --version'
     # Архив console/dist (решение 68, CI-10) для раздачи веб-сервером — те же файлы, что вшиты в бинарь этой сборки.
     # Детерминированный: порядок имён, время — коммита, владелец 0:0, права нормализованы, gzip без имени и времени;
     # repro сверяет его sha256. Каталог в архиве — имя архива.
@@ -67,15 +79,3 @@ runs:
           -cf - dist | gzip -9n > "$OUT/$NAME.tar.gz"
         (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" && cat "$NAME.tar.gz.sha256")
         echo "path=$OUT/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
-    # qemu-user и гостевая система — из Debian 12 (glibc под базовый x86-64), в контейнере: на раннере ubuntu-26.04
-    # загрузчик и libc собраны под x86-64-v3 и под Nehalem падают сами, ещё до бинаря (qemu -L не спасает).
-    - name: Запуск на старом процессоре (qemu Nehalem, без AVX)
-      if: inputs.target == 'x86_64-unknown-linux-gnu'
-      shell: bash
-      env:
-        BIN: target/${{ inputs.target }}/release/thepost
-        GUEST: debian:12-slim
-      run: |
-        docker run --rm -v "$PWD/$BIN:/thepost:ro" "$GUEST" sh -c 'apt-get update -qq &&
-          apt-get install -y -qq --no-install-recommends qemu-user >/dev/null &&
-          qemu-x86_64 -cpu Nehalem /thepost --version'
