@@ -1,4 +1,5 @@
-//! META-31: журнал событий, очередь и учёт BLOB по шардам — два шарда (две БД одного PostgreSQL).
+//! META-31: журнал событий, очередь и учёт BLOB по шардам — два шарда (две БД одного PostgreSQL); META-72:
+//! ближайший срок и сигнал очереди по шардам.
 
 mod common;
 
@@ -12,13 +13,14 @@ use tp_contracts::blob::{Acquire, BlobIndex, Commit};
 use tp_contracts::bus::{Event, EventBus, EventKind};
 use tp_contracts::events::{EventSink, LoggedEvent, ShardEventLogs};
 use tp_contracts::meta::{AccountScope, MailboxStore, MessageStore, NewMessage, SpecialUse};
-use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore, RcptStatus};
+use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore, RcptStatus, queue_ready};
 use tp_contracts::{AccountId, BlobHash, BlobKey, Gen, ModSeq, ShardId, TenantId};
 use tp_meta::PgMeta;
 use tp_meta::events::{EventConsumer, EventsConfig};
 use tp_meta::failover::connect_failover;
 use tp_meta::pool::{DbPool, NoAcquireObserver};
 use tp_meta::signals::{PgSignalBus, ShardedSignalBus, SignalsConfig, connect_listener};
+use tp_testkit::MemEventBus;
 
 fn hash() -> BlobHash {
     let mut h = [0u8; 32];
@@ -250,6 +252,79 @@ async fn queue_enqueue_goes_to_owner_shard() {
     let mut main = vec![*on_a.as_uuid(), *unknown.as_uuid(), *none.as_uuid()];
     main.sort();
     assert_eq!(ids(t.main.meta.pool().clone()).await, main);
+    t.drop_db().await;
+}
+
+/// META-72: `next_due` хранилищ со справочником — наименьший срок по всем шардам; постановка на шард отправителя
+/// и перенос записи этого шарда публикуют `QueueReady` организации.
+#[tokio::test]
+async fn queue_next_due_and_signal_across_shards() {
+    let Some(t) = common::two_shards().await else {
+        return;
+    };
+    let bus = Arc::new(MemEventBus::default());
+    let meta = t.meta.clone().with_bus(bus.clone());
+    let org = t.tenant().await;
+    let tenant = org.0;
+    let b = t.account_on(org, t.shard).await;
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    let mut ready = async |what: &str| {
+        let e = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match sys.next().await {
+                    Some(e) if e.kind == EventKind::QueueReady => return e,
+                    Some(_) => continue,
+                    None => panic!("подписка завершена"),
+                }
+            }
+        })
+        .await
+        .expect(what);
+        assert_eq!(e, queue_ready(tenant), "{what}");
+    };
+    // Сроки — в целых секундах: PostgreSQL хранит время с точностью до микросекунды.
+    let t0 = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("ts");
+    let at = |s: i64| t0 + time::Duration::seconds(s);
+    let message = |rcpt: &str, s: i64| OutMessage {
+        next_attempt: at(s),
+        ..out(tenant, rcpt)
+    };
+    assert_eq!(meta.next_due().await, Ok(None), "пустая очередь");
+
+    meta.enqueue(None, message("main@x.test", 60))
+        .await
+        .expect("enqueue main");
+    ready("сигнал после постановки в основную БД").await;
+    meta.enqueue(Some(b.account), message("b@x.test", 10))
+        .await
+        .expect("enqueue b");
+    ready("сигнал после постановки на второй шард").await;
+    let on_shard: i64 = sqlx::query_scalar("SELECT count(*) FROM queue")
+        .fetch_one(&mut *common::conn(&t.shard_pool).await)
+        .await
+        .expect("count");
+    assert_eq!(on_shard, 1, "письмо — на шарде отправителя");
+    assert_eq!(
+        meta.next_due().await,
+        Ok(Some(at(10))),
+        "ближайший срок — второго шарда"
+    );
+
+    let got = meta
+        .claim(at(10), 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].rcpts[0].rcpt.address, "b@x.test");
+    meta.reschedule(&got[0].claim, "b@x.test", at(120), "451 later")
+        .await
+        .expect("reschedule");
+    ready("сигнал после переноса на втором шарде").await;
+    assert_eq!(
+        meta.next_due().await,
+        Ok(Some(at(60))),
+        "ближайший срок — основной БД"
+    );
     t.drop_db().await;
 }
 
