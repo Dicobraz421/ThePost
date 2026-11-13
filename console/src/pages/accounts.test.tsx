@@ -23,6 +23,8 @@ const account = (id: string, login: string, more: object = {}) => ({
   display_name: login,
   enabled: true,
   external_id: null,
+  aliases: [] as string[],
+  hidden_from_gal: false,
   quota: { used_bytes: 2048, messages: 3, limit_bytes: null },
   policy: empty,
   effective: empty,
@@ -132,14 +134,53 @@ test("учётная запись: блокировка и имя — PATCH то
   await waitFor(() => expect(sent(calls, "PATCH", `${BASE}/accounts/a1`)[1]?.body).toEqual({ display_name: "Алиса" }));
 });
 
-test("учётная запись каталога: имя и блокировка только для чтения", async () => {
+test("учётная запись каталога: имя и блокировка только для чтения, псевдонимов и скрытия в форме нет", async () => {
   open("/accounts/a1", {
-    [`GET ${BASE}/accounts/a1`]: { body: account("a1", "alice@example.org", { external_id: "uid=alice" }) },
+    [`GET ${BASE}/accounts/a1`]: {
+      body: account("a1", "alice@example.org", { external_id: "uid=alice", aliases: ["a@example.org"], hidden_from_gal: true }),
+    },
     [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
   });
-  expect(await screen.findByText("Имя и блокировку записи каталога ведёт каталог.")).toBeTruthy();
+  expect(
+    await screen.findByText("Имя, блокировку, псевдонимы и скрытие из книги «Организация» записи каталога ведёт каталог."),
+  ).toBeTruthy();
   expect((screen.getByRole("switch", { name: "Разрешить вход" }) as HTMLButtonElement).disabled).toBe(true);
   expect(screen.queryByRole("button", { name: "Сохранить" })).toBeNull();
+  // Значения каталога — в сведениях карточки, полей формы нет.
+  expect(screen.getByText("a@example.org")).toBeTruthy();
+  expect(screen.getByText("скрыта")).toBeTruthy();
+  expect(screen.queryByRole("switch", { name: "Скрыть из книги «Организация»" })).toBeNull();
+  expect(screen.queryByLabelText("Псевдонимы")).toBeNull();
+});
+
+test("локальная учётная запись: псевдонимы и скрытие из книги — PATCH только изменённых полей", async () => {
+  let current = account("a1", "alice@example.org", { aliases: ["al@example.org"] });
+  const calls = open("/accounts/a1", {
+    [`GET ${BASE}/accounts/a1`]: () => ({ body: current }),
+    [`GET ${BASE}/accounts/a1/app-passwords`]: { body: [] },
+    [`PATCH ${BASE}/accounts/a1`]: (c) => {
+      current = { ...current, ...(c.body as object) };
+      return { body: current };
+    },
+  });
+  const save = await waitFor(() => {
+    const b = screen.getByRole("button", { name: "Сохранить" }) as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
+    return b;
+  });
+  expect(screen.getByText("видна")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Псевдонимы"), { target: { value: "alice.s@example.org," } });
+  fireEvent.click(screen.getByRole("switch", { name: "Скрыть из книги «Организация»" }));
+  await waitFor(() => expect(save.disabled).toBe(false));
+  fireEvent.click(save);
+  await waitFor(() =>
+    expect(sent(calls, "PATCH", `${BASE}/accounts/a1`)[0]?.body).toEqual({
+      aliases: ["al@example.org", "alice.s@example.org"],
+      hidden_from_gal: true,
+    }),
+  );
+  expect(await screen.findByText("скрыта")).toBeTruthy();
+  expect(screen.getByText("al@example.org, alice.s@example.org")).toBeTruthy();
 });
 
 test("пароли приложений: выпуск показывает пароль один раз, отзыв — DELETE", async () => {

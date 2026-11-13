@@ -2075,6 +2075,14 @@ async fn gal_without_ldap() {
     assert!(text.contains(maintenance), "{text}");
     assert!(!text.contains("ldap"), "{text}");
     let text = text.replace(maintenance, &format!("{maintenance}  gal_interval: 1s\n"));
+    // Снимок адресов SMTP — раз в секунду: псевдоним, заданный через Admin API, принимает почту без ожидания периода
+    // по умолчанию (`smtp.delivery.directory_refresh`).
+    let smtp = "smtp:\n  hostname: localhost\n";
+    assert!(text.contains(smtp), "{text}");
+    let text = text.replace(
+        smtp,
+        &format!("{smtp}  delivery:\n    directory_refresh: 1s\n"),
+    );
     std::fs::write(&path, text).expect("config");
     let cfg = thepost::sections::registry()
         .expect("registry")
@@ -2176,6 +2184,156 @@ async fn gal_without_ldap() {
     assert!(got.starts_with("HTTP/1.1 200"), "{got}");
     assert!(got.contains("FN:Ivan Petrov"), "{got}");
     assert!(got.contains(&colleague), "{got}");
+
+    // ADM-42: псевдоним через Admin API — почта на него доходит, CalDAV показывает его среди адресов принципала.
+    let one = format!("/api/v1/orgs/{tenant}/accounts/{id}");
+    let alias = format!("iv@{domain}");
+    let (code, body) = http(
+        admin,
+        "PATCH",
+        &one,
+        &bearer,
+        Some(&json!({ "aliases": [alias.to_uppercase()] })),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let patched: Value = serde_json::from_slice(&body).expect("account");
+    assert_eq!(patched["aliases"], json!([alias]), "{patched}");
+    let ivan = meta
+        .by_login(tenant, &colleague)
+        .await
+        .expect("by_login")
+        .expect("ivan");
+    let (_, ivan_secret) = apps
+        .issue(
+            AccountScope {
+                tenant,
+                account: ivan.id,
+            },
+            "alias",
+        )
+        .await
+        .expect("issue");
+    let word = format!("alias{}", std::process::id());
+    let message = format!(
+        "From: Bob <bob@sender.test>\nTo: <{alias}>\nSubject: {word}\n\
+         Message-ID: <{word}@sender.test>\n\nДоставка на псевдоним.\n"
+    );
+    // Снимок адресов SMTP живёт `directory_refresh` (1 с): псевдоним в нём — после обновления. Опрос `RCPT` в цикле
+    // упёрся бы в частоту соединений экрана smtp-in (`screen.max_rate`, `421`).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    smtp_send(
+        addr(&running, "smtp-in"),
+        "bob@sender.test",
+        &alias,
+        &message,
+    )
+    .await;
+    let mut imap = imap_login(addr(&running, "imap"), &colleague, ivan_secret.expose()).await;
+    let until = deadline();
+    while exists(&imap.cmd("SELECT INBOX").await) != 1 {
+        retry(until, "письмо на псевдоним во «Входящих» ivan").await;
+    }
+    let fetch = imap.cmd("FETCH 1 (BODY.PEEK[HEADER])").await;
+    assert!(fetch.contains(&word), "{fetch}");
+    let ivan_basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{colleague}:{}", ivan_secret.expose()))
+    );
+    let found = dav_send(
+        web,
+        "PROPFIND",
+        &format!("/dav/principals/{colleague}/"),
+        &ivan_basic,
+        "Depth: 0\r\n",
+        "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">\
+         <d:prop><c:calendar-user-address-set/></d:prop></d:propfind>",
+    )
+    .await;
+    assert!(found.starts_with("HTTP/1.1 207"), "{found}");
+    let mailto: Vec<String> = dav_hrefs(&found)
+        .into_iter()
+        .filter(|h| h.starts_with("mailto:"))
+        .collect();
+    assert_eq!(
+        mailto,
+        [format!("mailto:{colleague}"), format!("mailto:{alias}")],
+        "{found}"
+    );
+
+    // Адрес группы псевдонимом не становится — 409; запись каталога псевдонимы через API не меняет — 409.
+    let (code, body) = http(
+        admin,
+        "POST",
+        &format!("/api/v1/orgs/{tenant}/groups"),
+        &bearer,
+        Some(&json!({ "name": "Staff", "address": format!("staff@{domain}") })),
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = http(
+        admin,
+        "PATCH",
+        &one,
+        &bearer,
+        Some(&json!({ "aliases": [format!("staff@{domain}")] })),
+    )
+    .await;
+    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    let dir = meta
+        .upsert(
+            tenant,
+            AccountUpsert {
+                domain: ivan.domain,
+                login: format!("ldap@{domain}"),
+                display_name: "LDAP".into(),
+                external_id: Some("guid-ldap".into()),
+                enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::User,
+                hidden_from_gal: false,
+            },
+        )
+        .await
+        .expect("запись каталога");
+    for patch in [
+        json!({ "aliases": [format!("l@{domain}")] }),
+        json!({ "hidden_from_gal": true }),
+    ] {
+        let (code, body) = http(
+            admin,
+            "PATCH",
+            &format!("/api/v1/orgs/{tenant}/accounts/{}", dir.id),
+            &bearer,
+            Some(&patch),
+        )
+        .await;
+        assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    }
+
+    // Скрытая из книги учётная запись пропадает из «Организации» за `gal_interval`, почту по-прежнему принимает.
+    let (code, body) = http(
+        admin,
+        "PATCH",
+        &one,
+        &bearer,
+        Some(&json!({ "hidden_from_gal": true })),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let until = deadline();
+    loop {
+        let listed = dav(web, "PROPFIND", &gal, &basic, "1").await;
+        if listed.starts_with("HTTP/1.1 207") && !listed.contains(&card) {
+            break;
+        }
+        retry(
+            until,
+            &format!("карточки {card} нет в книге «Организация»: {listed}"),
+        )
+        .await;
+    }
 
     shutdown.cancel();
     let report = running.wait().await.expect("wait");

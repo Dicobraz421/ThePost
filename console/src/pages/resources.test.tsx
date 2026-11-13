@@ -24,6 +24,8 @@ const resource = (id: string, login: string, name: string, booking: object | nul
   display_name: name,
   enabled: true,
   external_id: null,
+  aliases: [],
+  hidden_from_gal: false,
   quota: { used_bytes: 0, messages: 0, limit_bytes: null },
   policy: empty,
   effective: empty,

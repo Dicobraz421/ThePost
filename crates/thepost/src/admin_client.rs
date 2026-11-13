@@ -231,6 +231,23 @@ pub enum AccountAction {
         /// Новое отображаемое имя (непустое, одна строка).
         name: String,
     },
+    /// Псевдонимы и скрытие из книги «Организация» локальной учётной записи (у записи каталога — 409, их ведёт
+    /// каталог). Нужен хотя бы один ключ.
+    Set {
+        /// Идентификатор (UUID) или имя входа.
+        account: String,
+        /// Псевдоним — адрес в принятом домене организации, не занятый учётной записью, группой или контактом (иначе
+        /// 409). Ключ повторяется; заданные псевдонимы заменяют прежние.
+        #[arg(long = "alias", value_name = "АДРЕС", conflicts_with = "no_aliases")]
+        aliases: Vec<String>,
+        /// Снять все псевдонимы.
+        #[arg(long)]
+        no_aliases: bool,
+        /// Скрыть из книги «Организация» (`true`) или показать в ней (`false`); книга меняется не позже чем через
+        /// `maintenance.gal_interval`.
+        #[arg(long, value_name = "true|false")]
+        hidden_from_gal: Option<bool>,
+    },
 }
 
 /// Действия с паролями приложений.
@@ -1443,6 +1460,27 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                     let a = patch_account(client, &org, &account, &patch).await?;
                     out(args, &a, account_record(&a))
                 }
+                AccountAction::Set {
+                    account,
+                    aliases,
+                    no_aliases,
+                    hidden_from_gal,
+                } => {
+                    let aliases = (no_aliases || !aliases.is_empty()).then_some(aliases);
+                    if aliases.is_none() && hidden_from_gal.is_none() {
+                        return Err(
+                            "нужен хотя бы один ключ: --alias, --no-aliases, --hidden-from-gal"
+                                .to_owned(),
+                        );
+                    }
+                    let patch = AccountPatch {
+                        aliases,
+                        hidden_from_gal,
+                        ..AccountPatch::default()
+                    };
+                    let a = patch_account(client, &org, &account, &patch).await?;
+                    out(args, &a, account_record(&a))
+                }
             }
         }
         ApiAction::AppPassword { action } => {
@@ -2512,6 +2550,11 @@ fn account_record(a: &AccountInfo) -> String {
         ("Имя входа", a.login.clone()),
         ("Имя", or_dash(&a.display_name)),
         ("Вход разрешён", a.enabled.to_string()),
+        ("Псевдонимы", or_dash(&a.aliases.join(", "))),
+        (
+            "Скрыта из книги «Организация»",
+            a.hidden_from_gal.to_string(),
+        ),
         ("Домен", a.domain.clone()),
         ("Занято, байт", a.quota.used_bytes.to_string()),
         ("Писем", a.quota.messages.to_string()),
@@ -4079,6 +4122,69 @@ mod tests {
             account: "нет@block.test".into(),
         });
         assert!(exec(&c, false, missing).await.is_err());
+    }
+
+    /// ADM-42: `account set` — псевдонимы (замена и снятие) и скрытие из книги «Организация»; домен не принят — 409;
+    /// без ключей — ошибка без запроса.
+    #[tokio::test]
+    async fn account_set_against_admin_api() {
+        let (_admin, url) = admin_api().await;
+        let c = client(&url, "oidc");
+        let login = || "a@alias.test".to_owned();
+        let account = account_action;
+        for action in [
+            domain_action(DomainAction::Create {
+                name: "alias.test".into(),
+                relay: None,
+            }),
+            account(AccountAction::Create {
+                login: login(),
+                name: None,
+            }),
+        ] {
+            exec(&c, false, action).await.expect("подготовка");
+        }
+        let set = |aliases: &[&str], no_aliases: bool, hidden_from_gal: Option<bool>| {
+            account(AccountAction::Set {
+                account: login(),
+                aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
+                no_aliases,
+                hidden_from_gal,
+            })
+        };
+        let fields = |out: CliResult<String>| {
+            let v: Value = serde_json::from_str(&out.expect("ответ")).expect("json");
+            (v["aliases"].clone(), v["hidden_from_gal"].clone())
+        };
+        let out = exec(
+            &c,
+            true,
+            set(&["B@alias.test", "c@alias.test"], false, None),
+        )
+        .await;
+        assert_eq!(
+            fields(out),
+            (json!(["b@alias.test", "c@alias.test"]), json!(false))
+        );
+        let out = exec(&c, true, set(&[], false, Some(true))).await;
+        assert_eq!(
+            fields(out),
+            (json!(["b@alias.test", "c@alias.test"]), json!(true))
+        );
+        let shown = exec(&c, false, set(&[], true, Some(false)))
+            .await
+            .expect("set");
+        assert!(shown.contains("Псевдонимы"), "{shown}");
+        let get = account(AccountAction::Get { account: login() });
+        assert_eq!(fields(exec(&c, true, get).await), (json!([]), json!(false)));
+        let err = exec(&c, false, set(&["x@other.test"], false, None))
+            .await
+            .expect_err("409");
+        assert!(err.contains("409"), "{err}");
+        let err = exec(&c, false, set(&[], false, None))
+            .await
+            .expect_err("без ключей");
+        assert!(err.contains("--alias"), "{err}");
     }
 
     /// `--after` из подсказки вывода (`… --after <имя входа>`); нет подсказки — `None`.
