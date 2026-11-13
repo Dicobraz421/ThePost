@@ -97,7 +97,8 @@ fn unsupported(why: impl Into<String>) -> MethodError {
     MethodError::with("unsupportedFilter", why)
 }
 
-fn utc(s: &str) -> MethodResult<OffsetDateTime> {
+/// `UTCDate` (RFC 3339); неверная строка — `invalidArguments`.
+pub(crate) fn utc(s: &str) -> MethodResult<OffsetDateTime> {
     OffsetDateTime::parse(s, &Rfc3339)
         .map_err(|_| MethodError::invalid(format!("bad UTCDate: {s}")))
 }

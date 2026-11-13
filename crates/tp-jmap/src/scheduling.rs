@@ -8,14 +8,15 @@
 //! `sendSchedulingMessages: true` — `invalidArguments`.
 //!
 //! `CalendarEventNotification` — сообщения входящих планирования (`DavStore::inbox_list`): `id` — идентификатор
-//! ресурса входящих, `state` — `Inbox::state`. Отличия от черновика:
+//! ресурса входящих, `state` — `DavStore::inbox_state`, `/changes` — по журналу входящих `DavStore::inbox_changes`
+//! (CTR-65; JMAP-42). Отличия от черновика:
 //! - уведомление — входящее сообщение iTIP, а не запись о чужой правке общего календаря (общие календари — JMAP-32);
 //!   применённые сервером `REQUEST`, `REPLY`, `CANCEL` во входящих остаются только при `dav.schedule_keep_processed`;
 //! - `type`: `CANCEL` — `destroyed`; `REQUEST`, `ADD`, `PUBLISH` с `sequence` 0 — `created`; остальное — `updated`;
 //! - `event` — событие из сообщения (у `updated` — новое состояние, `eventPatch` — `null`: прежнего нет);
-//! - `created` — отметка времени из сообщения (`DTSTAMP`): времени поступления во входящих нет;
-//! - `/changes`: входящие без надгробий, поэтому при изменившемся состоянии — `cannotCalculateChanges`;
-//! - `/query`, `/queryChanges` не поддерживаются;
+//! - `created` — время поступления во входящие (`InboxItem::received_at`);
+//! - `/query`: фильтр `after`, `before` (по `created`), `type`, `calendarEventIds` и операторы, сортировка — по
+//!   `created` (по умолчанию — по возрастанию); `canCalculateChanges` — `false`, `/queryChanges` не поддерживается;
 //! - `ParticipantIdentity` — один адрес (имя входа); `/changes`, `/set` не поддерживаются.
 
 use std::str::FromStr;
@@ -27,16 +28,17 @@ use tp_contracts::dav::{
     CollectionId, DavObjectId, DavStore, ObjectIndex, Precondition, PutOutcome,
 };
 use tp_contracts::schedule::{InboxItem, ItipMethod};
-use tp_dav::index::IndexOptions;
 use tp_dav::itip;
 
 use crate::calendar_event::{calendar_ids, split};
-use crate::core::error::{MethodError, MethodResult, set_error};
+use crate::core::error::{MethodError, MethodResult, changes_error, set_error};
 use crate::core::request::{
-    ChangesArgs, GetArgs, SetArgs, SetOutcome, changes_response, object, parse_args, parse_state,
-    select, state_string,
+    ChangesArgs, Comparator, GetArgs, QueryWindow, SetArgs, SetOutcome, apply_window,
+    changes_response, map_changes, object, parse_args, parse_state, select, state_string,
 };
 use crate::core::{Ctx, Jmap};
+use crate::email_get::utc_date;
+use crate::email_query::utc;
 
 /// Адреса календарного пользователя вошедшего (`tp_dav::itip::address`): имя входа, если оно — адрес (как в CalDAV).
 pub(crate) fn addresses(ctx: &Ctx<'_>) -> Vec<String> {
@@ -46,17 +48,6 @@ pub(crate) fn addresses(ctx: &Ctx<'_>) -> Vec<String> {
     } else {
         Vec::new()
     }
-}
-
-/// Индекс объекта календаря для записи: интервал, занятость (у повторяющегося события — признак
-/// `ObjectIndex::recurring`, META-54), `Schedule-Tag` — как при записи CalDAV.
-pub(crate) fn object_index(
-    ical: &ICalendar,
-    opts: &IndexOptions,
-) -> Result<ObjectIndex, tp_dav::index::IndexError> {
-    let mut idx = tp_dav::index::of_calendar(ical, opts)?;
-    idx.schedule_tag = itip::schedule_tag(ical);
-    Ok(idx)
 }
 
 /// `isOrigin`: событие не объект планирования или вошедший — его организатор.
@@ -202,9 +193,14 @@ fn participant_name(event: &Map<String, Value>, addr: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `id` события календарей учётной записи с UID `uid`.
-async fn event_id(ctx: &Ctx<'_>, store: &dyn DavStore, uid: &str) -> MethodResult<Option<String>> {
-    for cal in calendar_ids(store, ctx.scope).await? {
+/// `id` события календарей `cals` учётной записи с UID `uid`.
+async fn event_id(
+    ctx: &Ctx<'_>,
+    store: &dyn DavStore,
+    cals: &[CollectionId],
+    uid: &str,
+) -> MethodResult<Option<String>> {
+    for &cal in cals {
         if let Some(o) = store.object_by_uid(ctx.scope, cal, uid).await? {
             return Ok(Some(o.id.to_string()));
         }
@@ -212,22 +208,35 @@ async fn event_id(ctx: &Ctx<'_>, store: &dyn DavStore, uid: &str) -> MethodResul
     Ok(None)
 }
 
-/// Уведомление из сообщения входящих планирования.
-async fn notification(
-    ctx: &Ctx<'_>,
-    store: &dyn DavStore,
-    item: &InboxItem,
-) -> MethodResult<Map<String, Value>> {
+/// Событие JSCalendar из сообщения входящих.
+fn message_event(item: &InboxItem) -> Map<String, Value> {
     let msg = &item.message;
     let mut event = split(&msg.body).map(|(_, e)| e).unwrap_or_default();
     event.entry("@type").or_insert_with(|| json!("Event"));
     event.entry("uid").or_insert_with(|| json!(msg.uid));
+    event
+}
+
+/// `type` уведомления по методу сообщения и `sequence` события.
+fn kind(item: &InboxItem, event: &Map<String, Value>) -> &'static str {
     let first = event.get("sequence").and_then(Value::as_u64).unwrap_or(0) == 0;
-    let kind = match msg.method {
+    match item.message.method {
         ItipMethod::Cancel => "destroyed",
         ItipMethod::Request | ItipMethod::Add | ItipMethod::Publish if first => "created",
         _ => "updated",
-    };
+    }
+}
+
+/// Уведомление из сообщения входящих планирования; `cals` — календари учётной записи.
+async fn notification(
+    ctx: &Ctx<'_>,
+    store: &dyn DavStore,
+    cals: &[CollectionId],
+    item: &InboxItem,
+) -> MethodResult<Map<String, Value>> {
+    let msg = &item.message;
+    let event = message_event(item);
+    let kind = kind(item, &event);
     let from = itip::address(&msg.from);
     let principal = ctx
         .jmap
@@ -236,13 +245,9 @@ async fn notification(
         .by_login(ctx.scope.tenant, &from)
         .await?
         .map(|a| a.id.to_string());
-    let created = ["updated", "created"]
-        .iter()
-        .find_map(|k| event.get(*k).filter(|v| v.is_string()).cloned())
-        .unwrap_or_else(|| json!("1970-01-01T00:00:00Z"));
     Ok(object(json!({
         "id": item.id.to_string(),
-        "created": created,
+        "created": utc_date(item.received_at),
         "changedBy": {
             "name": participant_name(&event, &from).unwrap_or_default(),
             "email": from,
@@ -251,7 +256,7 @@ async fn notification(
         },
         "comment": null,
         "type": kind,
-        "calendarEventId": event_id(ctx, store, &msg.uid).await?,
+        "calendarEventId": event_id(ctx, store, cals, &msg.uid).await?,
         "isDraft": false,
         "event": event,
         "eventPatch": null,
@@ -290,9 +295,10 @@ pub(crate) async fn notification_get(
             out
         }
     };
+    let cals = calendar_ids(store.as_ref(), ctx.scope).await?;
     for item in picked {
         list.push(select(
-            notification(ctx, store.as_ref(), item).await?,
+            notification(ctx, store.as_ref(), &cals, item).await?,
             props,
         ));
     }
@@ -304,28 +310,143 @@ pub(crate) async fn notification_get(
     })))
 }
 
-/// `CalendarEventNotification/changes`: входящие без надгробий — при изменившемся состоянии клиент перечитывает
-/// список (`cannotCalculateChanges`).
+/// `CalendarEventNotification/changes` по журналу входящих планирования (`DavStore::inbox_changes`).
 pub(crate) async fn notification_changes(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: ChangesArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
-    a.limit(ctx.jmap.cfg.max_changes)?;
+    let limit = a.limit(ctx.jmap.cfg.max_changes)?;
     let since = parse_state(&a.since_state)?;
-    let inbox = ctx.jmap.dav_store()?.inbox_list(ctx.scope).await?;
-    if since != inbox.state {
-        return Err(MethodError::new("cannotCalculateChanges"));
-    }
-    let none = tp_contracts::meta::Changes::<String> {
-        created: Vec::new(),
-        updated: Vec::new(),
-        destroyed: Vec::new(),
-        new_state: inbox.state,
-        has_more: false,
+    let c = ctx
+        .jmap
+        .dav_store()?
+        .inbox_changes(ctx.scope, since, limit)
+        .await
+        .map_err(changes_error)?;
+    let c = map_changes(c, ToString::to_string);
+    Ok(changes_response(&a.account_id, &a.since_state, &c))
+}
+
+/// Свойства уведомления, по которым фильтрует и сортирует `/query`.
+struct Facts {
+    id: String,
+    created: OffsetDateTime,
+    kind: &'static str,
+    event: Option<String>,
+}
+
+/// Условие `key` есть в фильтре (в том числе внутри операторов).
+fn uses(filter: &Value, key: &str) -> bool {
+    filter.get(key).is_some()
+        || filter
+            .get("conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|c| c.iter().any(|f| uses(f, key)))
+}
+
+/// Проверка фильтра `/query` (`FilterOperator` или `FilterCondition`).
+fn matches(filter: &Value, n: &Facts) -> MethodResult<bool> {
+    let Value::Object(f) = filter else {
+        return Err(MethodError::invalid("filter must be an object"));
     };
-    Ok(changes_response(&a.account_id, &a.since_state, &none))
+    if let Some(op) = f.get("operator") {
+        let conds = f
+            .get("conditions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| MethodError::invalid("conditions must be an array"))?;
+        let mut results = Vec::with_capacity(conds.len());
+        for c in conds {
+            results.push(matches(c, n)?);
+        }
+        return match op.as_str() {
+            Some("AND") => Ok(results.iter().all(|r| *r)),
+            Some("OR") => Ok(results.iter().any(|r| *r)),
+            Some("NOT") => Ok(!results.iter().any(|r| *r)),
+            _ => Err(MethodError::invalid("unknown filter operator")),
+        };
+    }
+    let mut ok = true;
+    for (key, val) in f {
+        let unsupported = || MethodError::with("unsupportedFilter", key.clone());
+        let date = || val.as_str().ok_or_else(unsupported).and_then(utc);
+        ok &= match key.as_str() {
+            "after" => n.created >= date()?,
+            "before" => n.created < date()?,
+            "type" => val.as_str().ok_or_else(unsupported)? == n.kind,
+            "calendarEventIds" => {
+                let ids = val.as_array().ok_or_else(unsupported)?;
+                n.event
+                    .as_deref()
+                    .is_some_and(|e| ids.iter().any(|id| id.as_str() == Some(e)))
+            }
+            _ => return Err(unsupported()),
+        };
+    }
+    Ok(ok)
+}
+
+/// Аргументы `CalendarEventNotification/query`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryArgs {
+    account_id: String,
+    filter: Option<Value>,
+    sort: Option<Vec<Comparator>>,
+    #[serde(flatten)]
+    window: QueryWindow,
+}
+
+/// `CalendarEventNotification/query` по входящим планирования (без `/queryChanges`).
+pub(crate) async fn notification_query(
+    ctx: &mut Ctx<'_>,
+    args: Map<String, Value>,
+) -> MethodResult<Map<String, Value>> {
+    let a: QueryArgs = parse_args(args)?;
+    ctx.check_account(&a.account_id)?;
+    let sort = a.sort.as_deref().unwrap_or_default();
+    if sort.iter().any(|c| c.property != "created") {
+        return Err(MethodError::new("unsupportedSort"));
+    }
+    let descending = sort.first().is_some_and(|c| !c.is_ascending);
+    let filter = a.filter.as_ref().filter(|f| !f.is_null());
+    let store = ctx.jmap.dav_store()?.clone();
+    let inbox = store.inbox_list(ctx.scope).await?;
+    // `calendarEventId` ищется по календарям, только если фильтр по нему.
+    let cals = match filter {
+        Some(f) if uses(f, "calendarEventIds") => calendar_ids(store.as_ref(), ctx.scope).await?,
+        _ => Vec::new(),
+    };
+    let mut found = Vec::new();
+    for item in &inbox.items {
+        let event = if cals.is_empty() {
+            None
+        } else {
+            event_id(ctx, store.as_ref(), &cals, &item.message.uid).await?
+        };
+        let n = Facts {
+            id: item.id.to_string(),
+            created: item.received_at,
+            kind: kind(item, &message_event(item)),
+            event,
+        };
+        if filter.map_or(Ok(true), |f| matches(f, &n))? {
+            found.push(n);
+        }
+    }
+    found.sort_by(|x, y| x.created.cmp(&y.created).then_with(|| x.id.cmp(&y.id)));
+    if descending {
+        found.reverse();
+    }
+    let ids: Vec<String> = found.into_iter().map(|n| n.id).collect();
+    let mut out = object(json!({
+        "accountId": a.account_id,
+        "queryState": state_string(inbox.state),
+        "canCalculateChanges": false,
+    }));
+    apply_window(&ids, &a.window, ctx.jmap.cfg.max_query_limit, &mut out)?;
+    Ok(out)
 }
 
 /// `CalendarEventNotification/set`: только удаление (прочитанное уведомление); создание и изменение — `forbidden`.
@@ -372,7 +493,7 @@ pub(crate) async fn notification_set(
             Err(e) => return Err(e.into()),
         }
     }
-    let new = state_string(store.inbox_list(ctx.scope).await?.state);
+    let new = state_string(store.inbox_state(ctx.scope).await?);
     Ok(out.response(&a.account_id, &old, &new))
 }
 
@@ -381,8 +502,8 @@ pub(crate) async fn notification_state(
     jmap: &Jmap,
     scope: tp_contracts::meta::AccountScope,
 ) -> Option<String> {
-    let inbox = jmap.dav.as_ref()?.inbox_list(scope).await.ok()?;
-    Some(state_string(inbox.state))
+    let state = jmap.dav.as_ref()?.inbox_state(scope).await.ok()?;
+    Some(state_string(state))
 }
 
 #[cfg(test)]
@@ -391,7 +512,7 @@ mod tests {
     use tp_contracts::auth::Principal;
     use tp_contracts::dav::{CollectionKind, DavObject, DavStore};
     use tp_contracts::meta::AccountScope;
-    use tp_contracts::schedule::ItipMethod;
+    use tp_contracts::schedule::{BusyKind, ItipMethod};
 
     use crate::calendars::tests::{call, create_calendar};
     use crate::testenv::Env;
@@ -594,7 +715,8 @@ mod tests {
             json!({"accountId": acc, "sinceState": state}),
         )
         .await;
-        assert_eq!(c["type"], "cannotCalculateChanges", "{c}");
+        assert_eq!(c["destroyed"], json!([nid]), "{c}");
+        assert_eq!(c["newState"], s["newState"], "{c}");
         let n = call(
             &env,
             "CalendarEventNotification/get",
@@ -624,6 +746,113 @@ mod tests {
         assert_eq!(sent[1].method, ItipMethod::Cancel);
     }
 
+    /// `CalendarEventNotification/query` от имени `who` с аргументами `args` (кроме `accountId`).
+    async fn query(env: &Env, who: &Principal, args: Value) -> Value {
+        let mut a = json!({"accountId": who.account.to_string()});
+        if let (Some(a), Value::Object(extra)) = (a.as_object_mut(), args) {
+            a.extend(extra);
+        }
+        env.call_as(who, "CalendarEventNotification/query", a).await
+    }
+
+    /// Приёмка JMAP-42: новое приглашение видно в `CalendarEventNotification/changes` и `/query`; `created` — время
+    /// поступления во входящие.
+    #[tokio::test]
+    async fn notification_changes_and_query() {
+        let env = Env::new().await;
+        create_calendar(&env, "Работа").await;
+        let bob = env.user("bob@example.org").await;
+        let bob_acc = bob.account.to_string();
+        let n = env
+            .call_as(
+                &bob,
+                "CalendarEventNotification/get",
+                json!({"accountId": bob_acc}),
+            )
+            .await;
+        let old = n["state"].clone();
+        let r = call(
+            &env,
+            "CalendarEvent/set",
+            json!({"accountId": env.account(), "sendSchedulingMessages": true,
+                   "create": {"e": meeting()}}),
+        )
+        .await;
+        assert!(r["created"]["e"]["id"].is_string(), "{r}");
+
+        let c = env
+            .call_as(
+                &bob,
+                "CalendarEventNotification/changes",
+                json!({"accountId": bob_acc, "sinceState": old}),
+            )
+            .await;
+        let created = c["created"].as_array().unwrap_or_else(|| panic!("{c}"));
+        assert_eq!(created.len(), 1, "{c}");
+        assert_eq!(c["destroyed"], json!([]), "{c}");
+        assert_eq!(c["hasMoreChanges"], false, "{c}");
+        let nid = created[0].clone();
+        let c2 = env
+            .call_as(
+                &bob,
+                "CalendarEventNotification/changes",
+                json!({"accountId": bob_acc, "sinceState": c["newState"]}),
+            )
+            .await;
+        assert_eq!(c2["created"], json!([]), "{c2}");
+
+        let g = env
+            .call_as(
+                &bob,
+                "CalendarEventNotification/get",
+                json!({"accountId": bob_acc, "ids": [nid]}),
+            )
+            .await;
+        let note = &g["list"][0];
+        assert_eq!(g["state"], c["newState"], "{g}");
+        let at = note["created"].as_str().unwrap_or_else(|| panic!("{g}"));
+        assert!(at.starts_with("20") && at.ends_with('Z'), "{g}");
+        let event_id = note["calendarEventId"].clone();
+        assert!(event_id.is_string(), "{g}");
+
+        let q = query(&env, &bob, json!({"calculateTotal": true})).await;
+        assert_eq!(q["ids"], json!([nid]), "{q}");
+        assert_eq!(q["total"], 1, "{q}");
+        assert_eq!(q["queryState"], c["newState"], "{q}");
+        assert_eq!(q["canCalculateChanges"], false, "{q}");
+        let cases = [
+            (json!({"type": "created"}), json!([nid])),
+            (json!({"type": "updated"}), json!([])),
+            (json!({"calendarEventIds": [event_id]}), json!([nid])),
+            (json!({"calendarEventIds": ["nope"]}), json!([])),
+            (json!({"after": at}), json!([nid])),
+            (json!({"before": at}), json!([])),
+            (
+                json!({"after": "2000-01-01T00:00:00Z", "type": "created"}),
+                json!([nid]),
+            ),
+            (
+                json!({"operator": "NOT", "conditions": [{"calendarEventIds": [event_id]}]}),
+                json!([]),
+            ),
+        ];
+        for (filter, want) in cases {
+            let q = query(&env, &bob, json!({"filter": filter})).await;
+            assert_eq!(q["ids"], want, "{filter}: {q}");
+        }
+        let q = query(
+            &env,
+            &bob,
+            json!({"sort": [{"property": "created", "isAscending": false}]}),
+        )
+        .await;
+        assert_eq!(q["ids"], json!([nid]), "{q}");
+        let q = query(&env, &bob, json!({"sort": [{"property": "title"}]})).await;
+        assert_eq!(q["type"], "unsupportedSort", "{q}");
+        let q = query(&env, &bob, json!({"filter": {"flavour": "x"}})).await;
+        assert_eq!(q["type"], "unsupportedFilter", "{q}");
+    }
+
     /// Без `sendSchedulingMessages` событие с участниками записывается, но никому не рассылается.
     #[tokio::test]
     async fn silent_without_flag() {
@@ -643,25 +872,56 @@ mod tests {
         assert!(!mine.body.contains("SCHEDULE-STATUS"), "{}", mine.body);
     }
 
-    /// Индекс события, записанного из JMAP: `Schedule-Tag` только у встреч, занятость — до горизонта хранилища.
+    /// Приёмка JMAP-40: индекс события из JMAP — тот же, что у записи по CalDAV (`tp_dav::index::for_write`):
+    /// `Schedule-Tag` только у встреч, занятость неповторяющегося события, повторы — без индекса занятости.
     #[tokio::test]
-    async fn index_has_schedule_tag_and_clipped_busy() {
+    async fn index_matches_caldav_write() {
         let env = Env::new().await;
         create_calendar(&env, "Работа").await;
-        let mut event = meeting();
-        event["start"] = json!("2026-01-05T10:00:00");
-        event["recurrenceRule"] = json!({"@type": "RecurrenceRule", "frequency": "weekly"});
+        let mut weekly = meeting();
+        weekly["uid"] = json!("weekly-1");
+        weekly["start"] = json!("2026-01-05T10:00:00");
+        weekly["recurrenceRule"] = json!({"@type": "RecurrenceRule", "frequency": "weekly"});
+        let mut tentative = meeting();
+        tentative["uid"] = json!("tentative-1");
+        tentative["status"] = json!("tentative");
         let args = json!({"accountId": env.account(), "create": {
-            "m": event,
+            "m": meeting(),
+            "w": weekly,
+            "t": tentative,
             "p": {"uid": "plain-1", "title": "Личное", "start": "2027-01-11T10:00:00", "duration": "PT1H"},
+            "f": {"uid": "free-1", "title": "Свободно", "start": "2027-01-12T10:00:00", "duration": "PT1H",
+                  "freeBusyStatus": "free"},
         }});
         let r = call(&env, "CalendarEvent/set", args).await;
         assert!(r["notCreated"].is_null(), "{r}");
+        let opts = env
+            .jmap
+            .cfg
+            .calendars
+            .index_options(time::OffsetDateTime::now_utc());
+        for uid in ["meet-1", "weekly-1", "tentative-1", "plain-1", "free-1"] {
+            let obj = stored(&env, env.scope, uid).await.expect("событие");
+            let ical = calcard::icalendar::ICalendar::parse(&obj.body).expect("iCalendar");
+            let caldav = tp_dav::index::for_write(&ical, &opts).expect("индекс");
+            assert_eq!(obj.index, caldav, "{uid}: {}", obj.body);
+        }
+        let meet = stored(&env, env.scope, "meet-1").await.expect("встреча");
+        assert!(meet.index.schedule_tag.is_some());
+        assert_eq!(meet.index.busy.len(), 1, "{:?}", meet.index.busy);
+        assert_eq!(meet.index.busy[0].kind, BusyKind::Busy);
+        let tentative = stored(&env, env.scope, "tentative-1")
+            .await
+            .expect("встреча");
+        assert_eq!(tentative.index.busy[0].kind, BusyKind::Tentative);
         let plain = stored(&env, env.scope, "plain-1").await.expect("событие");
         assert_eq!(plain.index.schedule_tag, None);
-        let weekly = stored(&env, env.scope, "meet-1").await.expect("встреча");
-        assert!(weekly.index.schedule_tag.is_some());
+        assert_eq!(plain.index.busy.len(), 1);
+        let free = stored(&env, env.scope, "free-1").await.expect("событие");
+        assert!(free.index.busy.is_empty(), "{:?}", free.index.busy);
         // Повторы в индекс занятости не пишутся: их разворачивает хранилище при запросе (META-54).
+        let weekly = stored(&env, env.scope, "weekly-1").await.expect("встреча");
+        assert!(weekly.index.schedule_tag.is_some());
         assert!(weekly.index.recurring && weekly.index.busy.is_empty());
     }
 

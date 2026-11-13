@@ -310,7 +310,7 @@ impl Milters {
         let id = env.id.as_bytes();
         // Без соединения клиента (JMAP): имя — узел, семейство адреса — «неизвестно».
         let helo = env.client.map_or(self.hostname.as_str(), |(_, helo)| helo);
-        let ip = env.client.map(|(addr, _)| addr.ip().to_canonical());
+        let ip = env.client.map(|(addr, _)| addr.ip());
         let client_addr = ip.map(|ip| ip.to_string());
         let mut connect_macros: Vec<(&str, &[u8])> = vec![
             ("j", self.hostname.as_bytes()),

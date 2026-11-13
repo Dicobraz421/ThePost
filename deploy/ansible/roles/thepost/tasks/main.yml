@@ -11,6 +11,12 @@
       thepost_tls_mode — acme, internal или files; для acme нужен thepost_acme_email,
       для files — thepost_tls_cert_src и thepost_tls_key_src; thepost_binary_url — с thepost_binary_checksum
 
+# До бинарного файла: проверка config.yaml (validate) уже запускает thepost.
+- name: Install system libraries
+  ansible.builtin.package:
+    name: "{{ thepost_system_packages }}"
+    state: present
+
 - name: Install system user (sysusers.d)
   ansible.builtin.copy:
     src: "{{ role_path }}/../../../systemd/thepost.sysusers.conf"
@@ -87,6 +93,27 @@
     mode: "0644"
   notify: Restart thepost
 
+# Keytab Kerberos: MIT Kerberos читает его только из KRB5_KTNAME (auth.gssapi.keytab сверяется с переменной).
+- name: Set keytab path for thepost (KRB5_KTNAME)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/thepost.service.d/gssapi.conf
+    content: |
+      # Ansible: deploy/ansible/roles/thepost — не править вручную.
+      [Service]
+      Environment=KRB5_KTNAME=FILE:{{ thepost_gssapi_keytab }}
+    owner: root
+    group: root
+    mode: "0644"
+  when: thepost_gssapi_keytab_src | length > 0
+  notify: Restart thepost
+
+- name: Remove keytab path without Kerberos
+  ansible.builtin.file:
+    path: /etc/systemd/system/thepost.service.d/gssapi.conf
+    state: absent
+  when: thepost_gssapi_keytab_src | length == 0
+  notify: Restart thepost
+
 # Растущая пауза перезапуска (RestartSteps, RestartMaxDelaySec) — systemd 254+; на старых — постоянные 30 с
 # (решение 85).
 - name: Check systemd version
@@ -152,6 +179,23 @@
     - /var/lib/thepost/tls/privkey.pem
     - "{{ thepost_pki_dir | default('/etc/thepost/pki') }}/client.key"
 
+- name: Copy Kerberos keytab
+  ansible.builtin.copy:
+    src: "{{ thepost_gssapi_keytab_src }}"
+    dest: "{{ thepost_gssapi_keytab }}"
+    owner: root
+    group: thepost
+    mode: "0640"
+  when: thepost_gssapi_keytab_src | length > 0
+  notify: Restart thepost
+
+- name: Remove Kerberos keytab without Kerberos
+  ansible.builtin.file:
+    path: "{{ thepost_gssapi_keytab }}"
+    state: absent
+  when: thepost_gssapi_keytab_src | length == 0
+
+# Проверка auth.gssapi.keytab сверяет KRB5_KTNAME — та же переменная, что в drop-in gssapi.conf.
 - name: Write config.yaml
   ansible.builtin.template:
     src: config.yaml.j2
@@ -160,6 +204,8 @@
     group: thepost
     mode: "0640"
     validate: "{{ thepost_binary_path }} config check --config %s"
+  environment: >-
+    {{ {'KRB5_KTNAME': 'FILE:' ~ thepost_gssapi_keytab} if thepost_gssapi_keytab_src | length > 0 else {} }}
   notify: Restart thepost
 
 # Порты ниже 1024 — только сокеты systemd (решение 102): у процесса нет capabilities.

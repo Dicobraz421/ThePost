@@ -6,8 +6,8 @@
 //!   имя, адрес и участники — из каталога: через API меняются только ограничения, модераторы и скрытие
 //!   (если они не сопоставлены в секции каталога, иначе синхронизация их перезапишет); удалить группу каталога
 //!   нельзя. В ответе — словарь `names`: имя входа каждой упомянутой учётной записи и имя каждой упомянутой
-//!   группы (участники, перечисленные отправители, модераторы); имена читаются страницами списка учётных записей
-//!   и одним списком групп, а не запросом на участника;
+//!   группы (участники, перечисленные отправители, модераторы); имена читаются одним запросом учётных записей
+//!   (`AccountStore::by_ids`) и одним списком групп, а не запросом на участника;
 //! - очередь модерации (`/api/v1/orgs/{org}/moderation`): письма по времени постановки страницами (`after`,
 //!   продолжение — заголовок `Link` с `rel="next"`, как у списка учётных записей), одобрение — доставка
 //!   участникам, отклонение — уведомление отправителя с причиной. Письмо забирается из очереди
@@ -128,7 +128,7 @@ struct Names {
 
 impl Names {
     /// Имена для групп `shown`. Имена групп — из `all` (список групп организации) или одним `GroupStore::list`;
-    /// имена входа — страницами `AccountStore::list` до последней нужной записи, без запроса на участника.
+    /// имена входа — одним `AccountStore::by_ids` (CTR-63), без запроса на участника.
     async fn load(
         a: &Admin,
         org: TenantId,
@@ -156,19 +156,10 @@ impl Names {
                 names.groups.insert(g.id, g.name.clone());
             }
         }
-        let limit = a.cfg.max_page_size;
-        let mut after: Option<String> = None;
-        while !want_accounts.is_empty() {
-            let page = a.d.accounts.list(org, "", after.as_deref(), limit).await?;
-            let next = page.last().map(|acc| acc.login.to_lowercase());
-            if next.is_none() || next == after {
-                break;
-            }
-            after = next;
-            for acc in page {
-                if want_accounts.remove(&acc.id) {
-                    names.accounts.insert(acc.id, acc.login);
-                }
+        if !want_accounts.is_empty() {
+            let ids: Vec<AccountId> = want_accounts.into_iter().collect();
+            for acc in a.d.accounts.by_ids(org, &ids).await? {
+                names.accounts.insert(acc.id, acc.login);
             }
         }
         Ok(names)
@@ -1101,7 +1092,8 @@ mod tests {
         assert!(list.as_array().expect("list").is_empty());
     }
 
-    /// Приёмка ADM-20: имена участников, отправителей и модераторов — в том же ответе, страницами списка.
+    /// Приёмка ADM-20, ADM-32: имена участников, отправителей и модераторов — в том же ответе, одним запросом
+    /// `AccountStore::by_ids` на группу из 500 участников.
     #[tokio::test]
     async fn names_in_one_response() {
         let cfg = AdminConfig {
@@ -1111,7 +1103,7 @@ mod tests {
         };
         let env = Env::with(cfg, Vec::new());
         let mut ids = Vec::new();
-        for i in 0..200 {
+        for i in 0..500 {
             let login = format!("User{i:03}@example.org");
             ids.push((env.account(&login).await.account, login));
         }
@@ -1132,18 +1124,19 @@ mod tests {
             "name": "Все", "members": members, "moderators": [ids[0].0],
             "senders": {"only": {"accounts": [outsider], "groups": [inner_id]}}
         });
+        env.account_calls.take();
         let (s, _, g) = env.call("POST", &groups, Some("org"), Some(body)).await;
         assert_eq!(s, StatusCode::CREATED, "{g}");
         let id = g["id"].as_str().expect("id").to_owned();
         let check = |g: &Value| {
             let names = g["names"].as_object().expect("names");
-            assert_eq!(names.len(), 202, "200 участников, отправитель, группа");
+            assert_eq!(names.len(), 502, "500 участников, отправитель, группа");
             for (id, login) in &ids {
                 assert_eq!(names[&id.to_string()], json!(login));
             }
             assert_eq!(names[&outsider.to_string()], "zed@example.org");
             assert_eq!(names[&inner_id], "Внутренняя");
-            assert_eq!(g["members"].as_array().expect("members").len(), 201);
+            assert_eq!(g["members"].as_array().expect("members").len(), 501);
             assert_eq!(
                 g["members"][0],
                 json!({ "account": ids[0].0 }),
@@ -1152,10 +1145,21 @@ mod tests {
         };
         check(&g);
         let one = format!("{groups}/{id}");
+        env.account_calls.take();
         let (s, _, g) = env.call("GET", &one, Some("operator"), None).await;
         assert_eq!(s, StatusCode::OK);
         check(&g);
+        assert_eq!(
+            env.account_calls.take(),
+            ["by_ids"],
+            "чтение группы — один запрос имён"
+        );
         let (_, _, list) = env.call("GET", &groups, Some("org"), None).await;
+        assert_eq!(
+            env.account_calls.take(),
+            ["by_ids"],
+            "список групп — один запрос имён"
+        );
         let list = list.as_array().expect("list");
         check(list.iter().find(|g| g["id"] == id.as_str()).expect("group"));
         let inner = list

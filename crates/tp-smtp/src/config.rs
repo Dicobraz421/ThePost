@@ -565,10 +565,6 @@ pub struct QueueConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub delay_notify: Duration,
-    /// Пауза опроса очереди, когда записей со сроком попытки нет.
-    #[serde(with = "duration")]
-    #[schemars(with = "duration::HumanDuration")]
-    pub poll_interval: Duration,
     /// Записей за один захват.
     pub batch: usize,
     /// Одновременно обрабатываемых записей на узле.
@@ -597,7 +593,8 @@ pub struct QueueConfig {
     pub policy: PolicyConfig,
     /// Планировщик по доменам назначения.
     pub scheduler: SchedulerConfig,
-    /// Пауза перед повторной подпиской на сигналы настроек транспорта (политики доменов назначения).
+    /// Пауза перед повторной подпиской на сигналы шины (настройки транспорта, пополнение очереди) и перед повтором
+    /// прохода smtp-out, когда очередь недоступна.
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub resubscribe: Duration,
@@ -610,7 +607,6 @@ impl Default for QueueConfig {
             retry: vec![m(5), m(15), m(30), m(60), m(120), m(240), m(480)],
             expire: Duration::from_secs(5 * 24 * 3600),
             delay_notify: Duration::from_secs(4 * 3600),
-            poll_interval: Duration::from_secs(5),
             batch: 32,
             concurrency: 16,
             lease: Duration::from_secs(10 * 60),
@@ -852,6 +848,13 @@ mod tests {
             "{BASE}smtp:\n  milter:\n    filters:\n      - {{ name: rspamd, submission: true }}\n"
         );
         assert!(registry().parse_strict(&old, Vec::new()).is_err());
+    }
+
+    /// SMTP-42: опроса очереди нет — ключ `queue.poll_interval` неизвестен (строгий разбор — ошибка).
+    #[test]
+    fn queue_poll_interval_is_gone() {
+        let src = format!("{BASE}smtp:\n  queue:\n    poll_interval: 5s\n");
+        assert!(registry().parse_strict(&src, Vec::new()).is_err());
     }
 
     #[test]

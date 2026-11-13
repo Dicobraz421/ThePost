@@ -50,16 +50,35 @@ sieve:
 
 # Роль maintenance (входит в пресет): раз в purge_interval — очистка по сроку надгробий DAV, журнала автоответов,
 # журнала доставки и токенов `thepost admin init`; сроки хранения — в meta. Проверка целостности BLOB — verify:
-# в кластере проход выполняет один узел — держатель лизы verify.lease_name.
+# в кластере проход выполняет один узел — держатель лизы verify.lease_name. Значения ниже — умолчания узла.
 maintenance:
   purge_interval: 1h
+  # Срок хранения токенов `thepost admin init` после их истечения (аудит); 0s — удалять сразу.
   admin_token_retention: 30d
-  verify: { at: "03:00", interval: 24h }
+  # Проверка целостности BLOB по расписанию — `thepost verify` без --fix: итог — журнал узла и /metrics
+  # (tp_blob_verify_*), исправление — только вручную (`thepost verify --fix`). Время — UTC, ЧЧ:ММ.
+  verify:
+    enabled: true
+    at: "03:00"
+    interval: 24h
+    lease_name: blob-verify
+    lease_ttl: 2m   # продлевается во время прохода; покрывает расхождение часов узлов
 # Сроки очистки — секция meta (по умолчанию):
 #   meta:
 #     dav: { tombstone_ttl: 90d }        # надгробия DAV; старше — клиенту полная синхронизация
 #     sieve: { vacation_log_ttl: 90d }   # журнал автоответов
 #     delivery: { retention: 30d }       # журнал доставки
+
+# Вход администратора `thepost admin login --oidc` с устройства без браузера (RFC 8628) у поставщика auth.oidc.
+# client_id — открытый клиент (public client) с Device Authorization Grant, его токен — с получателем из
+# auth.oidc.audience; не задан — вход с устройства выключен.
+cli:
+  oidc:
+    # client_id: thepost-cli
+    scope: openid
+    poll_interval: 5s      # пауза опроса токена, если поставщик не задал interval
+    slow_down_step: 5s     # прибавка к паузе на ответ slow_down
+    max_wait: 15m          # наибольшее ожидание подтверждения
 
 # Календари и контакты (роль dav): лимиты CalDAV и CardDAV; полный перечень — thepost config schema.
 dav:

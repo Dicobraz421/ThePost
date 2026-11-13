@@ -20,7 +20,8 @@
 1. Linux x86_64/AArch64 или Windows + WSL2 Ubuntu (работать внутри WSL, репозиторий — в файловой системе WSL).
 2. Docker Engine с Compose v2 (`docker compose version`) или Docker Desktop с интеграцией WSL.
 3. Rust через rustup (тулчейн подхватится из `rust-toolchain.toml`), `cargo install cargo-nextest --locked`.
-   Пакеты для сборки: `build-essential pkg-config`; клиенты для проверок (необязательно): `postgresql-client`, `awscli`.
+   Пакеты для сборки: `build-essential pkg-config`; с фичей `gssapi` (как выпуск и образ) — ещё `libkrb5-dev libclang-dev`;
+   клиенты для проверок (необязательно): `postgresql-client`, `awscli`.
 4. `git clone https://github.com/Dicobraz421/ThePost && cd ThePost`.
 
 ## Зависимости
@@ -156,7 +157,9 @@ Compose и Ansible его не копируют, а подставляют зн�
 | `secrets.auth.approle` | `role_id` — `/etc/thepost/openbao`, `secret_id` — учётные данные systemd | `secret_id` — том `openbao-approle` | `thepost_secrets_role_id_file` |
 | `tls`, `acme` | цепочка `/etc/thepost/tls`, ключ — секрет `thepost/tls#key` | том `tls` | `thepost_tls_mode` |
 | `blob.gc.window` | по умолчанию | — | `thepost_blob_gc_window` |
-| `maintenance`, `dav`, `http.dav` | период очистки, лимиты DAV | — | `thepost_maintenance`, `thepost_dav`, `thepost_dav_listen` |
+| `maintenance` | очистка по сроку, книга GAL, проверка BLOB `verify` (03:00 UTC, раз в сутки) | — | `thepost_maintenance` |
+| `cli.oidc` | вход с устройства выключен (`client_id` не задан) | — | `thepost_cli_oidc` |
+| `dav`, `http.dav` | лимиты DAV | — | `thepost_dav`, `thepost_dav_listen` |
 
 Остальное (слушатели 25, 465, 587, 143, 993, 443, ManageSieve 4190, роли, BLOB) — из пресета без изменений; новый параметр эталона
 добавляется в пресет, а не в compose или шаблон роли. Проверка пресета — `thepost config check --config
@@ -193,6 +196,9 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 его в памяти, `files` — с управляющей машины), при `acme` — сам узел (политика `thepost` разрешает ему запись только
 этого пути). Новая версия секрета узел подхватывает без перезапуска.
 Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
+Системная библиотека MIT Kerberos (`thepost_system_packages`: apt — `libgssapi-krb5-2`, dnf — `krb5-libs`) ставится до
+бинарного файла: выпуск и бета собраны с фичей `gssapi`, без неё `thepost` не запускается. Вход по Kerberos —
+`thepost_gssapi_keytab_src` (раздел «Вход по Kerberos (GSSAPI)» ниже).
 Повторный прогон ничего не меняет. Ключи восстановления и root-токен OpenBao — `/root/openbao-init.json` (см. ниже).
 
 ### Резервное копирование и восстановление (роль `pgbackrest`, DEP-15)
@@ -212,7 +218,9 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
   `LoadCredentialEncrypted=` юнитов копий и drop-in `postgresql@16-main.service.d/pgbackrest.conf` (для
   `archive_command` и `restore_command`). pgBackRest читает их через `--config-include-path=/run/credentials/<юнит>`,
   restic — через `RESTIC_PASSWORD_FILE` и `AWS_SHARED_CREDENTIALS_FILE`. Вручную — `thepost-pgbackrest …` и
-  `thepost-restic …` (обёртки `systemd-run` с теми же учётными данными);
+  `thepost-restic …` от root (обёртки `systemd-run` с теми же учётными данными); через `sudo` в семействе RHEL —
+  полным путём `/usr/local/sbin/thepost-…`: `secure_path` sudo там без `/usr/local/sbin` (так их вызывают роль и
+  `restore.yml`);
 - снимок Raft OpenBao (`thepost_backup_openbao: true`, DEP-23; все секреты The Post — DKIM, AppRole, пароли СУБД,
   ключи копий) — `thepost-backup-openbao.service` после каждой копии СУБД (своё расписание —
   `thepost_backup_openbao_schedule`) в то же хранилище: restic (тег `thepost-openbao`) или каталог rsync
@@ -242,6 +250,7 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 
 ## Установка под systemd (SMB, Enterprise-ВМ)
 ```bash
+sudo apt-get install libgssapi-krb5-2   # РЕД ОС, AlmaLinux, RHEL: sudo dnf install krb5-libs (фича gssapi выпуска)
 sudo install -m 0755 target/release/thepost /usr/local/bin/thepost
 sudo install -m 0644 deploy/systemd/thepost.sysusers.conf /usr/lib/sysusers.d/thepost.conf && sudo systemd-sysusers
 sudo install -D -m 0640 -o root -g thepost deploy/config/all.yaml /etc/thepost/config.yaml   # domain, smtp.hostname, адреса
@@ -280,6 +289,27 @@ Hardening юнита: пустой `CapabilityBoundingSet=`, `NoNewPrivileges`, 
 процессу его передаёт systemd (`LoadCredential=` в `thepost.service`). Оба файла создаёт роль Ansible `openbao`.
 С TPM `secret_id` можно зашифровать: `systemd-creds encrypt --with-key=tpm2 --name=openbao-secret-id …`
 и заменить `LoadCredential=` на `LoadCredentialEncrypted=` (drop-in `systemctl edit thepost`).
+
+### Вход по Kerberos (GSSAPI)
+SASL GSSAPI (SMTP, IMAP, ManageSieve; секция `auth.gssapi`) — системная MIT Kerberos (`libgssapi_krb5`: пакет
+выше, в образе — своя копия). Keytab узла — по принципалу на службу, `<узел>` — имя, по которому подключаются клиенты
+(`gssapi.hostname`): `smtp/<узел>`, `imap/<узел>`, `sieve/<узел>` (ManageSieve, RFC 5804). Билет одной службы для
+другой не принимается. `HTTP/<узел>` не нужен: JMAP, DAV и Admin API по Kerberos не входят.
+```bash
+# MIT Kerberos (kadmin), область EXAMPLE.RU:
+kadmin -q 'addprinc -randkey smtp/mail.example.ru' -q 'addprinc -randkey imap/mail.example.ru'        -q 'addprinc -randkey sieve/mail.example.ru'
+kadmin -q 'ktadd -k thepost.keytab smtp/mail.example.ru imap/mail.example.ru sieve/mail.example.ru'
+# Active Directory: учётная запись узла с SPN smtp/, imap/, sieve/mail.example.ru (setspn -S), keytab — ktpass или msktutil.
+klist -k thepost.keytab   # три принципала
+```
+Keytab MIT Kerberos читает только из `KRB5_KTNAME`; `auth.gssapi.keytab` узел сверяет с этой переменной.
+- ВМ (Ansible): `thepost_gssapi_keytab_src` — файл на управляющей машине → `/etc/thepost/thepost.keytab` (0640
+  root:thepost), drop-in `thepost.service.d/gssapi.conf` (`Environment=KRB5_KTNAME=FILE:…`), `auth.gssapi.keytab`;
+  `hostname` и `realms` — `thepost_gssapi`. Без `thepost_gssapi_keytab_src` роль убирает keytab и drop-in.
+- Вручную: `sudo install -m 0640 -o root -g thepost thepost.keytab /etc/thepost/thepost.keytab`, `systemctl edit thepost`:
+  `[Service]` + `Environment=KRB5_KTNAME=FILE:/etc/thepost/thepost.keytab`, в `config.yaml` —
+  `auth: { gssapi: { keytab: /etc/thepost/thepost.keytab, hostname: mail.example.ru } }`.
+- Kubernetes (Helm): секрет с ключом `keytab` → `gssapi.keytabSecret` (раздел «Узел thepost (Helm)»).
 
 ## PostgreSQL: учётные записи
 Раздельные учётные записи (SRS 2.7, 3.1; META-23, DEP-08), все — LOGIN без SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE,
@@ -412,3 +442,6 @@ ManageSieve — 4190 и в поде, и у Service.
 Admin API — `127.0.0.1:8443` в поде (`kubectl port-forward`), служебный HTTP — адрес пода для проб kubelet.
 До установки — секрет `thepost-tls` (`tls.crt`, `ca.crt`; в под монтируются только они) и OpenBao (`bootstrap.sh` выше,
 ключ TLS — `TLS_KEY`: секрет `thepost/tls#key`, в values — `config.tls.key`; смена ключа — повторный `bootstrap.sh`).
+Вход по Kerberos: `kubectl -n thepost create secret generic thepost-keytab --from-file=keytab=thepost.keytab` и
+`--set gssapi.keytabSecret=thepost-keytab` — чарт монтирует keytab в `/etc/thepost/krb5/thepost.keytab`, задаёт
+`KRB5_KTNAME` и `config.auth.gssapi.keytab`; `hostname` и `realms` — в `config.auth.gssapi`.

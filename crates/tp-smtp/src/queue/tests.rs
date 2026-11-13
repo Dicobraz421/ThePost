@@ -1181,3 +1181,144 @@ async fn outbound_suite() {
     tp_testkit::suite::outbound_submit(&q, TenantId::DEFAULT, &rcpts).await;
     assert_eq!(env.queue.len(), 2);
 }
+
+/// Очередь, считающая захваты: проверка «без опроса».
+struct Counted {
+    queue: MemQueue,
+    claims: std::sync::atomic::AtomicUsize,
+}
+
+impl Counted {
+    fn claims(&self) -> usize {
+        self.claims.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl QueueStore for Counted {
+    async fn enqueue(
+        &self,
+        owner: Option<tp_contracts::AccountId>,
+        msg: OutMessage,
+    ) -> Result<tp_contracts::QueueId> {
+        self.queue.enqueue(owner, msg).await
+    }
+
+    async fn next_due(&self) -> Result<Option<OffsetDateTime>> {
+        self.queue.next_due().await
+    }
+
+    async fn claim(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+        lease: Duration,
+    ) -> Result<Vec<Claimed>> {
+        self.claims
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.queue.claim(now, limit, lease).await
+    }
+
+    async fn renew(&self, claim: &QueueClaim, until: OffsetDateTime) -> Result<()> {
+        self.queue.renew(claim, until).await
+    }
+
+    async fn reschedule(
+        &self,
+        claim: &QueueClaim,
+        rcpt: &str,
+        at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<()> {
+        self.queue.reschedule(claim, rcpt, at, reason).await
+    }
+
+    async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
+        self.queue.postpone(claim, rcpt, at).await
+    }
+
+    async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
+        self.queue.complete(claim, rcpt, status).await
+    }
+}
+
+/// SMTP-42: роль smtp-out без опроса — письмо уходит сразу после постановки (сигнал `QueueReady`), отложенное —
+/// в свой срок (таймер ближайшего срока `next_due`); до срока роль очередь не опрашивает.
+#[tokio::test]
+async fn smtp_out_runs_on_signal_and_due_time() {
+    use tp_contracts::load::{LoadLevel, fixed_load};
+    use tp_contracts::role::{ReadyHandle, fixed_config};
+
+    let bus = Arc::new(MemEventBus::default());
+    let mut env = Env::new();
+    let store = Arc::new(Counted {
+        queue: env.queue.clone().with_bus(bus.clone()),
+        claims: Default::default(),
+    });
+    env.deps.store = store.clone();
+    // Таймер роли — реального времени: часы очереди системные.
+    env.deps.now = system_now();
+    let t = Arc::new(Scripted::default());
+    let routes = Arc::new(Routes::new(Arc::new(MemTransport::new())));
+    let worker = QueueWorker::new(env.deps.clone(), t.clone(), "out.example.org")
+        .with_routes(routes, Some(bus.clone()));
+    let shutdown = CancellationToken::new();
+    let ctx = RoleCtx {
+        config: fixed_config(SmtpConfig::default()),
+        shutdown: shutdown.clone(),
+        drain_deadline: Duration::from_secs(1),
+        ready: ReadyHandle::default(),
+        load: fixed_load(LoadLevel::Normal),
+    };
+    let role = tokio::spawn(async move { SmtpOutService::new(Arc::new(worker)).run(ctx).await });
+    let sent = || t.calls.lock().expect("lock").len();
+    let until = async |what: &str, done: &dyn Fn() -> bool| {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(what);
+    };
+    until("проход после подписки", &|| {
+        store.claims() == 1
+    })
+    .await;
+
+    let q = Queue::new(env.deps.clone());
+    q.enqueue(
+        TenantId::DEFAULT,
+        None,
+        "alice@example.org",
+        &["x@example.net".into()],
+        Bytes::from_static(MAIL),
+    )
+    .await
+    .expect("enqueue");
+    until("письмо отправлено по сигналу", &|| sent() == 1).await;
+
+    let release = OffsetDateTime::now_utc() + Duration::from_secs(2);
+    q.schedule(
+        TenantId::DEFAULT,
+        None,
+        "alice@example.org",
+        &["y@example.net".into()],
+        Bytes::from_static(MAIL),
+        release,
+    )
+    .await
+    .expect("schedule");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let claims = store.claims();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        (sent(), store.claims()),
+        (1, claims),
+        "до срока — ни отправки, ни захвата"
+    );
+    until("отложенное отправлено в свой срок", &|| sent() == 2).await;
+    assert!(OffsetDateTime::now_utc() >= release, "не раньше срока");
+    shutdown.cancel();
+    role.await.expect("join").expect("run");
+}
