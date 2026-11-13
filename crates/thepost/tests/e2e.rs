@@ -14,6 +14,8 @@
 //!
 //! Метрики Д.7 (APP-34): `/metrics` узла с шиной LISTEN/NOTIFY — пул СУБД, слушатель, фиксации с NOTIFY, «сироты».
 //!
+//! Книга «Организация» без LDAP (APP-51): учётная запись из Admin API видна в книге по CardDAV.
+//!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
 use std::path::{Path, PathBuf};
@@ -2025,4 +2027,136 @@ async fn domain_list(addr: std::net::SocketAddr, path: &str, bearer: &str) -> (u
     let list: Value = serde_json::from_slice(&body).expect("domains");
     let version = list["version"].as_u64().expect("version");
     (version, list["domains"].as_array().expect("array").clone())
+}
+
+/// APP-51: узел без `auth.ldap` строит книгу «Организация» из учётных записей PostgreSQL (`impl Directory for PgMeta`,
+/// META-65). Учётная запись, созданная через Admin API, видна в книге по CardDAV у другой учётной записи организации.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gal_without_ldap() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = node_secrets(password);
+
+    let domain = "example.ru".to_owned();
+    let socket = dir.path().join("admin.sock");
+    let path = dir.path().join("config.yaml");
+    // Книга перестраивается раз в секунду: новая учётная запись видна в ней без ожидания периода по умолчанию.
+    let maintenance = "maintenance:\n  purge_interval: 1h\n";
+    let text = admin_config(dir.path(), &db_url, &domain, &socket);
+    assert!(text.contains(maintenance), "{text}");
+    assert!(!text.contains("ldap"), "{text}");
+    let text = text.replace(maintenance, &format!("{maintenance}  gal_interval: 1s\n"));
+    std::fs::write(&path, text).expect("config");
+    let cfg = thepost::sections::registry()
+        .expect("registry")
+        .load(&path)
+        .expect("load config");
+    let bound = ADMIN_SOCKET.lock().await;
+    thepost::local_admin::bind(&cfg).expect("admin init socket");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let admin = addr(&running, "admin");
+    let web = addr(&running, "jmap");
+
+    // Администратор и принятый домен — от `admin init`.
+    let login = format!("admin@{domain}");
+    let granted = admin_init(&socket, &login).await;
+    drop(bound);
+    assert_eq!(granted["status"], "granted", "{granted}");
+    let token = granted["token"].as_str().expect("token").to_owned();
+    let (code, body) = http(
+        admin,
+        "POST",
+        "/api/v1/session",
+        &format!("Bearer {token}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let session: Value = serde_json::from_slice(&body).expect("session");
+    let bearer = format!("Bearer {}", session["session"].as_str().expect("session"));
+
+    // Новая учётная запись — через Admin API.
+    let tenant = TenantId::DEFAULT;
+    let colleague = format!("ivan@{domain}");
+    let (code, body) = http(
+        admin,
+        "POST",
+        &format!("/api/v1/orgs/{tenant}/accounts"),
+        &bearer,
+        Some(&json!({ "login": colleague, "display_name": "Ivan Petrov" })),
+    )
+    .await;
+    assert_eq!(code, 201, "{}", String::from_utf8_lossy(&body));
+    let created: Value = serde_json::from_slice(&body).expect("account");
+    let id = created["id"].as_str().expect("id").to_owned();
+
+    // Книгу читает администратор: пароль приложения — в той же БД.
+    let pool = db_pool(&url_db).await;
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let reader = meta
+        .by_login(tenant, &login)
+        .await
+        .expect("by_login")
+        .expect("администратор");
+    let apps =
+        tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
+            .expect("app passwords");
+    let (_, secret) = apps
+        .issue(
+            AccountScope {
+                tenant,
+                account: reader.id,
+            },
+            "gal",
+        )
+        .await
+        .expect("issue");
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{login}:{}", secret.expose()))
+    );
+
+    let gal = format!("/dav/addressbooks/{login}/gal/");
+    let card = format!("{id}.vcf");
+    let until = deadline();
+    loop {
+        let listed = dav(web, "PROPFIND", &gal, &basic, "1").await;
+        if listed.starts_with("HTTP/1.1 207") && listed.contains(&card) {
+            break;
+        }
+        retry(
+            until,
+            &format!("карточка {card} в книге «Организация»: {listed}"),
+        )
+        .await;
+    }
+    let got = dav(web, "GET", &format!("{gal}{card}"), &basic, "0").await;
+    assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+    assert!(got.contains("FN:Ivan Petrov"), "{got}");
+    assert!(got.contains(&colleague), "{got}");
+
+    shutdown.cancel();
+    let report = running.wait().await.expect("wait");
+    assert!(report.failed.is_empty(), "{report:?}");
+    pool.close().await;
+    drop_database(&url, &db_name).await;
 }

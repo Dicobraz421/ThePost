@@ -100,8 +100,8 @@ pub struct Maintenance {
     /// Пересчёт поисковых строк контактов, записанных до миграции 0030 (`PgMeta::reindex_cards`, META-78, APP-63):
     /// один раз в фоне при запуске роли; `None` — не выполняется (тесты без PostgreSQL).
     pub card_reindex: Option<PgMeta>,
-    /// Заполнение книги GAL «Организация» из каталога (`maintenance.gal_interval`, APP-49); `None` — каталог
-    /// `auth.ldap` не настроен (книги нет) или тесты.
+    /// Заполнение книги GAL «Организация» из каталога — LDAP или PostgreSQL (`maintenance.gal_interval`, APP-49,
+    /// APP-51); `None` — не выполняется (тесты без PostgreSQL).
     pub gal: Option<Arc<crate::gal::GalSync>>,
 }
 

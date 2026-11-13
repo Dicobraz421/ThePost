@@ -82,11 +82,12 @@ pub struct Services {
     pub sasl: Arc<dyn SaslServer>,
     /// Права на папки и отправку от имени.
     pub authz: Arc<dyn Authorizer>,
-    /// Каталог LDAP; `None` — учётные записи только из PostgreSQL.
+    /// Каталог LDAP; `None` — учётные записи только из PostgreSQL (книгу GAL тогда строит каталог `PgMeta`,
+    /// [`Services::gal`]).
     pub directory: Option<Arc<dyn Directory>>,
-    /// Шина JMAP с системным `GalChanged` в подписках учётных записей (APP-49); `None` — без каталога книги GAL
-    /// нет, JMAP подписан на [`Services::bus`]. Системные сигналы читает `GalPush::run` (запускает `serve`).
-    pub gal_push: Option<Arc<crate::gal::GalPush>>,
+    /// Шина JMAP с системным `GalChanged` в подписках учётных записей (APP-49). Системные сигналы читает
+    /// `GalPush::run` (запускает `serve`).
+    pub gal_push: Arc<crate::gal::GalPush>,
     /// Издатель токенов OIDC (`auth.oidc.issuer`); `None` — вход Bearer OIDC не настроен.
     pub oidc_issuer: Option<String>,
     /// Пароли приложений.
@@ -323,9 +324,7 @@ impl Services {
                 .with_node(smtp.hostname.clone()),
         );
 
-        let gal_push = directory
-            .is_some()
-            .then(|| Arc::new(crate::gal::GalPush::new(bus.clone())));
+        let gal_push = Arc::new(crate::gal::GalPush::new(bus.clone()));
 
         Ok(Self {
             tenant,
@@ -543,10 +542,7 @@ impl Services {
             )),
             blob_index: Arc::new(self.meta.clone()),
             // Push узнаёт об изменении книги GAL организации (`GalChanged`) через `GalPush`.
-            bus: match &self.gal_push {
-                Some(push) => push.clone() as Arc<dyn EventBus>,
-                None => self.bus.clone(),
-            },
+            bus: self.gal_push.clone(),
             accounts: Arc::new(self.meta.clone()),
             authz: self.authz.clone(),
             outbound: Some(outbound.clone()),
@@ -603,20 +599,24 @@ impl Services {
             .route("/.well-known/carddav", axum::routing::any(context)))
     }
 
-    /// Заполнение глобальной адресной книги «Организация» (APP-49, решение 72) для роли maintenance: из каталога
-    /// организации (`auth.ldap`) — учётные записи и группы, кроме скрытых из адресной книги (группы — по признаку в
-    /// `PgMeta`), — в хранилище `PgMeta`, откуда её читают CardDAV и JMAP Contacts. Раз в `interval`, под лизой
-    /// держателя `holder` (одна запись на организацию в кластере); имя книги и размер порции — секция `dav`.
-    /// Без каталога книги нет (SRS 4.4) — `None`.
+    /// Заполнение глобальной адресной книги «Организация» (APP-49, решение 72) для роли maintenance: учётные записи
+    /// и группы каталога организации, кроме скрытых из адресной книги (группы — по признаку в `PgMeta`), — в
+    /// хранилище `PgMeta`, откуда её читают CardDAV и JMAP Contacts. Каталог один, по конфигурации: с секцией
+    /// `auth.ldap` — LDAP, без неё — учётные записи и группы PostgreSQL (`impl Directory for PgMeta`, META-65,
+    /// APP-51). Раз в `interval`, под лизой держателя `holder` (одна запись на организацию в кластере); имя книги и
+    /// размер порции — секция `dav`.
     pub fn gal(
         &self,
         cfg: tp_dav::DavConfig,
         leases: Arc<dyn tp_contracts::lease::LeaseStore>,
         holder: String,
         interval: std::time::Duration,
-    ) -> Option<crate::gal::GalSync> {
-        let directory = self.directory.clone()?;
-        Some(crate::gal::GalSync::new(
+    ) -> crate::gal::GalSync {
+        let directory = self
+            .directory
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.meta.clone()) as Arc<dyn Directory>);
+        crate::gal::GalSync::new(
             tp_dav::GalDeps {
                 directory,
                 groups: Some(Arc::new(self.meta.clone())),
@@ -627,7 +627,7 @@ impl Services {
             leases,
             holder,
             interval,
-        ))
+        )
     }
 
     /// Admin API. Решения модерации (одобрение и отказ очереди модерации, FIX-02) — доставка узла `tp-smtp`
