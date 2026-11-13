@@ -394,11 +394,19 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
         orphans: blob_cfg.orphans.clone(),
         orphan_probe: crate::metrics::register_orphans(&metrics),
         trash: Some(services.mail.clone()),
+        disabled: Some(tp_mailstore::DisabledMailboxes::new(
+            services.mail.clone(),
+            Arc::new(meta.clone()),
+            Arc::new(meta.clone()),
+        )),
         purge: Some(Purge {
             meta: meta.clone(),
             interval: maintenance_cfg.purge_interval,
             admin_token_retention: maintenance_cfg.admin_token_retention,
-            probe: crate::metrics::register_purge(&metrics),
+            probe: {
+                let mail = services.mail.clone();
+                crate::metrics::register_purge(&metrics, move || mail.trash_stats())
+            },
             itip: itip_purge,
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {

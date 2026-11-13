@@ -5,15 +5,18 @@
 //! фиксаций с NOTIFY и число слушателей ([`register_db`]), «сироты» BLOB ([`register_orphans`]).
 //!
 //! Проверка целостности BLOB по расписанию (APP-44): [`register_verify`]. Очистка по сроку роли maintenance
-//! (APP-52): [`register_purge`].
+//! (APP-52) и истечение корзины (`step="expire_trash"`, APP-67): [`register_purge`].
 
 use std::fmt;
 use std::sync::Arc;
 
 use prometheus_client::encoding::{EncodeMetric, MetricEncoder, NoLabelSet};
 use prometheus_client::metrics::MetricType;
+use prometheus_client::metrics::TypedMetric;
+use prometheus_client::metrics::family::Family;
 use tp_blob::OrphanMetrics;
 use tp_contracts::acquire::AcquireObserver;
+use tp_mailstore::TrashStats;
 use tp_meta::commits::{HISTOGRAM_BUCKETS, Histogram};
 use tp_meta::failover::{Failover, FailoverMetrics};
 use tp_meta::pool::DbPool;
@@ -21,7 +24,7 @@ use tp_meta::signals::{PgSignalBus, SignalMetrics};
 use tp_platform::{DbMetrics, ListenerSample, Metrics, PoolSample};
 use tp_search::{CacheStats, IndexCache, Indexer, IndexerStats};
 
-use crate::roles::{OrphanProbe, PurgeProbe, VerifyMetrics, VerifyProbe};
+use crate::roles::{OrphanProbe, PurgeProbe, Purged, StepLabel, VerifyMetrics, VerifyProbe};
 
 /// Описание показателя: имя, пояснение, значение `V` из снимка `S`, счётчик (иначе — текущее значение).
 type StatDef<S, V = u64> = (&'static str, &'static str, fn(&S) -> V, bool);
@@ -422,31 +425,94 @@ pub fn register_verify(metrics: &Metrics) -> VerifyProbe {
     probe
 }
 
-/// Регистрирует показатели очистки по сроку роли maintenance (APP-52) с меткой `step` (`Purged::STEPS`):
-/// `tp_maintenance_purge_{runs,errors}_total`, `tp_maintenance_purged_total` (у шагов с числом удалённых записей) и
+/// Шаг истечения корзины (`Store::expire_trash`, воркер роли maintenance) — значение метки `step` рядов очистки.
+pub const EXPIRE_TRASH: &str = "expire_trash";
+
+/// Снимок показателей истечения корзины (`tp_mailstore::Store::trash_stats`).
+type TrashSource = Arc<dyn Fn() -> TrashStats + Send + Sync>;
+
+/// Ряды показателя очистки по сроку: шаги [`Purged::STEPS`] из `family` и шаг [`EXPIRE_TRASH`] из снимка `trash`.
+struct PurgeSeries<M> {
+    family: Family<StepLabel, M>,
+    trash: TrashSource,
+    pick: fn(&TrashStats) -> u64,
+}
+
+impl<M> fmt::Debug for PurgeSeries<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PurgeSeries").finish_non_exhaustive()
+    }
+}
+
+impl<M> EncodeMetric for PurgeSeries<M>
+where
+    M: EncodeMetric + TypedMetric,
+{
+    fn encode(&self, mut encoder: MetricEncoder) -> Result<(), fmt::Error> {
+        for step in Purged::STEPS {
+            let label = [("step", step)];
+            if let Some(metric) = self.family.get(&label) {
+                metric.encode(encoder.encode_family(&label)?)?;
+            }
+        }
+        let label = [("step", EXPIRE_TRASH)];
+        (self.pick)(&(self.trash)()).encode(
+            encoder.encode_family(&label)?,
+            matches!(M::TYPE, MetricType::Counter),
+        )
+    }
+
+    fn metric_type(&self) -> MetricType {
+        M::TYPE
+    }
+}
+
+/// Регистрирует показатели очистки по сроку роли maintenance (APP-52) с меткой `step` (`Purged::STEPS` и
+/// [`EXPIRE_TRASH`] — истечение корзины из снимка `trash`, APP-67): `tp_maintenance_purge_{runs,errors}_total`,
+/// `tp_maintenance_purged_total` (у шагов с числом удалённых записей) и
 /// `tp_maintenance_purge_last_success_timestamp_seconds` (0 — успешных выполнений не было). Возвращает держатель для
-/// `Purge::probe`: до первого прохода значения нулевые.
-pub fn register_purge(metrics: &Metrics) -> PurgeProbe {
+/// `Purge::probe`: до первого прохода значения нулевые. Снимок `trash` читается на каждый запрос `/metrics`.
+pub fn register_purge(
+    metrics: &Metrics,
+    trash: impl Fn() -> TrashStats + Send + Sync + 'static,
+) -> PurgeProbe {
     let probe = PurgeProbe::new();
+    let trash: TrashSource = Arc::new(trash);
     metrics.register(
         "tp_maintenance_purge_runs",
         "Выполнения шагов очистки по сроку роли maintenance",
-        probe.runs.clone(),
+        PurgeSeries {
+            family: probe.runs.clone(),
+            trash: trash.clone(),
+            pick: |s| s.runs,
+        },
     );
     metrics.register(
         "tp_maintenance_purge_errors",
         "Шаги очистки по сроку, завершённые ошибкой (повтор — в следующий проход)",
-        probe.errors.clone(),
+        PurgeSeries {
+            family: probe.errors.clone(),
+            trash: trash.clone(),
+            pick: |s| s.errors,
+        },
     );
     metrics.register(
         "tp_maintenance_purged",
         "Записи, удалённые очисткой по сроку",
-        probe.purged.clone(),
+        PurgeSeries {
+            family: probe.purged.clone(),
+            trash: trash.clone(),
+            pick: |s| s.purged,
+        },
     );
     metrics.register(
         "tp_maintenance_purge_last_success_timestamp_seconds",
         "Момент последнего успешного выполнения шага очистки, секунд от начала эпохи Unix (0 — не было)",
-        probe.last_success.clone(),
+        PurgeSeries {
+            family: probe.last_success.clone(),
+            trash,
+            pick: |s| s.last_success,
+        },
     );
     probe
 }
@@ -460,9 +526,9 @@ mod tests {
     #[test]
     fn purge_stats_exported() {
         let metrics = Metrics::default();
-        let probe = register_purge(&metrics);
+        let probe = register_purge(&metrics, TrashStats::default);
         let text = metrics.encode().expect("encode");
-        for step in crate::roles::Purged::STEPS {
+        for step in Purged::STEPS.into_iter().chain([EXPIRE_TRASH]) {
             for line in [
                 format!("tp_maintenance_purge_runs_total{{step=\"{step}\"}} 0"),
                 format!("tp_maintenance_purge_errors_total{{step=\"{step}\"}} 0"),
@@ -491,6 +557,38 @@ mod tests {
         assert!(
             !text.contains("tp_maintenance_purged_total{step=\"purge_expired_delivery\"}"),
             "журнал удаляется секциями: числа записей нет"
+        );
+    }
+
+    /// APP-67: истечение корзины — ряды `step="expire_trash"` тех же показателей очистки, значения — снимок
+    /// `Store::trash_stats` на момент запроса.
+    #[test]
+    fn trash_expiry_exported() {
+        let metrics = Metrics::default();
+        let stats = Arc::new(std::sync::Mutex::new(TrashStats::default()));
+        let source = stats.clone();
+        register_purge(&metrics, move || *source.lock().expect("stats"));
+        *stats.lock().expect("stats") = TrashStats {
+            runs: 4,
+            errors: 1,
+            purged: 7,
+            last_success: 1_700_000_300,
+        };
+        let text = metrics.encode().expect("encode");
+        for line in [
+            "tp_maintenance_purge_runs_total{step=\"expire_trash\"} 4",
+            "tp_maintenance_purge_errors_total{step=\"expire_trash\"} 1",
+            "tp_maintenance_purged_total{step=\"expire_trash\"} 7",
+            "tp_maintenance_purge_last_success_timestamp_seconds{step=\"expire_trash\"} 1700000300",
+            "tp_maintenance_purge_runs_total{step=\"purge_dav_tombstones\"} 0",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert_eq!(
+            text.matches("# TYPE tp_maintenance_purge_runs counter")
+                .count(),
+            1,
+            "один показатель на все шаги: {text}"
         );
     }
 
