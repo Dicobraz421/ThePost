@@ -19,7 +19,8 @@
 //!   раньше срока; [`Outbound::cancel_scheduled`] до первого захвата удаляет запись и снимает ссылку на тело.
 //!   Локальные получатели выпущенной записи доставляются в ящики через [`LocalRelease`]
 //!   ([`QueueWorker::with_local`]), а не по SMTP.
-//! - [`SmtpOutService`] — роль smtp-out: опрос очереди до остановки.
+//! - [`SmtpOutService`] — роль smtp-out без опроса (SMTP-42): проход по сигналу пополнения очереди
+//!   (`QueueReady`, [`tp_contracts::queue::queue_ready`]) или по таймеру ближайшего срока [`QueueStore::next_due`].
 //!
 //! Время попыток — из [`Now`] (тесты — управляемые часы), очередь сама времени не берёт.
 
@@ -29,7 +30,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use time::OffsetDateTime;
 use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit};
 use tp_contracts::queue::{
@@ -45,7 +46,7 @@ use crate::metrics::{RcptOutcome, SmtpMetrics};
 use crate::routes::Routes;
 use crate::tracking::{self, Mail, Step, Tracking};
 use sched::{Admit, Scheduler};
-use tp_contracts::bus::EventBus;
+use tp_contracts::bus::{EventBus, EventKind, EventStream};
 use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
 use tp_contracts::transport::{DestinationPolicy, DomainKind, TlsRequirement};
 
@@ -360,7 +361,7 @@ pub struct QueueWorker {
     sched: Arc<Scheduler>,
     /// Политики доменов назначения.
     routes: Option<Arc<Routes>>,
-    /// Шина: перечитывание политик по сигналу.
+    /// Шина узла: сигналы пополнения очереди для роли smtp-out.
     bus: Option<Arc<dyn EventBus>>,
     /// Журнал доставки.
     tracking: Option<Tracking>,
@@ -410,8 +411,9 @@ impl QueueWorker {
         self
     }
 
-    /// Политики доменов назначения организаций (SMTP-15); с шиной `bus` роль smtp-out перечитывает их по
-    /// сигналу `TransportChanged` ([`Routes::watch`]).
+    /// Политики доменов назначения организаций (SMTP-15; перечитывает их [`Routes::watch`] узла) и шина узла `bus`:
+    /// по её сигналу `QueueReady` роль smtp-out берёт записи без опроса ([`SmtpOutService`]; без шины роль не
+    /// запускается).
     pub fn with_routes(mut self, routes: Arc<Routes>, bus: Option<Arc<dyn EventBus>>) -> Self {
         self.routes = Some(routes);
         self.bus = bus;
@@ -824,16 +826,139 @@ impl QueueWorker {
     }
 }
 
-/// Роль smtp-out: опрос очереди каждые `queue.poll_interval` (сразу снова — если проход что-то взял).
+/// Роль smtp-out без опроса (SMTP-42): проход — после подписки на системные сигналы шины, по сигналу `QueueReady`
+/// или `Resync` и по таймеру ближайшего срока [`QueueStore::next_due`]; полный захват (`queue.batch`) — сразу снова.
+/// Пустая очередь — только ожидание сигнала. Поток сигналов завершился, подписка или очередь недоступны — повтор
+/// через `queue.resubscribe` (после переподписки — проход: сигналы могли потеряться).
 #[derive(Debug, Clone)]
 pub struct SmtpOutService {
     worker: Arc<QueueWorker>,
 }
 
 impl SmtpOutService {
-    /// Роль с обработчиком `worker`.
+    /// Роль с обработчиком `worker`; шина — [`QueueWorker::with_routes`].
     pub fn new(worker: Arc<QueueWorker>) -> Self {
         Self { worker }
+    }
+
+    /// Подписки и проходы до остановки.
+    async fn serve(&self, bus: &dyn EventBus, ctx: &RoleCtx) -> Result<()> {
+        while !ctx.shutdown.is_cancelled() {
+            let retry = ctx.config::<SmtpConfig>()?.queue.resubscribe;
+            match bus.subscribe_system().await {
+                Ok(events) => {
+                    if self.watch(events, ctx).await? == Watch::Stopped {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "smtp: подписка на сигналы очереди не удалась");
+                }
+            }
+            tokio::select! {
+                () = ctx.shutdown.cancelled() => break,
+                () = tokio::time::sleep(retry) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Проходы по сигналам потока `events` и сроку очереди; поток завершился — [`Watch::Ended`].
+    async fn watch(&self, mut events: EventStream, ctx: &RoleCtx) -> Result<Watch> {
+        loop {
+            let cfg = ctx.config::<SmtpConfig>()?;
+            // Сигналы, пришедшие до прохода, он и покрывает.
+            let alive = skip_ready(&mut events);
+            let started = (self.worker.deps.now)();
+            // Начатый проход завершается; после сигнала остановки — не дольше `drain_deadline`.
+            let drain = async {
+                ctx.shutdown.cancelled().await;
+                tokio::time::sleep(ctx.drain_deadline).await;
+            };
+            let n = tokio::select! {
+                () = drain => return Ok(Watch::Stopped),
+                r = self.worker.run_once(&cfg.queue) => match r {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "smtp: очередь недоступна");
+                        None
+                    }
+                },
+            };
+            if !alive {
+                return Ok(Watch::Ended);
+            }
+            if n.is_some_and(|n| n >= cfg.queue.batch.max(1)) {
+                continue;
+            }
+            let wake = match n {
+                Some(n) => self.wake_at(n, started, cfg.queue.resubscribe).await,
+                None => Some(tokio::time::Instant::now() + cfg.queue.resubscribe),
+            };
+            let timer = async {
+                match wake {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(timer);
+            loop {
+                tokio::select! {
+                    () = ctx.shutdown.cancelled() => return Ok(Watch::Stopped),
+                    () = &mut timer => break,
+                    ev = events.next() => match ev.map(|e| e.kind) {
+                        Some(EventKind::QueueReady | EventKind::Resync) => break,
+                        Some(_) => {}
+                        None => return Ok(Watch::Ended),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Когда снова брать записи после прохода, начатого в `started` и взявшего `n` записей: в ближайший срок
+    /// очереди; `None` — записей нет (только по сигналу). Срок не позже `started`, а проход ничего не взял, —
+    /// запись недоступна захвату: повтор через `retry`, а не сразу. Очередь недоступна — тоже через `retry`.
+    async fn wake_at(
+        &self,
+        n: usize,
+        started: OffsetDateTime,
+        retry: std::time::Duration,
+    ) -> Option<tokio::time::Instant> {
+        let due = match self.worker.deps.store.next_due().await {
+            Ok(due) => due?,
+            Err(e) => {
+                tracing::warn!(error = %e, "smtp: ближайший срок очереди не получен");
+                return Some(tokio::time::Instant::now() + retry);
+            }
+        };
+        if n == 0 && due <= started {
+            return Some(tokio::time::Instant::now() + retry);
+        }
+        let wait =
+            std::time::Duration::try_from(due - (self.worker.deps.now)()).unwrap_or_default();
+        // Срок за пределами таймера — как без срока: запись возьмёт проход по сигналу.
+        tokio::time::Instant::now().checked_add(wait)
+    }
+}
+
+/// Итог наблюдения за потоком сигналов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// Роль останавливается.
+    Stopped,
+    /// Поток сигналов завершился: переподписка.
+    Ended,
+}
+
+/// Пропускает уже пришедшие сигналы без ожидания; `false` — поток завершился.
+fn skip_ready(events: &mut EventStream) -> bool {
+    loop {
+        match events.next().now_or_never() {
+            None => return true,
+            Some(Some(_)) => {}
+            Some(None) => return false,
+        }
     }
 }
 
@@ -844,42 +969,15 @@ impl RoleService for SmtpOutService {
     }
 
     async fn run(&self, ctx: RoleCtx) -> Result<()> {
-        if let (Some(routes), Some(bus)) = (&self.worker.routes, &self.worker.bus) {
-            let retry = ctx.config::<SmtpConfig>()?.queue.resubscribe;
-            tokio::spawn(
-                routes
-                    .clone()
-                    .watch(bus.clone(), ctx.shutdown.clone(), retry),
-            );
-        }
+        let bus = self
+            .worker
+            .bus
+            .clone()
+            .ok_or_else(|| Error::internal("smtp-out: нет шины сигналов очереди"))?;
         ctx.ready.set(true);
-        loop {
-            let cfg = ctx.config::<SmtpConfig>()?;
-            if ctx.shutdown.is_cancelled() {
-                break;
-            }
-            // Начатый проход завершается; после сигнала остановки — не дольше `drain_deadline`.
-            let drain = async {
-                ctx.shutdown.cancelled().await;
-                tokio::time::sleep(ctx.drain_deadline).await;
-            };
-            let n = tokio::select! {
-                () = drain => break,
-                r = self.worker.run_once(&cfg.queue) => r.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "smtp: очередь недоступна");
-                    0
-                }),
-            };
-            if n >= cfg.queue.batch.max(1) {
-                continue;
-            }
-            tokio::select! {
-                () = ctx.shutdown.cancelled() => break,
-                () = tokio::time::sleep(cfg.queue.poll_interval) => {}
-            }
-        }
+        let res = self.serve(bus.as_ref(), &ctx).await;
         ctx.ready.set(false);
-        Ok(())
+        res
     }
 }
 
