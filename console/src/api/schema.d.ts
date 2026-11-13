@@ -361,7 +361,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Журнал аудита организации. */
+        /** Журнал аудита организации: записи по возрастанию `seq`, удовлетворяющие условиям; пустое условие — 400. */
         get: operations["search_audit"];
         put?: never;
         post?: never;
@@ -959,6 +959,17 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Принятый домен организации. */
+        AcceptedDomain: {
+            /** @description Домен (UUID). */
+            id: string;
+            /** @description Вид. */
+            kind: components["schemas"]["DomainKind"];
+            /** @description Имя в канонической форме. */
+            name: string;
+            /** @description Организация (UUID). */
+            tenant: string;
+        };
         /** @description Учётная запись. */
         AccountInfo: components["schemas"]["Policies"] & {
             /** @description Отображаемое имя. */
@@ -1095,9 +1106,9 @@ export interface components {
         /** @description Снимок уровня кластера. */
         ClusterView: {
             /** @description Принятые домены всех организаций. */
-            domains: Record<string, never>[];
+            domains: components["schemas"]["AcceptedDomain"][];
             /** @description Доверенные источники кластера и организаций. */
-            sources: Record<string, never>[];
+            sources: components["schemas"]["TrustedSource"][];
             /**
              * Format: int64
              * @description Версия снимка.
@@ -1169,6 +1180,17 @@ export interface components {
             /** @description `after` следующей страницы; `null` — записей больше нет. */
             next?: string | null;
         };
+        /** @description Политика домена назначения. */
+        DestinationPolicy: {
+            /** @description Адрес исходящих соединений; `null` — адрес узла по умолчанию. */
+            egress_ip?: string | null;
+            /** @description Шаблон: `example.org`, `*.example.org` (поддомены) или `*` (все внешние домены). */
+            pattern: string;
+            /** @description Промежуточный узел (`host` или `host:port`); `null` — доставка по MX. */
+            smart_host?: string | null;
+            /** @description Требование к TLS. */
+            tls: components["schemas"]["TlsRequirement"];
+        };
         /** @description Отключённый ящик. */
         DisabledInfo: {
             /** @description Отображаемое имя. */
@@ -1187,8 +1209,8 @@ export interface components {
         };
         /** @description Принятый домен: создание или замена. */
         DomainBody: {
-            /** @description Вид: `"authoritative"` (по умолчанию) или `{"internal_relay": {"next_hop": "host[:port]"}}`. */
-            kind?: Record<string, never>;
+            /** @description Вид (по умолчанию `"authoritative"`). */
+            kind?: components["schemas"]["DomainKind"];
             /** @description Имя домена (приводится к канонической форме: нижний регистр, без точки в конце, IDN — A-label). */
             name: string;
             /**
@@ -1197,13 +1219,21 @@ export interface components {
              */
             version: number;
         };
+        /**
+         * @description Вид принятого домена: `"authoritative"` — полномочный (неизвестный адрес отклоняется в `RCPT TO`),
+         *     `{"internal_relay": {"next_hop": "host[:port]"}}` — неизвестные адреса передаются на узел `next_hop`.
+         */
+        DomainKind: "authoritative" | {
+            /** @description Внутренняя ретрансляция. */
+            internal_relay: {
+                /** @description Узел назначения неизвестных адресов (`host` или `host:port`). */
+                next_hop: string;
+            };
+        };
         /** @description Принятые домены организации. */
         DomainList: {
-            /**
-             * @description Домены по имени: `{id, tenant, name, kind}`, `kind` — `"authoritative"` или
-             *     `{"internal_relay": {"next_hop": "host[:port]"}}`.
-             */
-            domains: Record<string, never>[];
+            /** @description Домены по имени. */
+            domains: components["schemas"]["AcceptedDomain"][];
             /**
              * Format: int64
              * @description Версия снимка кластера.
@@ -1213,7 +1243,7 @@ export interface components {
         /** @description Записанный домен. */
         DomainWritten: {
             /** @description Домен. */
-            domain: Record<string, never>;
+            domain: components["schemas"]["AcceptedDomain"];
             /**
              * Format: int64
              * @description Новая версия снимка кластера.
@@ -1523,8 +1553,8 @@ export interface components {
             egress_ip?: string | null;
             /** @description Промежуточный узел (`host` или `host:port`); нет — доставка по MX. */
             smart_host?: string | null;
-            /** @description TLS: `"opportunistic"` (по умолчанию), `"required"` или `{"pinned": {"spki_sha256": ["<hex>"]}}`. */
-            tls?: Record<string, never>;
+            /** @description TLS (по умолчанию `"opportunistic"`). */
+            tls?: components["schemas"]["TlsRequirement"];
             /**
              * Format: int64
              * @description Версия снимка организации.
@@ -1533,8 +1563,8 @@ export interface components {
         };
         /** @description Политики доменов назначения организации. */
         RouteList: {
-            /** @description Политики по шаблону: `{pattern, tls, smart_host, egress_ip}`. */
-            routes: Record<string, never>[];
+            /** @description Политики по шаблону. */
+            routes: components["schemas"]["DestinationPolicy"][];
             /**
              * Format: int64
              * @description Версия снимка организации.
@@ -1616,28 +1646,57 @@ export interface components {
         };
         /** @description Доверенный источник: создание или замена (имя — в пути). */
         SourceBody: {
-            /**
-             * @description Вид: `{"gateway": {"xclient": true, "authserv_id": "mx.example.org"}}` или
-             *     `{"application": {"senders": ["@example.org"], "external": false}}` (только у источника организации).
-             */
-            kind: Record<string, never>;
-            /** @description Признаки соединения: `{"networks": ["192.0.2.0/24"]}` или `{"client_cert": {"subject": "mx.example.org"}}`. */
-            matcher: Record<string, never>;
+            /** @description Вид (`application` — только у источника организации). */
+            kind: components["schemas"]["SourceKind"];
+            /** @description Признаки соединения. */
+            matcher: components["schemas"]["SourceMatch"];
             /**
              * Format: int64
              * @description Версия снимка кластера.
              */
             version: number;
         };
+        /** @description Вид доверенного источника: шлюз перед продуктом или приложение без SASL (только у источника организации). */
+        SourceKind: {
+            /** @description Внешний MTA перед продуктом. */
+            gateway: {
+                /** @description authserv-id доверенных `Authentication-Results` шлюза; `null` — не доверять. */
+                authserv_id?: string | null;
+                /** @description Принимать исходного клиента из `XCLIENT`/`XFORWARD`. */
+                xclient: boolean;
+            };
+        } | {
+            /** @description Устройство или система без SASL. */
+            application: {
+                /** @description Разрешены внешние получатели. */
+                external: boolean;
+                /** @description Разрешённые адреса отправителя (`user@example.org` или `@example.org`; не пусто). */
+                senders: string[];
+            };
+        };
         /** @description Доверенные источники. */
         SourceList: {
-            /** @description Источники по имени: `{name, tenant, matcher, kind}`. */
-            sources: Record<string, never>[];
+            /** @description Источники по имени. */
+            sources: components["schemas"]["TrustedSource"][];
             /**
              * Format: int64
              * @description Версия снимка кластера.
              */
             version: number;
+        };
+        /**
+         * @description Признаки соединения доверенного источника: `{"networks": ["192.0.2.0/24"]}` — адрес клиента в одной из подсетей,
+         *     `{"client_cert": {"subject": "mx.example.org"}}` — имя в сертификате клиента (mTLS).
+         */
+        SourceMatch: {
+            /** @description Подсети (CIDR, не пусто). */
+            networks: string[];
+        } | {
+            /** @description Сертификат клиента. */
+            client_cert: {
+                /** @description dNSName из SAN, без учёта регистра ASCII. */
+                subject: string;
+            };
         };
         /** @description Синхронизация каталога, остановленная массовым удалением учётных записей. */
         SyncHold: {
@@ -1658,6 +1717,17 @@ export interface components {
              * @description Учётных записей в организации.
              */
             total: number;
+        };
+        /**
+         * @description TLS при доставке в домен назначения: `"opportunistic"` — по возможности, `"required"` — обязательный с проверкой
+         *     сертификата, `{"pinned": {"spki_sha256": ["<hex>"]}}` — обязательный с закреплённым ключом.
+         */
+        TlsRequirement: "opportunistic" | "required" | {
+            /** @description Обязательный с закреплённым ключом. */
+            pinned: {
+                /** @description SHA-256 SubjectPublicKeyInfo (hex, 64 символа; не пусто). */
+                spki_sha256: string[];
+            };
         };
         /** @description Элемент корзины. */
         TrashEntry: {
@@ -1719,6 +1789,17 @@ export interface components {
             mode: components["schemas"]["PurgeMode"];
             /** @description Пользователь может выбрать своё значение; иначе действует `mode`. */
             user_can_choose?: boolean;
+        };
+        /** @description Доверенный источник приёма. */
+        TrustedSource: {
+            /** @description Вид. */
+            kind: components["schemas"]["SourceKind"];
+            /** @description Признаки соединения. */
+            matcher: components["schemas"]["SourceMatch"];
+            /** @description Имя (ключ записи). */
+            name: string;
+            /** @description Организация (UUID); `null` — источник кластера (общий шлюз). */
+            tenant?: string | null;
         };
         /** @description Подразделение без идентификатора: создание и замена целиком. */
         UnitBody: {
@@ -1862,19 +1943,20 @@ export interface operations {
     };
     list_accounts: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`. */
+                login?: string;
+                /** @description Список: имя входа начинается с префикса (без учёта регистра). */
+                prefix?: string;
+                /** @description Список: продолжение после этого имени входа — `after` из ссылки `rel="next"` предыдущей страницы. */
+                after?: string;
+                /** @description Список: размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`). */
+                limit?: number;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
-                /** @description Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`. */
-                login: string | null;
-                /** @description Список: имя входа начинается с префикса (без учёта регистра). */
-                prefix: string | null;
-                /** @description Список: продолжение после этого имени входа — `after` из ссылки `rel="next"` предыдущей страницы. */
-                after: string | null;
-                /** @description Список: размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`). */
-                limit: number | null;
             };
             cookie?: never;
         };
@@ -2667,22 +2749,23 @@ export interface operations {
     };
     list_trash: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Смещение от начала списка. */
+                offset?: number;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit?: number;
+                /**
+                 * @description `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
+                 *     журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
+                 */
+                include?: string;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
                 /** @description Учётная запись (UUID) */
                 account: string;
-                /** @description Смещение от начала списка. */
-                offset: number;
-                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                limit: number | null;
-                /**
-                 * @description `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
-                 *     журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
-                 */
-                include: string | null;
             };
             cookie?: never;
         };
@@ -2756,22 +2839,23 @@ export interface operations {
     };
     list_hidden: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Смещение от начала списка. */
+                offset?: number;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit?: number;
+                /**
+                 * @description `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
+                 *     журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
+                 */
+                include?: string;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
                 /** @description Учётная запись (UUID) */
                 account: string;
-                /** @description Смещение от начала списка. */
-                offset: number;
-                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                limit: number | null;
-                /**
-                 * @description `subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в
-                 *     журнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.
-                 */
-                include: string | null;
             };
             cookie?: never;
         };
@@ -2981,19 +3065,26 @@ export interface operations {
     };
     search_audit: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Начало интервала (RFC 3339), включительно. */
+                since?: string;
+                /** @description Конец интервала (RFC 3339), не включительно. */
+                until?: string;
+                /** @description Администратор: имя входа (без учёта регистра) или UUID учётной записи. */
+                actor?: string;
+                /** @description Метод HTTP (`PUT`, `POST`, `PATCH`, `DELETE`; без учёта регистра). */
+                method?: string;
+                /** @description Начало шаблона маршрута: `/api/v1/orgs/{org}/transport` — все маршруты транспорта. */
+                route?: string;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit?: number;
+                /** @description Продолжение: `next` предыдущей страницы. */
+                after?: number;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
-                /** @description Начало интервала (RFC 3339), включительно. */
-                since: string | null;
-                /** @description Конец интервала (RFC 3339), не включительно. */
-                until: string | null;
-                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                limit: number | null;
-                /** @description Продолжение: `next` предыдущей страницы. */
-                after: number | null;
             };
             cookie?: never;
         };
@@ -3216,25 +3307,26 @@ export interface operations {
     };
     search_delivery: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Отправитель конверта (точно, без учёта регистра ASCII). */
+                sender?: string;
+                /** @description Один из получателей (точно, без учёта регистра ASCII). */
+                recipient?: string;
+                /** @description Message-ID без угловых скобок (точно). */
+                message_id?: string;
+                /** @description Начало интервала (RFC 3339), включительно. */
+                since?: string;
+                /** @description Конец интервала (RFC 3339), не включительно. */
+                until?: string;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit?: number;
+                /** @description Продолжение: `next` предыдущей страницы с теми же условиями. */
+                after?: string;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
-                /** @description Отправитель конверта (точно, без учёта регистра ASCII). */
-                sender: string | null;
-                /** @description Один из получателей (точно, без учёта регистра ASCII). */
-                recipient: string | null;
-                /** @description Message-ID без угловых скобок (точно). */
-                message_id: string | null;
-                /** @description Начало интервала (RFC 3339), включительно. */
-                since: string | null;
-                /** @description Конец интервала (RFC 3339), не включительно. */
-                until: string | null;
-                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
-                limit: number | null;
-                /** @description Продолжение: `next` предыдущей страницы с теми же условиями. */
-                after: string | null;
             };
             cookie?: never;
         };
@@ -3715,30 +3807,31 @@ export interface operations {
     };
     search_mailbox_audit: {
         parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Организация (UUID) */
-                org: string;
+            query?: {
                 /** @description Ящик (UUID учётной записи). */
-                account: string | null;
+                account?: string;
                 /** @description Исполнитель (имя входа или субъект администратора). */
-                actor: string | null;
+                actor?: string;
                 /** @description Кто относительно ящика: `owner`, `delegate`, `admin`. */
-                actor_kind: string | null;
+                actor_kind?: string;
                 /**
                  * @description Действие (`login`, `read`, `search`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,
                  *     `change_rules`, `change_forwarding`).
                  */
-                action: string | null;
+                action?: string;
                 /** @description Начало интервала (RFC 3339), включительно. */
-                since: string | null;
+                since?: string;
                 /** @description Конец интервала (RFC 3339), не включительно. */
-                until: string | null;
+                until?: string;
                 /** @description Размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`). */
-                limit: number | null;
+                limit?: number;
                 /** @description Продолжение — `next` предыдущей страницы. */
-                after: string | null;
+                after?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
             };
             cookie?: never;
         };
@@ -3818,20 +3911,21 @@ export interface operations {
     };
     list_held: {
         parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Организация (UUID) */
-                org: string;
+            query?: {
                 /** @description Только письма группы (UUID). */
-                group: string | null;
+                group?: string;
                 /** @description Размер (по умолчанию и наибольший — из конфигурации). */
-                limit: number | null;
+                limit?: number;
                 /**
                  * @description `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
                  *     к содержимому; размер — не больше `admin.content_page_size`.
                  */
-                include: string | null;
+                include?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
             };
             cookie?: never;
         };
@@ -4321,15 +4415,16 @@ export interface operations {
     };
     delete_domain: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
                 /** @description Домен (UUID) */
                 id: string;
-                /** @description Версия снимка из последнего чтения. */
-                version: number;
             };
             cookie?: never;
         };
@@ -4547,15 +4642,16 @@ export interface operations {
     };
     delete_route: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
                 /** @description Шаблон */
                 pattern: string;
-                /** @description Версия снимка из последнего чтения. */
-                version: number;
             };
             cookie?: never;
         };
@@ -4681,15 +4777,16 @@ export interface operations {
     };
     delete_org_source: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
                 /** @description Имя источника */
                 name: string;
-                /** @description Версия снимка из последнего чтения. */
-                version: number;
             };
             cookie?: never;
         };
@@ -4881,15 +4978,16 @@ export interface operations {
     };
     unit_members: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description С вложенными подразделениями. */
+                subtree?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Организация (UUID) */
                 org: string;
                 /** @description Подразделение (UUID) */
                 unit: string;
-                /** @description С вложенными подразделениями. */
-                subtree: boolean;
             };
             cookie?: never;
         };
@@ -5063,13 +5161,14 @@ export interface operations {
     };
     delete_cluster_source: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description Версия снимка из последнего чтения. */
+                version: number;
+            };
             header?: never;
             path: {
                 /** @description Имя источника */
                 name: string;
-                /** @description Версия снимка из последнего чтения. */
-                version: number;
             };
             cookie?: never;
         };

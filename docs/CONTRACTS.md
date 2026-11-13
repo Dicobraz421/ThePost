@@ -389,9 +389,11 @@ until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_au
 SRS 5.2, 6.8, решение 98 (CTR-25; код — `admin_audit.rs`). Журнал аудита Admin API, только добавление. `AdminAuditRecord { at, tenant?
 (`None` — уровень инсталляции), actor_tenant, actor, actor_login, roles: Vec<String> (роли Admin API), method, route, path, status,
 content_messages? }` — без тела запроса и секретов. `AuditLog`: `append(&record) -> seq` (номер ≥ 1, растёт в порядке добавления);
-`search(tenant, &AdminAuditQuery { since?, until?, limit ≥ 1, after? }) -> AdminAuditPage { entries: Vec<AdminAuditEntry { seq, record }>,
-next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, `at` в [`since`, `until`), `next` — у полной страницы;
-`AdminAuditQuery::validate` (неверный — `Invalid`). Выгрузка в SIEM (решение владельца 12.11: база + выгрузка из неё, APP-59):
+`search(tenant, &AdminAuditQuery { since?, until?, actor?, method?, route_prefix?, limit ≥ 1, after? }) -> AdminAuditPage { entries:
+Vec<AdminAuditEntry { seq, record }>, next? }` — только записи организации (без уровня инсталляции), по возрастанию `seq`, условия по «и»
+(`AdminAuditQuery::matches`: `at` в [`since`, `until`), `actor` — имя входа без учёта регистра или UUID, `method` — точно, `route_prefix` —
+начало шаблона маршрута; ADM-30) отбирает хранилище, `next` — у полной страницы; `AdminAuditQuery::first(limit)` — без условий;
+`AdminAuditQuery::validate` (неверный, в том числе пустое условие, — `Invalid`). Выгрузка в SIEM (решение владельца 12.11: база + выгрузка из неё, APP-59):
 `export_page(after, limit ≥ 1) -> Vec<AdminAuditEntry>` — все записи (и уровень инсталляции) с `seq > after` по возрастанию; видимые записи —
 непрерывный префикс порядка добавления (меньший номер не появляется после бо́льшего); `export_mark(sink) -> seq` (0 — ничего не доставлено),
 `advance_export_mark(sink, from, to) -> bool` — сдвиг, только если отметка всё ещё `from` (`to > from`, иначе `Invalid`; `check_export_mark`).

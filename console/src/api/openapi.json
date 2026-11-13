@@ -1,6 +1,34 @@
 {
   "components": {
     "schemas": {
+      "AcceptedDomain": {
+        "description": "Принятый домен организации.",
+        "properties": {
+          "id": {
+            "description": "Домен (UUID).",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DomainKind",
+            "description": "Вид."
+          },
+          "name": {
+            "description": "Имя в канонической форме.",
+            "type": "string"
+          },
+          "tenant": {
+            "description": "Организация (UUID).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant",
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
       "AccountInfo": {
         "allOf": [
           {
@@ -335,14 +363,14 @@
           "domains": {
             "description": "Принятые домены всех организаций.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/AcceptedDomain"
             },
             "type": "array"
           },
           "sources": {
             "description": "Доверенные источники кластера и организаций.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/TrustedSource"
             },
             "type": "array"
           },
@@ -540,6 +568,38 @@
         ],
         "type": "object"
       },
+      "DestinationPolicy": {
+        "description": "Политика домена назначения.",
+        "properties": {
+          "egress_ip": {
+            "description": "Адрес исходящих соединений; `null` — адрес узла по умолчанию.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "Шаблон: `example.org`, `*.example.org` (поддомены) или `*` (все внешние домены).",
+            "type": "string"
+          },
+          "smart_host": {
+            "description": "Промежуточный узел (`host` или `host:port`); `null` — доставка по MX.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tls": {
+            "$ref": "#/components/schemas/TlsRequirement",
+            "description": "Требование к TLS."
+          }
+        },
+        "required": [
+          "pattern",
+          "tls"
+        ],
+        "type": "object"
+      },
       "DisabledInfo": {
         "description": "Отключённый ящик.",
         "properties": {
@@ -581,8 +641,8 @@
         "description": "Принятый домен: создание или замена.",
         "properties": {
           "kind": {
-            "description": "Вид: `\"authoritative\"` (по умолчанию) или `{\"internal_relay\": {\"next_hop\": \"host[:port]\"}}`.",
-            "type": "object"
+            "$ref": "#/components/schemas/DomainKind",
+            "description": "Вид (по умолчанию `\"authoritative\"`)."
           },
           "name": {
             "description": "Имя домена (приводится к канонической форме: нижний регистр, без точки в конце, IDN — A-label).",
@@ -601,13 +661,47 @@
         ],
         "type": "object"
       },
+      "DomainKind": {
+        "description": "Вид принятого домена: `\"authoritative\"` — полномочный (неизвестный адрес отклоняется в `RCPT TO`),\n`{\"internal_relay\": {\"next_hop\": \"host[:port]\"}}` — неизвестные адреса передаются на узел `next_hop`.",
+        "oneOf": [
+          {
+            "description": "Полномочный.",
+            "enum": [
+              "authoritative"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Внутренняя ретрансляция.",
+            "properties": {
+              "internal_relay": {
+                "description": "Внутренняя ретрансляция.",
+                "properties": {
+                  "next_hop": {
+                    "description": "Узел назначения неизвестных адресов (`host` или `host:port`).",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "next_hop"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "internal_relay"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "DomainList": {
         "description": "Принятые домены организации.",
         "properties": {
           "domains": {
-            "description": "Домены по имени: `{id, tenant, name, kind}`, `kind` — `\"authoritative\"` или\n`{\"internal_relay\": {\"next_hop\": \"host[:port]\"}}`.",
+            "description": "Домены по имени.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/AcceptedDomain"
             },
             "type": "array"
           },
@@ -628,8 +722,8 @@
         "description": "Записанный домен.",
         "properties": {
           "domain": {
-            "description": "Домен.",
-            "type": "object"
+            "$ref": "#/components/schemas/AcceptedDomain",
+            "description": "Домен."
           },
           "version": {
             "description": "Новая версия снимка кластера.",
@@ -1424,8 +1518,8 @@
             ]
           },
           "tls": {
-            "description": "TLS: `\"opportunistic\"` (по умолчанию), `\"required\"` или `{\"pinned\": {\"spki_sha256\": [\"<hex>\"]}}`.",
-            "type": "object"
+            "$ref": "#/components/schemas/TlsRequirement",
+            "description": "TLS (по умолчанию `\"opportunistic\"`)."
           },
           "version": {
             "description": "Версия снимка организации.",
@@ -1443,9 +1537,9 @@
         "description": "Политики доменов назначения организации.",
         "properties": {
           "routes": {
-            "description": "Политики по шаблону: `{pattern, tls, smart_host, egress_ip}`.",
+            "description": "Политики по шаблону.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/DestinationPolicy"
             },
             "type": "array"
           },
@@ -1672,12 +1766,12 @@
         "description": "Доверенный источник: создание или замена (имя — в пути).",
         "properties": {
           "kind": {
-            "description": "Вид: `{\"gateway\": {\"xclient\": true, \"authserv_id\": \"mx.example.org\"}}` или\n`{\"application\": {\"senders\": [\"@example.org\"], \"external\": false}}` (только у источника организации).",
-            "type": "object"
+            "$ref": "#/components/schemas/SourceKind",
+            "description": "Вид (`application` — только у источника организации)."
           },
           "matcher": {
-            "description": "Признаки соединения: `{\"networks\": [\"192.0.2.0/24\"]}` или `{\"client_cert\": {\"subject\": \"mx.example.org\"}}`.",
-            "type": "object"
+            "$ref": "#/components/schemas/SourceMatch",
+            "description": "Признаки соединения."
           },
           "version": {
             "description": "Версия снимка кластера.",
@@ -1693,13 +1787,77 @@
         ],
         "type": "object"
       },
+      "SourceKind": {
+        "description": "Вид доверенного источника: шлюз перед продуктом или приложение без SASL (только у источника организации).",
+        "oneOf": [
+          {
+            "description": "Внешний MTA перед продуктом.",
+            "properties": {
+              "gateway": {
+                "description": "Внешний MTA перед продуктом.",
+                "properties": {
+                  "authserv_id": {
+                    "description": "authserv-id доверенных `Authentication-Results` шлюза; `null` — не доверять.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "xclient": {
+                    "description": "Принимать исходного клиента из `XCLIENT`/`XFORWARD`.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "xclient"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "gateway"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Устройство или система без SASL.",
+            "properties": {
+              "application": {
+                "description": "Устройство или система без SASL.",
+                "properties": {
+                  "external": {
+                    "description": "Разрешены внешние получатели.",
+                    "type": "boolean"
+                  },
+                  "senders": {
+                    "description": "Разрешённые адреса отправителя (`user@example.org` или `@example.org`; не пусто).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "senders",
+                  "external"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "application"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "SourceList": {
         "description": "Доверенные источники.",
         "properties": {
           "sources": {
-            "description": "Источники по имени: `{name, tenant, matcher, kind}`.",
+            "description": "Источники по имени.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/TrustedSource"
             },
             "type": "array"
           },
@@ -1715,6 +1873,49 @@
           "sources"
         ],
         "type": "object"
+      },
+      "SourceMatch": {
+        "description": "Признаки соединения доверенного источника: `{\"networks\": [\"192.0.2.0/24\"]}` — адрес клиента в одной из подсетей,\n`{\"client_cert\": {\"subject\": \"mx.example.org\"}}` — имя в сертификате клиента (mTLS).",
+        "oneOf": [
+          {
+            "description": "Подсети (CIDR, не пусто).",
+            "properties": {
+              "networks": {
+                "description": "Подсети (CIDR, не пусто).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "networks"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Сертификат клиента.",
+            "properties": {
+              "client_cert": {
+                "description": "Сертификат клиента.",
+                "properties": {
+                  "subject": {
+                    "description": "dNSName из SAN, без учёта регистра ASCII.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "subject"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "client_cert"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "SyncHold": {
         "description": "Синхронизация каталога, остановленная массовым удалением учётных записей.",
@@ -1748,6 +1949,50 @@
           "approved"
         ],
         "type": "object"
+      },
+      "TlsRequirement": {
+        "description": "TLS при доставке в домен назначения: `\"opportunistic\"` — по возможности, `\"required\"` — обязательный с проверкой\nсертификата, `{\"pinned\": {\"spki_sha256\": [\"<hex>\"]}}` — обязательный с закреплённым ключом.",
+        "oneOf": [
+          {
+            "description": "По возможности.",
+            "enum": [
+              "opportunistic"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Обязательный с проверкой сертификата.",
+            "enum": [
+              "required"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Обязательный с закреплённым ключом.",
+            "properties": {
+              "pinned": {
+                "description": "Обязательный с закреплённым ключом.",
+                "properties": {
+                  "spki_sha256": {
+                    "description": "SHA-256 SubjectPublicKeyInfo (hex, 64 символа; не пусто).",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "spki_sha256"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "pinned"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "TrashEntry": {
         "description": "Элемент корзины.",
@@ -1882,6 +2127,36 @@
         },
         "required": [
           "mode"
+        ],
+        "type": "object"
+      },
+      "TrustedSource": {
+        "description": "Доверенный источник приёма.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind",
+            "description": "Вид."
+          },
+          "matcher": {
+            "$ref": "#/components/schemas/SourceMatch",
+            "description": "Признаки соединения."
+          },
+          "name": {
+            "description": "Имя (ключ записи).",
+            "type": "string"
+          },
+          "tenant": {
+            "description": "Организация (UUID); `null` — источник кластера (общий шлюз).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "matcher",
+          "kind"
         ],
         "type": "object"
       },
@@ -2181,51 +2456,39 @@
           },
           {
             "description": "Имя входа (без учёта регистра): поиск одной записи; несовместимо с `prefix`, `after`, `limit`.",
-            "in": "path",
+            "in": "query",
             "name": "login",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Список: имя входа начинается с префикса (без учёта регистра).",
-            "in": "path",
+            "in": "query",
             "name": "prefix",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Список: продолжение после этого имени входа — `after` из ссылки `rel=\"next\"` предыдущей страницы.",
-            "in": "path",
+            "in": "query",
             "name": "after",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Список: размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           }
         ],
@@ -3405,9 +3668,9 @@
           },
           {
             "description": "Смещение от начала списка.",
-            "in": "path",
+            "in": "query",
             "name": "offset",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
               "type": "integer"
@@ -3415,27 +3678,21 @@
           },
           {
             "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
             "description": "`subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в\nжурнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.",
-            "in": "path",
+            "in": "query",
             "name": "include",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -3556,9 +3813,9 @@
           },
           {
             "description": "Смещение от начала списка.",
-            "in": "path",
+            "in": "query",
             "name": "offset",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
               "type": "integer"
@@ -3566,27 +3823,21 @@
           },
           {
             "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
             "description": "`subject` — отдать тему и отправителя писем (`subject`, `from`). Только администратору; запрос пишется в\nжурнал аудита как доступ к содержимому; страница — не больше `admin.content_page_size`.",
-            "in": "path",
+            "in": "query",
             "name": "include",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -3907,55 +4158,70 @@
           },
           {
             "description": "Начало интервала (RFC 3339), включительно.",
-            "in": "path",
+            "in": "query",
             "name": "since",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Конец интервала (RFC 3339), не включительно.",
-            "in": "path",
+            "in": "query",
             "name": "until",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
+            }
+          },
+          {
+            "description": "Администратор: имя входа (без учёта регистра) или UUID учётной записи.",
+            "in": "query",
+            "name": "actor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Метод HTTP (`PUT`, `POST`, `PATCH`, `DELETE`; без учёта регистра).",
+            "in": "query",
+            "name": "method",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Начало шаблона маршрута: `/api/v1/orgs/{org}/transport` — все маршруты транспорта.",
+            "in": "query",
+            "name": "route",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
             "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
             "description": "Продолжение: `next` предыдущей страницы.",
-            "in": "path",
+            "in": "query",
             "name": "after",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           }
         ],
@@ -3988,7 +4254,7 @@
             }
           }
         },
-        "summary": "Журнал аудита организации.",
+        "summary": "Журнал аудита организации: записи по возрастанию `seq`, удовлетворяющие условиям; пустое условие — 400.",
         "tags": [
           "audit"
         ]
@@ -4275,89 +4541,68 @@
           },
           {
             "description": "Отправитель конверта (точно, без учёта регистра ASCII).",
-            "in": "path",
+            "in": "query",
             "name": "sender",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Один из получателей (точно, без учёта регистра ASCII).",
-            "in": "path",
+            "in": "query",
             "name": "recipient",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Message-ID без угловых скобок (точно).",
-            "in": "path",
+            "in": "query",
             "name": "message_id",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Начало интервала (RFC 3339), включительно.",
-            "in": "path",
+            "in": "query",
             "name": "since",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Конец интервала (RFC 3339), не включительно.",
-            "in": "path",
+            "in": "query",
             "name": "until",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
             "description": "Продолжение: `next` предыдущей страницы с теми же условиями.",
-            "in": "path",
+            "in": "query",
             "name": "after",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -5050,101 +5295,77 @@
           },
           {
             "description": "Ящик (UUID учётной записи).",
-            "in": "path",
+            "in": "query",
             "name": "account",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Исполнитель (имя входа или субъект администратора).",
-            "in": "path",
+            "in": "query",
             "name": "actor",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Кто относительно ящика: `owner`, `delegate`, `admin`.",
-            "in": "path",
+            "in": "query",
             "name": "actor_kind",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Действие (`login`, `read`, `search`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,\n`change_rules`, `change_forwarding`).",
-            "in": "path",
+            "in": "query",
             "name": "action",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Начало интервала (RFC 3339), включительно.",
-            "in": "path",
+            "in": "query",
             "name": "since",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Конец интервала (RFC 3339), не включительно.",
-            "in": "path",
+            "in": "query",
             "name": "until",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Размер страницы (по умолчанию и наибольший — `admin.page_size`, `admin.max_page_size`).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
             "description": "Продолжение — `next` предыдущей страницы.",
-            "in": "path",
+            "in": "query",
             "name": "after",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -5260,39 +5481,30 @@
           },
           {
             "description": "Только письма группы (UUID).",
-            "in": "path",
+            "in": "query",
             "name": "group",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
             "description": "Размер (по умолчанию и наибольший — из конфигурации).",
-            "in": "path",
+            "in": "query",
             "name": "limit",
-            "required": true,
+            "required": false,
             "schema": {
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
             "description": "`subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ\nк содержимому; размер — не больше `admin.content_page_size`.",
-            "in": "path",
+            "in": "query",
             "name": "include",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -5877,7 +6089,7 @@
           },
           {
             "description": "Версия снимка из последнего чтения.",
-            "in": "path",
+            "in": "query",
             "name": "version",
             "required": true,
             "schema": {
@@ -6214,7 +6426,7 @@
           },
           {
             "description": "Версия снимка из последнего чтения.",
-            "in": "path",
+            "in": "query",
             "name": "version",
             "required": true,
             "schema": {
@@ -6409,7 +6621,7 @@
           },
           {
             "description": "Версия снимка из последнего чтения.",
-            "in": "path",
+            "in": "query",
             "name": "version",
             "required": true,
             "schema": {
@@ -6774,9 +6986,9 @@
           },
           {
             "description": "С вложенными подразделениями.",
-            "in": "path",
+            "in": "query",
             "name": "subtree",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "boolean"
             }
@@ -6923,7 +7135,7 @@
           },
           {
             "description": "Версия снимка из последнего чтения.",
-            "in": "path",
+            "in": "query",
             "name": "version",
             "required": true,
             "schema": {

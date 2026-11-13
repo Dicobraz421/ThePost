@@ -144,6 +144,7 @@ impl From<OrgMember> for UnitMember {
 
 /// Выбор учётных записей подразделения.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct MembersQuery {
     /// С вложенными подразделениями.

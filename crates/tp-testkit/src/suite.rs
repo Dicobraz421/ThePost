@@ -5385,8 +5385,8 @@ pub async fn policy_store(
 }
 
 /// CTR-25: [`AuditLog`] — номера растут в порядке добавления; чтение — только записи организации (без уровня
-/// инсталляции и чужих), по возрастанию номера, интервал [`since`, `until`), курсор `after`, `next` у полной
-/// страницы; неверный запрос — `Invalid`. `tenant` и `foreign_tenant` — организации без записей в журнале.
+/// инсталляции и чужих), по возрастанию номера, интервал [`since`, `until`), условия `actor`, `method`,
+/// `route_prefix` (ADM-30) — в хранилище, курсор `after`, `next` у полной страницы; неверный запрос — `Invalid`. `tenant` и `foreign_tenant` — организации без записей в журнале.
 pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenant: TenantId) {
     let t0 = OffsetDateTime::now_utc()
         .replace_nanosecond(0)
@@ -5401,8 +5401,13 @@ pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenan
             actor: AccountId::new(),
             actor_login: format!("admin{s}"),
             roles: vec!["organization_admin".into()],
-            method: "PUT".into(),
-            route: "/api/v1/orgs/{org}/policy".into(),
+            method: if s % 2 == 0 { "PUT" } else { "DELETE" }.into(),
+            route: if s == 4 {
+                "/api/v1/orgs/{org}/transport/routes/{pattern}"
+            } else {
+                "/api/v1/orgs/{org}/policy"
+            }
+            .into(),
             path: format!("/api/v1/orgs/{org}/policy"),
             status: if s % 2 == 0 { 200 } else { 403 },
             content_messages: (s == 3).then_some(2),
@@ -5424,12 +5429,7 @@ pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenan
         seq: seqs[i],
         record: records[i].clone(),
     };
-    let query = |limit: usize| AdminAuditQuery {
-        since: None,
-        until: None,
-        limit,
-        after: None,
-    };
+    let query = AdminAuditQuery::first;
     let page = |entries: Vec<AdminAuditEntry>, next: Option<u64>| AdminAuditPage { entries, next };
 
     assert_eq!(
@@ -5472,9 +5472,68 @@ pub async fn admin_audit_log(log: &dyn AuditLog, tenant: TenantId, foreign_tenan
         log.search(tenant, &since).await,
         Ok(page(vec![entry(3), entry(4)], None))
     );
+    // Условия по записи (ADM-30): администратор — имя входа без учёта регистра или UUID, метод, начало маршрута.
+    let by_login = AdminAuditQuery {
+        actor: Some("ADMIN3".into()),
+        ..query(10)
+    };
+    assert_eq!(
+        log.search(tenant, &by_login).await,
+        Ok(page(vec![entry(3)], None))
+    );
+    let by_id = AdminAuditQuery {
+        actor: Some(records[4].actor.to_string()),
+        ..query(10)
+    };
+    assert_eq!(
+        log.search(tenant, &by_id).await,
+        Ok(page(vec![entry(4)], None))
+    );
+    let by_method = AdminAuditQuery {
+        method: Some("DELETE".into()),
+        ..query(10)
+    };
+    assert_eq!(
+        log.search(tenant, &by_method).await,
+        Ok(page(vec![entry(3)], None))
+    );
+    let by_route = AdminAuditQuery {
+        route_prefix: Some("/api/v1/orgs/{org}/transport".into()),
+        ..query(10)
+    };
+    assert_eq!(
+        log.search(tenant, &by_route).await,
+        Ok(page(vec![entry(4)], None))
+    );
+    // Отбор в хранилище: страница с условием полная, неподходящая запись между страницами пропускается.
+    let put = |after: Option<u64>| AdminAuditQuery {
+        method: Some("PUT".into()),
+        after,
+        ..query(1)
+    };
+    assert_eq!(
+        log.search(tenant, &put(None)).await,
+        Ok(page(vec![entry(0)], Some(seqs[0])))
+    );
+    assert_eq!(
+        log.search(tenant, &put(Some(seqs[0]))).await,
+        Ok(page(vec![entry(4)], Some(seqs[4])))
+    );
+    assert_eq!(
+        log.search(tenant, &put(Some(seqs[4]))).await,
+        Ok(page(Vec::new(), None))
+    );
     // Неверный запрос.
     assert!(matches!(
         log.search(tenant, &query(0)).await,
+        Err(Error::Invalid(_))
+    ));
+    let blank = AdminAuditQuery {
+        actor: Some(String::new()),
+        ..query(10)
+    };
+    assert!(matches!(
+        log.search(tenant, &blank).await,
         Err(Error::Invalid(_))
     ));
     let reversed = AdminAuditQuery {

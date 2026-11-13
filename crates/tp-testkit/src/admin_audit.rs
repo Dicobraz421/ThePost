@@ -51,8 +51,7 @@ impl AuditLog for MemAuditLog {
             .iter()
             .filter(|e| e.record.tenant == Some(tenant))
             .filter(|e| query.after.is_none_or(|a| e.seq > a))
-            .filter(|e| query.since.is_none_or(|s| e.record.at >= s))
-            .filter(|e| query.until.is_none_or(|u| e.record.at < u))
+            .filter(|e| query.matches(&e.record))
             .take(query.limit)
             .cloned()
             .collect();

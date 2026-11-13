@@ -70,16 +70,23 @@ impl AuditLog for PgMeta {
             .transpose()
             .map_err(|_| Error::invalid("audit: after out of range"))?;
         let (since, until) = (query.since, query.until);
+        let (actor, method, route) = (&query.actor, &query.method, &query.route_prefix);
         let rows: Vec<(i64, Json<AdminAuditRecord>)> = self
             .idempotent(|| {
+                let (actor, method, route) = (actor.clone(), method.clone(), route.clone());
                 with_tenant(&self.pool, tenant, move |tx| {
                     Box::pin(async move {
+                        // Условия по записи — правило `AdminAuditQuery::matches`.
                         sqlx::query_as(
                             "SELECT seq, record FROM audit_log
                              WHERE tenant_id = $1
                                AND ($2::timestamptz IS NULL OR at >= $2)
                                AND ($3::timestamptz IS NULL OR at < $3)
                                AND ($4::bigint IS NULL OR seq > $4)
+                               AND ($6::text IS NULL OR lower(record->>'actor_login') = lower($6)
+                                    OR actor::text = $6)
+                               AND ($7::text IS NULL OR record->>'method' = $7)
+                               AND ($8::text IS NULL OR starts_with(record->>'route', $8))
                              ORDER BY seq LIMIT $5",
                         )
                         .bind(tenant.as_uuid())
@@ -87,6 +94,9 @@ impl AuditLog for PgMeta {
                         .bind(until)
                         .bind(after)
                         .bind(limit)
+                        .bind(actor)
+                        .bind(method)
+                        .bind(route)
                         .fetch_all(&mut *tx)
                         .await
                         .map_err(db_err)

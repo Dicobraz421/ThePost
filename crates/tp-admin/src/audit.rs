@@ -10,7 +10,8 @@
 //! от отметки доставки (решение владельца 12.11: база + выгрузка из неё, APP-59).
 //!
 //! Чтение — `GET /api/v1/orgs/{org}/audit` (`AuditLog::search`): администраторы и аудитор организации, оператор —
-//! нет. В ответе и в экспорте запись — [`AuditRecord`] (момент — RFC 3339).
+//! нет. Условия (по «и») — интервал, администратор (`actor`: имя входа или UUID), метод, начало шаблона маршрута;
+//! отбирает хранилище, поэтому страница с условием полная, пока подходящие записи есть (ADM-30). В ответе и в экспорте запись — [`AuditRecord`] (момент — RFC 3339).
 
 use std::sync::Arc;
 
@@ -124,8 +125,9 @@ pub(crate) async fn record(d: &Deps, record: &AdminAuditRecord) -> Result<()> {
     Ok(())
 }
 
-/// Параметры чтения журнала аудита.
+/// Параметры чтения журнала аудита (условия — по «и»).
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct AuditParams {
     /// Начало интервала (RFC 3339), включительно.
@@ -136,6 +138,12 @@ pub struct AuditParams {
     #[serde(default, with = "time::serde::rfc3339::option")]
     #[param(value_type = Option<String>, format = DateTime)]
     pub until: Option<OffsetDateTime>,
+    /// Администратор: имя входа (без учёта регистра) или UUID учётной записи.
+    pub actor: Option<String>,
+    /// Метод HTTP (`PUT`, `POST`, `PATCH`, `DELETE`; без учёта регистра).
+    pub method: Option<String>,
+    /// Начало шаблона маршрута: `/api/v1/orgs/{org}/transport` — все маршруты транспорта.
+    pub route: Option<String>,
     /// Размер страницы (по умолчанию и наибольший — из конфигурации).
     pub limit: Option<usize>,
     /// Продолжение: `next` предыдущей страницы.
@@ -155,7 +163,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
 )]
 pub(crate) struct Doc;
 
-/// Журнал аудита организации.
+/// Журнал аудита организации: записи по возрастанию `seq`, удовлетворяющие условиям; пустое условие — 400.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/audit", tag = "audit",
     params(("org" = String, Path, description = "Организация (UUID)"), AuditParams),
     responses((status = 200, body = AuditPage), (status = 400, body = Problem), (status = 403, body = Problem)))]
@@ -167,6 +175,9 @@ async fn search_audit(
     let query = AdminAuditQuery {
         since: q.since,
         until: q.until,
+        actor: q.actor,
+        method: q.method.map(|m| m.to_ascii_uppercase()),
+        route_prefix: q.route,
         limit: a.cfg.page(q.limit),
         after: q.after,
     };
@@ -303,5 +314,79 @@ mod tests {
         let (s, _, b) = env.call("GET", &ok, Some("auditor"), None).await;
         assert_eq!(s, StatusCode::OK);
         assert!(!b["entries"].as_array().expect("entries").is_empty());
+    }
+
+    /// Все записи, которые отдаёт журнал по запросу `query` страницами по `limit`, и число запросов.
+    async fn all_pages(env: &Env, query: &str, limit: usize) -> (Vec<serde_json::Value>, usize) {
+        let (mut out, mut requests, mut after) = (Vec::new(), 0, None::<u64>);
+        loop {
+            let cursor = after.map(|a| format!("&after={a}")).unwrap_or_default();
+            let url = format!("{}?{query}&limit={limit}{cursor}", audit());
+            let (s, _, b) = env.call("GET", &url, Some("auditor"), None).await;
+            assert_eq!(s, StatusCode::OK, "{url}: {b}");
+            requests += 1;
+            out.extend(b["entries"].as_array().expect("entries").iter().cloned());
+            match b["next"].as_u64() {
+                Some(n) => after = Some(n),
+                None => return (out, requests),
+            }
+        }
+    }
+
+    /// Приёмка ADM-30: фильтры `actor`, `method`, `route` отбирает хранилище — записи одного администратора
+    /// вперемешку с чужими читаются полными страницами с нескольких страниц журнала; пустое условие — 400.
+    #[tokio::test]
+    async fn filters_span_pages() {
+        let env = Env::new();
+        let org = format!("/api/v1/orgs/{}", tp_contracts::TenantId::DEFAULT);
+        let domains = format!("{org}/transport/domains");
+        // Вперемешку: отказ оператору (403) и создание домена администратором (201), трижды.
+        for i in 0..3 {
+            let body = Some(json!({"version": i, "name": format!("d{i}.example.org")}));
+            let (s, _, _) = env
+                .call("POST", &domains, Some("operator"), body.clone())
+                .await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            let (s, _, b) = env.call("POST", &domains, Some("org"), body).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        let (s, _, _) = env
+            .call(
+                "PUT",
+                &format!("{org}/policy"),
+                Some("org"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // Администратор — по имени входа без учёта регистра: страницы по 2 записи, все — его.
+        let (mine, requests) = all_pages(&env, "actor=OPS@example.org", 2).await;
+        assert_eq!(mine.len(), 3, "{mine:?}");
+        assert!(mine.iter().all(|e| e["actor_login"] == "ops@example.org"));
+        assert!(requests >= 2, "записи с нескольких страниц: {requests}");
+        let seqs: Vec<_> = mine.iter().map(|e| e["seq"].as_u64()).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        // Он же по UUID учётной записи.
+        let id = mine[0]["actor"].as_str().expect("actor").to_owned();
+        let (by_id, _) = all_pages(&env, &format!("actor={id}"), 2).await;
+        assert_eq!(by_id, mine);
+
+        // Метод (без учёта регистра) и начало шаблона маршрута.
+        let (posts, _) = all_pages(&env, "method=post", 1).await;
+        assert_eq!(posts.len(), 6);
+        let (transport, _) = all_pages(&env, "route=/api/v1/orgs/%7Borg%7D/transport", 4).await;
+        assert_eq!(transport.len(), 6);
+        let (policy, _) =
+            all_pages(&env, "method=PUT&route=/api/v1/orgs/%7Borg%7D/policy", 4).await;
+        assert_eq!(policy.len(), 1);
+        assert_eq!(policy[0]["actor_login"], "admin@example.org");
+
+        for bad in ["actor=", "method=", "route="] {
+            let (s, _, _) = env
+                .call("GET", &format!("{}?{bad}", audit()), Some("auditor"), None)
+                .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 }
