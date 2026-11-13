@@ -590,8 +590,12 @@
 | [DAV-35](DAV-35.md) | планирование — вложенные группы в участниках | dav | A | dav-13 | done | — |
 | [AUTH-20](AUTH-20.md) | защита от перебора — без своей нормализации адреса | auth | A | auth-15 | done | PLT-34 |
 | [SMTP-46](SMTP-46.md) | адрес клиента — без нормализации в потребителях; `XCLIENT`/`XFORWARD ADDR` — в канонической форме | smtp | A | smtp-27 | done | PLT-34 |
-| [SYS-16](SYS-16.md) | Landlock — кэш повторов Kerberos для входа GSSAPI | sys | A | sys-11 | ready | — |
-| [UI-18](UI-18.md) | консоль — журнал аудита на фильтрах хранилища | console | A | console-09 | ready | — |
+| [SYS-16](SYS-16.md) | Landlock — кэш повторов Kerberos для входа GSSAPI | sys | A | sys-11 | done | — |
+| [UI-18](UI-18.md) | консоль — журнал аудита на фильтрах хранилища | console | A | console-09 | done | — |
+| [APP-68](APP-68.md) | узел: каталог кэша повторов Kerberos при входе GSSAPI | app | A | app-64 | done | SYS-16 |
+| [DEP-53](DEP-53.md) | развёртывание: KRB5RCACHEDIR — каталог кэша повторов Kerberos узла | deploy | A | deploy-39 | done | SYS-16 |
+| [DOC-06](DOC-06.md) | INSTALL: `admin transport domain` вместо `admin domain`, вход `admin login --oidc` | docs | A | docs-06 | done | ADM-38,ADM-39 |
+| [DEP-54](DEP-54.md) | развёртывание: принципал `pop/<узел>` в keytab для входа GSSAPI по POP3 | deploy | A | deploy-40 | done | DEP-39 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
@@ -627,12 +631,12 @@
 | [FIX-06](FIX-06.md) | `tp-mailstore`: паника разбора метаданных письма (фаззер, цель `meta`) | mailstore | A | mailstore-13 | done | — |
 | [FIX-07](FIX-07.md) | `tp-mailstore`: паника разбиения письма на части (фаззер, цель `split`) | mailstore | A | mailstore-13 | done | — |
 | [FIX-08](FIX-08.md) | `tp-smtp`: паника разбора ответа Milter (фаззер, цель `milter`) | smtp | A | smtp-22 | done | — |
-| [ADM-37](ADM-37.md) | CLI `account list --after` | admin | A | admin-25 | ready | APP-22 |
-| [ADM-38](ADM-38.md) | CLI: политики, группы, корзина, аудит, журнал доставки, транспорт | admin | A | admin-25 | ready | APP-22 |
-| [ADM-39](ADM-39.md) | CLI: `thepost admin login --oidc` | admin | A | admin-25 | ready | APP-42 |
+| [ADM-37](ADM-37.md) | CLI `account list --after` | admin | A | admin-25 | done | APP-22 |
+| [ADM-38](ADM-38.md) | CLI: политики, группы, корзина, аудит, журнал доставки, транспорт | admin | A | admin-25 | done | APP-22 |
+| [ADM-39](ADM-39.md) | CLI: `thepost admin login --oidc` | admin | A | admin-25 | done | APP-42 |
 | [BLOB-17](BLOB-17.md) | `verify`: раздельные счётчики «пропал» и «неверный размер» | blob | A | blob-10 | done | BLOB-14 |
 | [DEP-49](DEP-49.md) | эталонные конфигурации: `maintenance.*` и `cli.oidc.*` | deploy | A | deploy-35 | done | APP-44,APP-39 |
-| [DOC-05](DOC-05.md) | справочник администратора: `maintenance.*` и `cli.oidc.*` | docs | A | docs-05 | ready | DEP-49 |
+| [DOC-05](DOC-05.md) | справочник администратора: `maintenance.*` и `cli.oidc.*` | docs | A | docs-05 | done | DEP-49 |
 | [APP-56](APP-56.md) | узел: OIDC с ключом из хранилища секретов | app | A | app-50 | done | AUTH-17 |
 | [CTR-72](CTR-72.md) | `AccountStore::by_external_id` — обязательный метод | contracts | B | contracts-48 | done | — |
 
@@ -787,7 +791,7 @@
 | [DEPS-12](DEPS-12.md) | фича `gssapi` в сборке узла | deps | B | deps-12 | done | AUTH-13 |
 | [CI-12](CI-12.md) | libkrb5 в CI, выпуск и бета с GSSAPI | ci | B | ci-10 | done | DEPS-12 |
 | [DEP-39](DEP-39.md) | образ и эталоны: libkrb5 для GSSAPI | deploy | A | deploy-29 | done | DEPS-12 |
-| [DOC-03](DOC-03.md) | PREREQUISITES: Kerberos — принципалы служб и keytab | docs | A | docs-03 | ready | DEP-39 |
+| [DOC-03](DOC-03.md) | PREREQUISITES: Kerberos — принципалы служб и keytab | docs | A | docs-03 | done | DEP-39 |
 | [ADM-30](ADM-30.md) | журнал аудита: фильтры `actor`, `method`, `route`; точные схемы транспорта | admin | A | admin-20 | done | ADM-27 |
 | [ADM-31](ADM-31.md) | CLI: блокировка и изменение учётной записи | admin | A | admin-20 | done | ADM-18,CI-07 |
 | [CTR-63](CTR-63.md) | `AccountStore::by_ids` — учётные записи по списку идентификаторов | contracts | B | contracts-44 | done | — |
