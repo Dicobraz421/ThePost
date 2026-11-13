@@ -39,6 +39,7 @@ pub mod replica;
 pub mod retention;
 pub mod schema;
 pub mod shards;
+pub mod sharing;
 pub mod sieve;
 pub mod signals;
 pub mod submissions;
