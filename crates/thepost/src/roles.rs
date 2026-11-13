@@ -100,6 +100,9 @@ pub struct Maintenance {
     /// Пересчёт поисковых строк контактов, записанных до миграции 0030 (`PgMeta::reindex_cards`, META-78, APP-63):
     /// один раз в фоне при запуске роли; `None` — не выполняется (тесты без PostgreSQL).
     pub card_reindex: Option<PgMeta>,
+    /// Заполнение книги GAL «Организация» из каталога (`maintenance.gal_interval`, APP-49); `None` — каталог
+    /// `auth.ldap` не настроен (книги нет) или тесты.
+    pub gal: Option<Arc<crate::gal::GalSync>>,
 }
 
 /// Показатели проверки целостности BLOB по расписанию для `/metrics` (`crate::metrics::register_verify`).
@@ -414,6 +417,7 @@ impl std::fmt::Debug for Maintenance {
             .field("holder", &self.holder)
             .field("trash", &self.trash.is_some())
             .field("purge", &self.purge)
+            .field("gal", &self.gal.is_some())
             .field(
                 "sinks",
                 &self.sinks.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -506,7 +510,18 @@ impl RoleService for Maintenance {
                 }
             })
         });
+        // Книга GAL «Организация» (APP-49): первый проход при запуске, затем по периоду; один узел — держатель лизы.
+        let gal = self.gal.clone().map(|gal| {
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move { gal.run(token).await })
+        });
         ctx.ready.set(true);
+        let gal = async move {
+            match gal {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let card_reindex = async move {
             match card_reindex {
                 Some(task) => task.await,
@@ -537,7 +552,7 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, verify, audit_export, card_reindex, ()) = tokio::join!(
+        let (gc, orphans, trash, purge, verify, audit_export, card_reindex, gal, ()) = tokio::join!(
             gc,
             orphans,
             trash,
@@ -545,6 +560,7 @@ impl RoleService for Maintenance {
             verify,
             audit_export,
             card_reindex,
+            gal,
             consume(
                 self.events.clone(),
                 self.sinks.clone(),
@@ -560,6 +576,7 @@ impl RoleService for Maintenance {
             ("blob-verify", verify),
             ("audit-export", audit_export),
             ("card-reindex", card_reindex),
+            ("gal", gal),
         ] {
             if let Err(e) = done {
                 return Err(tp_contracts::Error::Internal(format!("{what}: {e}")));
@@ -690,6 +707,7 @@ mod tests {
             verify: None,
             audit_export: None,
             card_reindex: None,
+            gal: None,
         };
         let (ctx, shutdown, ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -822,6 +840,7 @@ mod tests {
             verify: Some(verify),
             audit_export: None,
             card_reindex: None,
+            gal: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
@@ -1086,6 +1105,7 @@ mod tests {
             verify: None,
             audit_export: None,
             card_reindex: None,
+            gal: None,
         };
         let (ctx, shutdown, _ready) = ctx();
         let task = tokio::spawn(async move { role.run(ctx).await });
