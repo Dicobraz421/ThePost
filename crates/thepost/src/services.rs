@@ -677,7 +677,13 @@ impl Services {
         Ok(tp_admin::Admin::new(deps, cfg)
             .map_err(|e| infra::context("admin", e))?
             // Правила Sieve и автоответ за пользователя (ADM-14).
-            .with_sieve(Arc::new(self.meta.clone()), check))
+            .with_sieve(Arc::new(self.meta.clone()), check)
+            // Тема письма очереди модерации (`include=subject`, ADM-19) — из объекта `HeldMessage::blob`; объект
+            // мог совпасть по содержимому со сжатой частью письма, поэтому чтение — с распаковкой.
+            .with_held_blobs(Arc::new(tp_blob::Decompressing::new(
+                self.blob.clone(),
+                Arc::new(self.meta.clone()),
+            ))))
     }
 
     /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»
@@ -1598,8 +1604,9 @@ mod tests {
     }
 
     /// FIX-02: письмо внешнего отправителя в модерируемую группу узла (`PgMeta`) → Admin API узла (`Services::admin`,
-    /// сессия `admin init`): `approve` — 204 (было 500 «доставка решений ещё не подключена»), письмо у каждого
-    /// участника, повтор — 404; `reject` — 204, DSN отправителю в очереди исходящей почты.
+    /// сессия `admin init`): список с `include=subject` отдаёт темы писем (APP-38); `approve` — 204 (было 500
+    /// «доставка решений ещё не подключена»), письмо у каждого участника, повтор — 404; `reject` — 204, DSN
+    /// отправителю в очереди исходящей почты.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn moderation_decisions_through_admin_api() {
         use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
@@ -1788,6 +1795,26 @@ mod tests {
                 .id
         };
         let (approve, reject) = (id_of("fix02-approve"), id_of("fix02-reject"));
+
+        // APP-38: тема письма в очереди модерации — по `include=subject` (ADM-19), объект письма читает узел.
+        let r = http
+            .get(format!("{base}/api/v1/orgs/{t}/moderation?include=subject"))
+            .bearer_auth(&session)
+            .send()
+            .await
+            .expect("moderation list");
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        let list: serde_json::Value =
+            serde_json::from_slice(&r.bytes().await.expect("body")).expect("json");
+        for (id, tag) in [(approve, "fix02-approve"), (reject, "fix02-reject")] {
+            let item = list
+                .as_array()
+                .expect("list")
+                .iter()
+                .find(|i| i["id"] == id.to_string())
+                .unwrap_or_else(|| panic!("{id} нет в списке: {list}"));
+            assert_eq!(item["subject"], tag, "{list}");
+        }
         let decide = |id: HeldId, what: &str, body: &'static str| {
             http.post(format!("{base}/api/v1/orgs/{t}/moderation/{id}/{what}"))
                 .bearer_auth(&session)
