@@ -7,7 +7,8 @@
 //! у этих типов своё состояние). Состояние в `StateChange` — текущее состояние типа; повтор тех же состояний
 //! не отправляется. Доставка шины — at-most-once: после
 //! переподключения клиент сверяется по `/changes`. При остановке узла ([`Jmap::shutdown`]) EventSource завершается,
-//! WebSocket получает Close 1001.
+//! WebSocket получает Close 1001; при запрете входа учётной записи (`AccountDisabled`, модуль `disable`) —
+//! EventSource завершается, WebSocket получает Close 1008.
 //!
 //! WebSocket: `Request` → `Response` (или `RequestError`) с `requestId`; `WebSocketPushEnable` (`dataTypes`,
 //! `pushState`) / `WebSocketPushDisable` включают и выключают `StateChange` с `pushState`.
@@ -34,6 +35,7 @@ use tp_contracts::meta::AccountScope;
 use crate::core::http::{Peer, auth_error};
 use crate::core::request::state_string;
 use crate::core::{Jmap, Problem};
+use crate::disable::Registration;
 
 /// Типы учётной записи, чьё состояние — состояние учётной записи (`Identity` и `UserSettings` ведут своё).
 #[cfg(test)]
@@ -256,6 +258,8 @@ struct Source {
     watch: Watch,
     events: EventStream,
     stop: watch::Receiver<bool>,
+    /// Соединение учётной записи: запрет входа завершает поток.
+    session: Registration,
     ping: Option<(Interval, u64)>,
     close_after_state: bool,
     done: bool,
@@ -263,12 +267,13 @@ struct Source {
 
 fn source_stream(src: Source) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     futures::stream::unfold(src, |mut s| async move {
-        if s.done || *s.stop.borrow() {
+        if s.done || *s.stop.borrow() || s.session.is_disabled() {
             return None;
         }
         loop {
             let next = tokio::select! {
                 () = stopped(&mut s.stop) => return None,
+                () = s.session.disabled() => return None,
                 ev = s.events.next() => match ev {
                     None => return None,
                     Some(ev) => Some(ev),
@@ -341,6 +346,7 @@ pub(crate) async fn eventsource(
         },
         events,
         stop: j.stopping(),
+        session: j.push_session(scope),
         ping,
         close_after_state: q.closeafter.as_deref() == Some("state"),
         done: false,
@@ -460,6 +466,7 @@ async fn ws_session(j: Arc<Jmap>, p: Principal, mut socket: WebSocket) {
         }
     };
     let mut stop = j.stopping();
+    let mut session = j.push_session(scope);
     let mut w = Watch {
         jmap: j.clone(),
         scope,
@@ -472,6 +479,11 @@ async fn ws_session(j: Arc<Jmap>, p: Principal, mut socket: WebSocket) {
         tokio::select! {
             () = stopped(&mut stop) => {
                 let frame = CloseFrame { code: 1001, reason: "server shutdown".into() };
+                let _ = socket.send(Message::Close(Some(frame))).await;
+                return;
+            }
+            () = session.disabled() => {
+                let frame = CloseFrame { code: 1008, reason: "account disabled".into() };
                 let _ = socket.send(Message::Close(Some(frame))).await;
                 return;
             }
@@ -518,7 +530,10 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::{WebSocketStream, client_async};
     use tp_contracts::bus::{Event, EventBus, EventKind};
-    use tp_contracts::meta::{Flags, SpecialUse};
+    use tp_contracts::meta::{
+        AccountKind, AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse, account_disabled,
+    };
+    use tp_contracts::{AccountId, DomainId};
 
     use super::{ALL_TYPES, EVERY_TYPE};
     use crate::testenv::{Env, mail, serve};
@@ -578,13 +593,16 @@ mod tests {
 
     /// Открывает EventSource (`types=*&closeafter=state`) и дочитывает заголовки ответа.
     async fn eventsource_open(addr: std::net::SocketAddr) -> (TcpStream, Vec<u8>) {
+        eventsource_query(addr, "types=*&closeafter=state&ping=0").await
+    }
+
+    /// Открывает EventSource с параметрами `query` и дочитывает заголовки ответа.
+    async fn eventsource_query(addr: std::net::SocketAddr, query: &str) -> (TcpStream, Vec<u8>) {
         let mut s = TcpStream::connect(addr).await.expect("connect");
-        s.write_all(
-            b"GET /jmap/eventsource/?types=*&closeafter=state&ping=0 HTTP/1.0\r\n\
-              Host: x\r\nAuthorization: Bearer token-1\r\n\r\n",
-        )
-        .await
-        .expect("write");
+        let req = format!(
+            "GET /jmap/eventsource/?{query} HTTP/1.0\r\nHost: x\r\nAuthorization: Bearer token-1\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.expect("write");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -780,6 +798,86 @@ mod tests {
         flood(&env).await;
         let v = eventsource_state_change(s, buf).await;
         assert_all_types(&v, &acc);
+    }
+
+    /// Ждёт, пока у шины станет не меньше `n` подписчиков.
+    async fn subscribers(env: &Env, n: usize) {
+        tokio::time::timeout(WAIT, async {
+            while env.bus.subscribers() < n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("subscribed");
+    }
+
+    /// `AccountDisabled` (JMAP-41): открытый EventSource учётной записи завершается; сигнал другой учётной
+    /// записи поток не закрывает.
+    #[tokio::test]
+    async fn eventsource_closed_on_account_disabled() {
+        let env = Env::new().await;
+        let addr = serve(env.jmap.clone()).await;
+        let before = env.bus.subscribers();
+        let (mut s, mut buf) = eventsource_query(addr, "types=*&ping=0").await;
+        // Подписка EventSource и слушатель системных сигналов.
+        subscribers(&env, before + 2).await;
+
+        env.bus
+            .publish(account_disabled(AccountScope {
+                tenant: env.scope.tenant,
+                account: AccountId::new(),
+            }))
+            .await
+            .expect("publish");
+        let mut chunk = [0u8; 256];
+        let open = tokio::time::timeout(Duration::from_millis(200), s.read(&mut chunk)).await;
+        assert!(open.is_err(), "stream closed by another account: {open:?}");
+
+        env.bus
+            .publish(account_disabled(env.scope))
+            .await
+            .expect("publish");
+        tokio::time::timeout(WAIT, s.read_to_end(&mut buf))
+            .await
+            .expect("stream not closed")
+            .expect("read");
+        let text = String::from_utf8_lossy(&buf);
+        assert!(!text.contains("event: state"), "{text}");
+    }
+
+    /// Сигнал потерян, вход запрещён в хранилище: после подписки слушатель сверяется с хранилищем,
+    /// WebSocket получает Close 1008.
+    #[tokio::test]
+    async fn websocket_closed_after_reconcile() {
+        let env = Env::new().await;
+        env.meta
+            .upsert(
+                env.scope.tenant,
+                AccountUpsert {
+                    domain: DomainId::new(),
+                    login: "user@example.org".into(),
+                    display_name: "User".into(),
+                    external_id: None,
+                    enabled: false,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
+                },
+            )
+            .await
+            .expect("disable");
+        let addr = serve(env.jmap.clone()).await;
+        let mut ws = connect(addr).await;
+        let close = loop {
+            match tokio::time::timeout(WAIT, ws.next())
+                .await
+                .expect("timeout")
+            {
+                Some(Ok(WsMessage::Close(f))) => break f,
+                Some(Ok(_)) => {}
+                other => panic!("no close: {other:?}"),
+            }
+        };
+        assert_eq!(close.map(|f| f.code), Some(CloseCode::Policy));
     }
 
     /// SearchSnippet/get: подсветка по текстовой части фильтра; чужое письмо — notFound.
