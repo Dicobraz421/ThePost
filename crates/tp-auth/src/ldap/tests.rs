@@ -1099,6 +1099,7 @@ mod group_sync {
             enabled: true,
             aliases: Vec::new(),
             kind: tp_contracts::meta::AccountKind::User,
+            hidden_from_gal: false,
         };
         let alice = meta
             .upsert(T, upsert("alice@example.org", Some(ALICE_ID)))

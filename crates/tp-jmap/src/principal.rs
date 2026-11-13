@@ -414,6 +414,7 @@ mod tests {
             enabled,
             aliases: cur.aliases,
             kind: cur.kind,
+            hidden_from_gal: false,
         };
         env.meta.upsert(scope.tenant, data).await.expect("upsert");
         scope

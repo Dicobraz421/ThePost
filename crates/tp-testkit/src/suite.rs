@@ -2428,7 +2428,8 @@ pub struct ExternalIdFixture {
 }
 
 /// Набор проверок `AccountStore::by_external_id` (CTR-32): поиск по идентификатору каталога, переименование входа
-/// сохраняет учётную запись и её членство в группе, изоляция организаций.
+/// сохраняет учётную запись и её членство в группе, изоляция организаций; псевдонимы (CTR-53), вид (CTR-48) и признак
+/// «скрыта из книги «Организация»» (CTR-83) хранятся с учётной записью.
 pub async fn account_external_id(
     accounts: &dyn AccountStore,
     groups: &dyn GroupStore,
@@ -2445,6 +2446,7 @@ pub async fn account_external_id(
         enabled: true,
         aliases: Vec::new(),
         kind: AccountKind::User,
+        hidden_from_gal: false,
     };
     assert_eq!(
         accounts
@@ -2515,6 +2517,31 @@ pub async fn account_external_id(
     assert_eq!(
         accounts.by_login(fx.tenant, &room.login).await,
         Ok(Some(room))
+    );
+    assert_eq!(
+        accounts.upsert(fx.tenant, upsert(login("anna"))).await,
+        Ok(a.clone())
+    );
+    // Признак «скрыта из книги «Организация»» (CTR-83) хранится с учётной записью и заменяется записью.
+    assert!(!a.hidden_from_gal);
+    let hidden = accounts
+        .upsert(
+            fx.tenant,
+            AccountUpsert {
+                hidden_from_gal: true,
+                ..upsert(login("anna"))
+            },
+        )
+        .await
+        .expect("upsert");
+    assert!(hidden.hidden_from_gal);
+    assert_eq!(
+        accounts.get(fx.tenant, a.id).await,
+        Ok(Some(hidden.clone()))
+    );
+    assert_eq!(
+        accounts.by_external_id(fx.tenant, &ext).await,
+        Ok(Some(hidden))
     );
     assert_eq!(
         accounts.upsert(fx.tenant, upsert(login("anna"))).await,
@@ -2626,6 +2653,7 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                     enabled: true,
                     aliases: Vec::new(),
                     kind: AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await
@@ -2643,6 +2671,7 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                 enabled: true,
                 aliases: Vec::new(),
                 kind: AccountKind::User,
+                hidden_from_gal: false,
             },
         )
         .await
@@ -2740,6 +2769,7 @@ pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture
         enabled: true,
         aliases: Vec::new(),
         kind: AccountKind::User,
+        hidden_from_gal: false,
     };
     let mut made = Vec::new();
     for n in ["ids-a", "ids-b"] {
@@ -2795,6 +2825,7 @@ pub async fn account_by_address(
                 enabled: true,
                 aliases: vec![addr("Addr-Sales")],
                 kind: AccountKind::User,
+                hidden_from_gal: false,
             },
         )
         .await
@@ -4530,6 +4561,7 @@ pub async fn account_state(
         enabled: true,
         aliases: Vec::new(),
         kind: AccountKind::User,
+        hidden_from_gal: false,
     };
     let scope = |account| AccountScope { tenant: t, account };
     let until = OffsetDateTime::now_utc()

@@ -1,6 +1,7 @@
 //! META-65: каталог `Directory` поверх учётных записей, групп и оргструктуры PostgreSQL — книга «Организация» узла
-//! без LDAP. Учётная запись, заведённая как в Admin API (`AccountStore::upsert`), видна в `accounts_since`; группа,
-//! скрытая из GAL, — нет; курсор неизменного каталога даёт пустую порцию, изменённого — `Conflict`.
+//! без LDAP. Учётная запись, заведённая как в Admin API (`AccountStore::upsert`), видна в `accounts_since` (скрытая из
+//! книги — с признаком `hidden_from_gal`, CTR-83); группа, скрытая из GAL, — нет; курсор неизменного каталога даёт
+//! пустую порцию, изменённого — `Conflict`.
 
 mod common;
 
@@ -31,6 +32,7 @@ async fn create(
             enabled: true,
             aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
             kind: AccountKind::User,
+            hidden_from_gal: false,
         },
     )
     .await
@@ -231,6 +233,45 @@ async fn accounts_groups_and_cursors() {
             .await,
         Err(Error::Conflict)
     ));
+
+    // Учётная запись, скрытая из книги «Организация» (CTR-83), — в каталоге с признаком, как из LDAP; признак — новая
+    // версия каталога.
+    let (_, cursor) = all_accounts(&meta, tenant, 10).await;
+    let o = AccountStore::get(&meta, tenant, oleg)
+        .await
+        .expect("get")
+        .expect("oleg");
+    meta.upsert(
+        tenant,
+        AccountUpsert {
+            domain: o.domain,
+            login: o.login,
+            display_name: o.display_name,
+            external_id: None,
+            enabled: true,
+            aliases: o.aliases,
+            kind: o.kind,
+            hidden_from_gal: true,
+        },
+    )
+    .await
+    .expect("hide");
+    assert!(matches!(
+        meta.accounts_since(tenant, Some(&cursor), 1).await,
+        Err(Error::Conflict)
+    ));
+    let (accounts, _) = all_accounts(&meta, tenant, 10).await;
+    let hidden: Vec<String> = accounts
+        .iter()
+        .filter(|a| a.hidden_from_gal)
+        .map(|a| a.external_id.clone())
+        .collect();
+    assert_eq!(hidden, [oleg.to_string()]);
+    assert_eq!(
+        accounts.len(),
+        3,
+        "вход и приём почты не меняются: запись в каталоге"
+    );
 
     // Группы: скрытая из GAL в каталог не попадает; участники — учётные записи и вложенные группы.
     let staff = group(

@@ -24,6 +24,7 @@ async fn delivery(env: &Env) -> Delivery {
             enabled: true,
             aliases: vec!["A.Smith@example.org".into()],
             kind: AccountKind::User,
+            hidden_from_gal: false,
         },
     )
     .await

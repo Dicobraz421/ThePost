@@ -5,9 +5,11 @@
 //! Идентификатор записи каталога (`external_id`) — идентификатор строки: `AccountId`, `GroupId`, `OrgUnitId`
 //! (UUID). На них же ссылаются `DirOrg::department`, `DirOrg::manager` и `DirGroup::members` (учётные записи и
 //! вложенные группы). Атрибуты адресной книги — `OrgAttributes::attributes`, их имена — [`Directory::gal_attributes`].
-//! Своего признака «скрыта из GAL» у учётной записи в PostgreSQL нет (`hidden_from_gal = false`); группа, скрытая
-//! из GAL (`DistributionGroup::hidden_from_gal`), в каталог не попадает — у `DirGroup` признака нет, а книга строится
-//! из каталога. Почтовых контактов каталог не отдаёт (`contacts_since` — по умолчанию).
+//! Учётная запись, скрытая из книги «Организация» (`Account::hidden_from_gal`, CTR-83), отдаётся с признаком
+//! `DirAccount::hidden_from_gal`, как из LDAP: в книгу её не берёт построение GAL, ссылки на неё (`DirOrg::manager`,
+//! участники групп) остаются. Группа, скрытая из GAL (`DistributionGroup::hidden_from_gal`), в каталог не попадает —
+//! у `DirGroup` признака нет, а книга строится из каталога. Почтовых контактов каталог не отдаёт (`contacts_since` —
+//! по умолчанию).
 //!
 //! Курсор — версия выгрузки: `md5` строк каталога организации (всё, что отдаёт каталог), снятая в начале полной
 //! выгрузки. В выгрузке — `p:<версия>:<последний id>` (порции по возрастанию id), после неё — `v:<версия>`.
@@ -35,7 +37,7 @@ use crate::schema::{begin, db_err, to_i64};
 use crate::shards::ShardId;
 
 /// Учётные записи каталога с оргатрибутами: `$1` — организация, ключ порции — `account_id`.
-const ACCOUNTS_SQL: &str = "SELECT a.account_id, a.login, a.display_name, a.enabled, a.aliases,
+const ACCOUNTS_SQL: &str = "SELECT a.account_id, a.login, a.display_name, a.enabled, a.aliases, a.hidden_from_gal,
         o.department_id, o.title, o.manager_id, o.seniority, coalesce(o.attributes, '{}'::jsonb) AS attributes
     FROM accounts a
     LEFT JOIN org_attributes o ON o.tenant_id = a.tenant_id AND o.account_id = a.account_id
@@ -56,6 +58,7 @@ struct AccountRow {
     display_name: String,
     enabled: bool,
     aliases: Vec<String>,
+    hidden_from_gal: bool,
     department_id: Option<Uuid>,
     title: Option<String>,
     manager_id: Option<Uuid>,
@@ -78,7 +81,7 @@ impl From<AccountRow> for DirAccount {
                 manager: r.manager_id.map(|u| u.to_string()),
                 seniority: r.seniority,
             },
-            hidden_from_gal: false,
+            hidden_from_gal: r.hidden_from_gal,
         }
     }
 }

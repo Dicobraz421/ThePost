@@ -305,6 +305,31 @@ async fn foreign_domain_skipped() {
     assert_eq!((r.upserted, r.skipped), (0, 1));
 }
 
+/// Признак «скрыта из книги «Организация»» каталога (CTR-83) переносится в учётную запись и снимается вместе с ним.
+#[tokio::test]
+async fn hidden_from_gal_synced() {
+    let e = env().await;
+    let mut a = person(1);
+    a.hidden_from_gal = true;
+    e.dir.upsert_account(T, a.clone());
+    let r = e.sync.accounts(None).await.expect("run");
+    let stored = |e: &Env| {
+        let meta = e.meta.clone();
+        async move {
+            meta.by_external_id(T, "guid-01")
+                .await
+                .expect("by_external_id")
+                .expect("account")
+                .hidden_from_gal
+        }
+    };
+    assert!(stored(&e).await);
+    a.hidden_from_gal = false;
+    e.dir.upsert_account(T, a);
+    e.sync.accounts(r.cursor.as_ref()).await.expect("again");
+    assert!(!stored(&e).await);
+}
+
 #[test]
 fn zero_batch_rejected() {
     let meta = MemMetadata::new(Arc::new(SystemClock));
