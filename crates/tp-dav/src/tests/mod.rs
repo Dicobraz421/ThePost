@@ -13,7 +13,7 @@ use tp_contracts::dav::{Collection, CollectionKind, DavStore};
 use tp_contracts::meta::AccountScope;
 use tp_testkit::{FakeAuthenticator, FakeDirectory, MemDav, MemGroups, principal};
 
-use crate::{DavConfig, Deps, GalDeps, router_with_gal};
+use crate::{DavConfig, Deps, GalDeps, gal, router};
 
 mod auth;
 mod caldav_home;
@@ -44,10 +44,12 @@ pub(crate) struct Env {
     pub store: MemDav,
     pub auth: FakeAuthenticator,
     pub scope: AccountScope,
-    /// Каталог организации (глобальная адресная книга).
+    /// Каталог организации (глобальная адресная книга, [`Env::sync_gal`]).
     pub dir: FakeDirectory,
     /// Группы рассылки (скрытие из адресной книги).
     pub groups: MemGroups,
+    /// Настройки сервера.
+    pub cfg: DavConfig,
 }
 
 impl Env {
@@ -69,16 +71,12 @@ impl Env {
         let store = MemDav::new();
         let dir = FakeDirectory::default();
         let groups = MemGroups::new();
-        let app = router_with_gal(
+        let app = router(
             Deps {
                 auth: Arc::new(auth.clone()),
                 store: Arc::new(store.clone()),
             },
-            GalDeps {
-                directory: Arc::new(dir.clone()),
-                groups: Some(Arc::new(groups.clone())),
-            },
-            cfg,
+            cfg.clone(),
         );
         Self {
             app,
@@ -86,11 +84,23 @@ impl Env {
             auth,
             dir,
             groups,
+            cfg,
             scope: AccountScope {
                 tenant,
                 account: me.account,
             },
         }
+    }
+
+    /// Книга GAL организации из каталога [`Env::dir`] и групп [`Env::groups`] ([`gal::sync`]).
+    pub(crate) async fn sync_gal(&self) {
+        let source = GalDeps {
+            directory: Arc::new(self.dir.clone()),
+            groups: Some(Arc::new(self.groups.clone())),
+        };
+        gal::sync(&source, &self.store, self.scope.tenant, &self.cfg)
+            .await
+            .expect("gal::sync");
     }
 
     /// Запрос от [`LOGIN`] (Basic).

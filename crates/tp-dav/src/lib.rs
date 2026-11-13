@@ -6,13 +6,14 @@
 //! `calendar-multiget`, `free-busy-query`, RFC 4791 §7.8–7.10), отчёты CardDAV (`addressbook-query`,
 //! `addressbook-multiget`, RFC 6352 §8.6–8.7). Хранилище — [`tp_contracts::dav::DavStore`].
 //!
-//! Глобальная адресная книга «Организация» только для чтения из каталога ([`router_with_gal`]) — в доме адресных книг
-//! каждого пользователя.
+//! Глобальная адресная книга «Организация» только для чтения — в доме адресных книг каждого пользователя: хранится
+//! в `DavStore` (CTR-60), строит её из каталога [`gal::sync`].
 //!
 //! Планирование встреч (DAV-13…16, RFC 6638; [`router_with`] с [`ScheduleDeps`]): рассылка iTIP после `PUT` и
 //! `DELETE`, `schedule-inbox` и `schedule-outbox`, `Schedule-Tag`, запрос занятости.
 //!
 //! - [`config`] — секция `dav` ([`DavConfig`]);
+//! - [`gal`] — книга GAL из каталога ([`gal::sync`], [`GalDeps`]);
 //! - [`itip`] — разбор и построение iTIP (RFC 5546), общий с `tp-jmap`;
 //! - [`deliver`] — приём iTIP учётной записью ([`ItipInbox`] — реализация `ItipDelivery`);
 //! - [`imip`] — письмо iMIP внешним участникам ([`ImipSender`] — реализация `ItipSender`);
@@ -28,7 +29,7 @@ pub mod charset;
 pub mod config;
 pub mod deliver;
 pub mod fuzz;
-mod gal;
+pub mod gal;
 pub mod imip;
 pub mod index;
 pub mod itip;
@@ -46,7 +47,8 @@ mod tests;
 
 pub use config::DavConfig;
 pub use deliver::ItipInbox;
+pub use gal::GalDeps;
 pub use imip::ImipSender;
 pub use path::PREFIX;
 pub use schedule::ScheduleDeps;
-pub use server::{ALLOW, DAV_HEADER, Deps, GalDeps, router, router_with, router_with_gal};
+pub use server::{ALLOW, DAV_HEADER, Deps, router, router_with};
