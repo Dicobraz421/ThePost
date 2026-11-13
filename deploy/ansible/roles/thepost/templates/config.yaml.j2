@@ -34,6 +34,11 @@
 {%- if thepost_db_urls | length > 0 -%}
 {%-   set node = node | combine({'database': {'urls': thepost_db_urls}}, recursive=true) -%}
 {%- endif -%}
+{#- Kerberos: keytab роли (KRB5_KTNAME — drop-in gssapi.conf) и поля thepost_gssapi. -#}
+{%- if thepost_gssapi_keytab_src | length > 0 -%}
+{%-   set node = node | combine({'auth': {'gssapi': thepost_gssapi | combine({'keytab': thepost_gssapi_keytab})}},
+                                recursive=true) -%}
+{%- endif -%}
 {%- if thepost_blob_gc_window | length > 0 -%}
 {%-   set node = node | combine({'blob': {'gc': {'window': thepost_blob_gc_window}}}, recursive=true) -%}
 {%- endif -%}

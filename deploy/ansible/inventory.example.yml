@@ -18,6 +18,9 @@ all:
         # Бинарный файл: собранный на управляющей машине (cargo build --release) или релиз:
         # thepost_binary_url: https://…/thepost-x86_64-linux
         # thepost_binary_checksum: "sha256:…"
+        # Вход по Kerberos (SASL GSSAPI) — keytab служб smtp/, imap/, sieve/<узел> с управляющей машины:
+        # thepost_gssapi_keytab_src: files/thepost.keytab
+        # thepost_gssapi: { hostname: mail.example.ru, realms: { EXAMPLE.RU: example.ru } }
         # Резервное копирование (pgBackRest + restic; восстановление — deploy/ansible/restore.yml). Каталоги копий —
         # на отдельном диске или в S3; ключи S3 — в OpenBao (bao kv put -mount=thepost-backup s3 …), не здесь.
         thepost_backup: true

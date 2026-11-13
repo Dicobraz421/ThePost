@@ -41,6 +41,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- (.Values.cnpg.certificates).serverCASecret | default (printf "%s-ca" (include "thepost.dbCluster" .)) -}}
 {{- end -}}
 
+{{/* Keytab Kerberos (gssapi.keytabSecret): MIT Kerberos читает его по KRB5_KTNAME. */}}
+{{- define "thepost.keytab" -}}
+/etc/thepost/krb5/thepost.keytab
+{{- end -}}
+
 {{/* config.yaml: с cnpg.enabled адреса database задаёт чарт — служба primary (<кластер>-rw) или PgBouncer (Pooler). */}}
 {{- define "thepost.config" -}}
 {{- $cfg := deepCopy .Values.config -}}
@@ -59,6 +64,13 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- $_ := unset $db "direct_url" -}}
 {{- end -}}
 {{- $_ := set $cfg "database" $db -}}
+{{- end -}}
+{{- if .Values.gssapi.keytabSecret -}}
+{{- $auth := deepCopy (default (dict) $cfg.auth) -}}
+{{- $gssapi := deepCopy (default (dict) $auth.gssapi) -}}
+{{- $_ := set $gssapi "keytab" (include "thepost.keytab" .) -}}
+{{- $_ := set $auth "gssapi" $gssapi -}}
+{{- $_ := set $cfg "auth" $auth -}}
 {{- end -}}
 {{- toYaml $cfg -}}
 {{- end -}}

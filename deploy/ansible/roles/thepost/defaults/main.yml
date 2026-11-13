@@ -13,6 +13,18 @@ thepost_binary_url: ""
 thepost_binary_checksum: ""
 thepost_binary_src: "{{ playbook_dir }}/../../target/release/thepost"
 thepost_binary_path: /usr/local/bin/thepost
+# Системные библиотеки бинарного файла: libgssapi_krb5 (MIT Kerberos) — выпуск и бета собраны с фичей gssapi
+# (решение 107, CI-12), без неё thepost не запускается. Debian, Ubuntu, Astra Linux — libgssapi-krb5-2; РЕД ОС,
+# AlmaLinux, RHEL — krb5-libs.
+thepost_system_packages: "{{ ['libgssapi-krb5-2'] if ansible_pkg_mgr == 'apt' else ['krb5-libs'] }}"
+
+# Вход по Kerberos (SASL GSSAPI, секция auth.gssapi): keytab с ключами принципалов служб smtp/<узел>, imap/<узел>,
+# sieve/<узел> (deploy/README.md) — файл на управляющей машине; пусто — Kerberos выключен. Роль кладёт его в
+# thepost_gssapi_keytab (0640 root:thepost) и задаёт KRB5_KTNAME в drop-in юнита gssapi.conf. Остальные поля
+# секции — thepost_gssapi, например { hostname: mail.example.ru, realms: { EXAMPLE.RU: example.ru } }.
+thepost_gssapi_keytab_src: ""
+thepost_gssapi_keytab: /etc/thepost/thepost.keytab
+thepost_gssapi: {}
 
 # Сертификат клиентских протоколов (SMTP, IMAP, ManageSieve, JMAP, служебный HTTP; решение 101). Ключ — только в
 # OpenBao: секрет thepost/tls#key (tls.key пресета, решение 100), на диске ВМ его нет; цепочка — файл секции tls.

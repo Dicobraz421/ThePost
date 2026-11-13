@@ -33,6 +33,13 @@ serviceAccount:
 tls:
   secretName: thepost-tls
 
+# Вход по Kerberos (SASL GSSAPI, config.auth.gssapi): секрет с keytab принципалов служб smtp/, imap/, sieve/<узел>
+# (ключ keytab: kubectl -n thepost create secret generic thepost-keytab --from-file=keytab=thepost.keytab). Чарт
+# монтирует его в /etc/thepost/krb5/thepost.keytab, задаёт KRB5_KTNAME и config.auth.gssapi.keytab; hostname и realms —
+# в config.auth.gssapi. Пусто — Kerberos выключен. Библиотека MIT Kerberos (libgssapi_krb5) — в образе.
+gssapi:
+  keytabSecret: ""
+
 # Минимальные привилегии (SRS 2.7, 6.8): не root, корневая ФС только для чтения, без повышения привилегий и без
 # capabilities; seccomp — RuntimeDefault и свой профиль ролей процесса (секция confine config.yaml). Свой
 # профиль узла (Localhost) — containerSecurityContext.seccompProfile: { type: Localhost, localhostProfile: … }.
