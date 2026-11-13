@@ -17,6 +17,7 @@ use crate::{DavConfig, Deps, GalDeps, router_with_gal};
 
 mod auth;
 mod caldav_home;
+mod card_charset;
 mod card_query;
 mod card_versions;
 mod carddav_home;

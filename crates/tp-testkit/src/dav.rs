@@ -3,7 +3,8 @@
 //! `ModSeq` — свой счётчик учётной записи (у `PgMeta` — общий с письмами), ETag — `ModSeq` записи. С шиной
 //! ([`MemDav::with_bus`]) после каждого изменения публикуется `DavChanged`, после изменения входящих планирования —
 //! `ScheduleInboxChanged`. [`MemDav::purge_tombstones`] имитирует очистку надгробий: прежние `since` после неё —
-//! `Conflict`.
+//! `Conflict`. Книга GAL (CTR-60) — своя «учётная запись» организации с одной коллекцией и своим счётчиком; ETag
+//! карточки — `ModSeq` её записи (неизменная карточка при `sync_gal` не перезаписывается), сигнал — `GalChanged`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -14,8 +15,8 @@ use time::OffsetDateTime;
 use tp_contracts::bus::EventBus;
 use tp_contracts::dav::{
     Collection, CollectionId, CollectionKind, DavLimits, DavObject, DavObjectId, DavStore,
-    DeleteOutcome, MoveOutcome, Moved, ObjectIndex, ObjectRef, Precondition, Put, PutOutcome,
-    TimeRange, dav_changed, valid_name,
+    DeleteOutcome, GAL_COLLECTION_NAME, GalCard, MoveOutcome, Moved, ObjectIndex, ObjectRef,
+    Precondition, Put, PutOutcome, TimeRange, dav_changed, gal_changed, valid_name, validate_gal,
 };
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::schedule::{
@@ -132,6 +133,41 @@ impl Account {
     }
 }
 
+#[derive(Debug, Default)]
+struct State {
+    accounts: HashMap<AccountScope, Account>,
+    /// Книги GAL по организациям: одна коллекция, свой счётчик и надгробия.
+    gal: HashMap<TenantId, Account>,
+}
+
+impl State {
+    /// Коллекция `id`, видимая учётной записи `scope` (своя или книга GAL организации), с её владельцем: счётчик и
+    /// надгробия.
+    fn find(&self, scope: AccountScope, id: CollectionId) -> Result<(&Account, &Coll)> {
+        if let Some(acc) = self.accounts.get(&scope)
+            && let Some(c) = acc.collections.get(&id)
+        {
+            return Ok((acc, c));
+        }
+        let gal = self.gal.get(&scope.tenant).ok_or(Error::NotFound)?;
+        Ok((gal, gal.coll(id)?))
+    }
+
+    /// `id` — книга GAL организации `tenant`.
+    fn is_gal(&self, tenant: TenantId, id: CollectionId) -> bool {
+        self.gal
+            .get(&tenant)
+            .is_some_and(|g| g.collections.contains_key(&id))
+    }
+
+    /// Книга GAL организации `tenant`, если есть.
+    fn gal(&self, tenant: TenantId) -> Option<&Coll> {
+        self.gal
+            .get(&tenant)
+            .and_then(|g| g.collections.values().next())
+    }
+}
+
 fn object(collection: CollectionId, name: &str, o: &Obj) -> DavObject {
     DavObject {
         id: o.id,
@@ -193,7 +229,7 @@ fn live<T>(created: ModSeq, since: ModSeq, t: T) -> Change<T> {
 /// Календари и контакты в памяти. Клоны разделяют данные.
 #[derive(Clone, Default)]
 pub struct MemDav {
-    state: Arc<Mutex<HashMap<AccountScope, Account>>>,
+    state: Arc<Mutex<State>>,
     limits: DavLimits,
     bus: Option<Arc<dyn EventBus>>,
 }
@@ -229,7 +265,7 @@ impl MemDav {
     /// Очищает надгробия учётной записи: `since` меньше текущего счётчика (кроме `ModSeq::ZERO`) — `Conflict`.
     pub fn purge_tombstones(&self, scope: AccountScope) {
         let mut st = lock(&self.state);
-        let acc = st.entry(scope).or_default();
+        let acc = st.accounts.entry(scope).or_default();
         acc.horizon = acc.counter;
         acc.objects.clear();
         acc.deleted.clear();
@@ -269,6 +305,7 @@ impl DavStore for MemDav {
     ) -> Result<Vec<Collection>> {
         let st = lock(&self.state);
         let mut out: Vec<Collection> = st
+            .accounts
             .get(&scope)
             .map(|a| {
                 a.collections
@@ -278,6 +315,11 @@ impl DavStore for MemDav {
                     .collect()
             })
             .unwrap_or_default();
+        out.extend(
+            st.gal(scope.tenant)
+                .filter(|g| g.meta.kind == kind)
+                .map(|g| g.meta.clone()),
+        );
         out.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
     }
@@ -288,9 +330,9 @@ impl DavStore for MemDav {
         id: CollectionId,
     ) -> Result<Option<Collection>> {
         Ok(lock(&self.state)
-            .get(&scope)
-            .and_then(|a| a.collections.get(&id))
-            .map(|c| c.meta.clone()))
+            .find(scope, id)
+            .ok()
+            .map(|(_, c)| c.meta.clone()))
     }
 
     async fn collection_by_name(
@@ -299,12 +341,18 @@ impl DavStore for MemDav {
         kind: CollectionKind,
         name: &str,
     ) -> Result<Option<Collection>> {
-        Ok(lock(&self.state).get(&scope).and_then(|a| {
+        let st = lock(&self.state);
+        let own = st.accounts.get(&scope).and_then(|a| {
             a.collections
                 .values()
                 .find(|c| c.meta.kind == kind && c.meta.name == name)
-                .map(|c| c.meta.clone())
-        }))
+        });
+        Ok(own
+            .or_else(|| {
+                st.gal(scope.tenant)
+                    .filter(|g| g.meta.kind == kind && g.meta.name == name)
+            })
+            .map(|c| c.meta.clone()))
     }
 
     async fn create_collection(
@@ -313,10 +361,13 @@ impl DavStore for MemDav {
         mut collection: Collection,
     ) -> Result<ModSeq> {
         collection.validate()?;
+        if collection.is_gal() {
+            return Err(Error::Conflict);
+        }
         let (kind, id) = (collection.kind, collection.id);
         let (cleared, modseq) = {
             let mut st = lock(&self.state);
-            let acc = st.entry(scope).or_default();
+            let acc = st.accounts.entry(scope).or_default();
             let taken = acc.collections.contains_key(&id)
                 || acc.deleted.iter().any(|d| d.0 == id)
                 || acc
@@ -362,7 +413,10 @@ impl DavStore for MemDav {
         let (kind, id) = (collection.kind, collection.id);
         let (cleared, modseq) = {
             let mut st = lock(&self.state);
-            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            if st.is_gal(scope.tenant, id) {
+                return Err(Error::Forbidden);
+            }
+            let acc = st.accounts.get_mut(&scope).ok_or(Error::NotFound)?;
             let cur = acc.coll(id)?;
             if cur.meta.kind != kind || cur.meta.name != collection.name {
                 return Err(Error::invalid("вид и имя коллекции не меняются"));
@@ -390,7 +444,10 @@ impl DavStore for MemDav {
     async fn delete_collection(&self, scope: AccountScope, id: CollectionId) -> Result<ModSeq> {
         let (kind, modseq) = {
             let mut st = lock(&self.state);
-            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            if st.is_gal(scope.tenant, id) {
+                return Err(Error::Forbidden);
+            }
+            let acc = st.accounts.get_mut(&scope).ok_or(Error::NotFound)?;
             let c = acc.collections.remove(&id).ok_or(Error::NotFound)?;
             let kind = c.meta.kind;
             for (name, o) in c.objects {
@@ -418,7 +475,7 @@ impl DavStore for MemDav {
         name: &str,
     ) -> Result<Option<DavObject>> {
         let st = lock(&self.state);
-        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        let (_, c) = st.find(scope, collection)?;
         Ok(c.objects.get(name).map(|o| object(collection, name, o)))
     }
 
@@ -429,7 +486,7 @@ impl DavStore for MemDav {
         uid: &str,
     ) -> Result<Option<DavObject>> {
         let st = lock(&self.state);
-        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        let (_, c) = st.find(scope, collection)?;
         Ok(c.objects
             .iter()
             .find(|(_, o)| o.index.uid == uid)
@@ -442,7 +499,7 @@ impl DavStore for MemDav {
         collection: CollectionId,
     ) -> Result<Vec<ObjectRef>> {
         let st = lock(&self.state);
-        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        let (_, c) = st.find(scope, collection)?;
         Ok(c.objects
             .iter()
             .map(|(name, o)| ObjectRef {
@@ -460,7 +517,7 @@ impl DavStore for MemDav {
         names: &[String],
     ) -> Result<Vec<DavObject>> {
         let st = lock(&self.state);
-        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        let (_, c) = st.find(scope, collection)?;
         Ok(names
             .iter()
             .filter_map(|n| c.objects.get(n).map(|o| object(collection, n, o)))
@@ -473,17 +530,21 @@ impl DavStore for MemDav {
         ids: &[DavObjectId],
     ) -> Result<Vec<DavObject>> {
         let st = lock(&self.state);
-        let Some(acc) = st.get(&scope) else {
-            return Ok(Vec::new());
-        };
+        let colls: Vec<(&CollectionId, &Coll)> = st
+            .accounts
+            .get(&scope)
+            .into_iter()
+            .chain(st.gal.get(&scope.tenant))
+            .flat_map(|a| a.collections.iter())
+            .collect();
         Ok(ids
             .iter()
             .filter_map(|id| {
-                acc.collections.iter().find_map(|(cid, c)| {
+                colls.iter().find_map(|(cid, c)| {
                     c.objects
                         .iter()
                         .find(|(_, o)| o.id == *id)
-                        .map(|(n, o)| object(*cid, n, o))
+                        .map(|(n, o)| object(**cid, n, o))
                 })
             })
             .collect())
@@ -496,7 +557,7 @@ impl DavStore for MemDav {
         range: TimeRange,
     ) -> Result<Vec<DavObject>> {
         let st = lock(&self.state);
-        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        let (_, c) = st.find(scope, collection)?;
         Ok(c.objects
             .iter()
             .filter(|(_, o)| o.index.may_overlap(&range))
@@ -515,7 +576,10 @@ impl DavStore for MemDav {
     ) -> Result<PutOutcome> {
         let (kind, put) = {
             let mut st = lock(&self.state);
-            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            if st.is_gal(scope.tenant, collection) {
+                return Err(Error::Forbidden);
+            }
+            let acc = st.accounts.get_mut(&scope).ok_or(Error::NotFound)?;
             let c = acc.coll(collection)?;
             if !valid_name(name) {
                 return Err(Error::invalid(format!(
@@ -598,7 +662,10 @@ impl DavStore for MemDav {
     ) -> Result<DeleteOutcome> {
         let (kind, modseq) = {
             let mut st = lock(&self.state);
-            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            if st.is_gal(scope.tenant, collection) {
+                return Err(Error::Forbidden);
+            }
+            let acc = st.accounts.get_mut(&scope).ok_or(Error::NotFound)?;
             let c = acc.coll(collection)?;
             let cur = c.objects.get(name);
             match (&pre, cur) {
@@ -641,7 +708,12 @@ impl DavStore for MemDav {
     ) -> Result<MoveOutcome> {
         let (kind, moved) = {
             let mut st = lock(&self.state);
-            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            st.find(scope, from)?;
+            st.find(scope, to)?;
+            if st.is_gal(scope.tenant, from) || st.is_gal(scope.tenant, to) {
+                return Err(Error::Forbidden);
+            }
+            let acc = st.accounts.get_mut(&scope).ok_or(Error::NotFound)?;
             let (src, dst) = (acc.coll(from)?, acc.coll(to)?);
             let cur = src.objects.get(name);
             if cur.is_none() && !matches!(pre, Precondition::IfMatch(_)) {
@@ -716,7 +788,7 @@ impl DavStore for MemDav {
         limit: usize,
     ) -> Result<Vec<DavObject>> {
         let st = lock(&self.state);
-        let c = st.get(&scope).ok_or(Error::NotFound)?.coll(collection)?;
+        let (_, c) = st.find(scope, collection)?;
         Ok(c.objects
             .iter()
             .filter(|(_, o)| o.index.search.matches(needle))
@@ -733,8 +805,7 @@ impl DavStore for MemDav {
         limit: usize,
     ) -> Result<Changes<String>> {
         let st = lock(&self.state);
-        let acc = st.get(&scope).ok_or(Error::NotFound)?;
-        let c = acc.coll(collection)?;
+        let (acc, c) = st.find(scope, collection)?;
         acc.check_since(since)?;
         let mut all: Vec<(ModSeq, Change<String>)> = c
             .objects
@@ -767,7 +838,7 @@ impl DavStore for MemDav {
         limit: usize,
     ) -> Result<Changes<CollectionId>> {
         let st = lock(&self.state);
-        let Some(acc) = st.get(&scope) else {
+        let Some(acc) = st.accounts.get(&scope) else {
             return untouched(since);
         };
         acc.check_since(since)?;
@@ -796,7 +867,7 @@ impl DavStore for MemDav {
         limit: usize,
     ) -> Result<Changes<DavObjectId>> {
         let st = lock(&self.state);
-        let Some(acc) = st.get(&scope) else {
+        let Some(acc) = st.accounts.get(&scope) else {
             return untouched(since);
         };
         acc.check_since(since)?;
@@ -827,8 +898,129 @@ impl DavStore for MemDav {
 
     async fn state(&self, scope: AccountScope, kind: CollectionKind) -> Result<ModSeq> {
         Ok(lock(&self.state)
+            .accounts
             .get(&scope)
             .map_or(ModSeq::ZERO, |a| a.state(kind)))
+    }
+
+    async fn sync_gal(
+        &self,
+        tenant: TenantId,
+        display_name: &str,
+        cards: Vec<GalCard>,
+    ) -> Result<ModSeq> {
+        validate_gal(display_name, &cards, &self.limits)?;
+        let (id, state, changed) = {
+            let mut st = lock(&self.state);
+            let gal = st.gal.entry(tenant).or_default();
+            let before = gal.counter;
+            // Книга вынимается на время записи: счётчик и надгробия — у `gal`.
+            let existing = gal.collections.drain().next();
+            let mut book = match existing {
+                Some((_, book)) => book,
+                None => {
+                    let modseq = gal.bump();
+                    let meta = Collection {
+                        display_name: display_name.to_owned(),
+                        state: modseq,
+                        ..Collection::new(CollectionKind::AddressBook, GAL_COLLECTION_NAME)
+                    };
+                    Coll {
+                        meta,
+                        created: modseq,
+                        props: modseq,
+                        objects: BTreeMap::new(),
+                    }
+                }
+            };
+            let id = book.meta.id;
+            if book.meta.display_name != display_name {
+                let modseq = gal.bump();
+                book.meta.display_name = display_name.to_owned();
+                book.meta.state = modseq;
+                book.props = modseq;
+            }
+            let cards: BTreeMap<String, GalCard> =
+                cards.into_iter().map(|c| (c.name.clone(), c)).collect();
+            let gone: Vec<String> = book
+                .objects
+                .keys()
+                .filter(|n| !cards.contains_key(n.as_str()))
+                .cloned()
+                .collect();
+            for name in gone {
+                if let Some(o) = book.objects.remove(&name) {
+                    let modseq = gal.bump();
+                    book.meta.state = modseq;
+                    gal.objects.push(Tomb {
+                        collection: id,
+                        kind: CollectionKind::AddressBook,
+                        id: o.id,
+                        name,
+                        modseq,
+                    });
+                }
+            }
+            for (name, card) in cards {
+                let prev = book.objects.get(&name);
+                if prev.is_some_and(|o| o.body == card.body && o.index == card.index) {
+                    continue;
+                }
+                let modseq = gal.bump();
+                let (oid, created) =
+                    prev.map_or((DavObjectId::new(), modseq), |o| (o.id, o.created));
+                book.objects.insert(
+                    name,
+                    Obj {
+                        id: oid,
+                        etag: modseq.to_string(),
+                        body: card.body,
+                        index: card.index,
+                        created,
+                        placed: created,
+                        modseq,
+                    },
+                );
+                book.meta.state = modseq;
+            }
+            let state = book.meta.state;
+            let changed = gal.counter != before;
+            gal.collections.insert(id, book);
+            (id, state, changed)
+        };
+        if changed && let Some(bus) = &self.bus {
+            // Как у `signal`: ошибка шины не отменяет изменение.
+            let _ = bus.publish(gal_changed(tenant, id, state)).await;
+        }
+        Ok(state)
+    }
+
+    async fn gal_changes(
+        &self,
+        tenant: TenantId,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>> {
+        let st = lock(&self.state);
+        let (Some(gal), Some(book)) = (st.gal.get(&tenant), st.gal(tenant)) else {
+            return untouched(since);
+        };
+        gal.check_since(since)?;
+        let mut all: Vec<(ModSeq, Change<DavObjectId>)> = book
+            .objects
+            .values()
+            .filter(|o| o.modseq > since)
+            .map(|o| (o.modseq, live(o.created, since, o.id)))
+            .collect();
+        if since != ModSeq::ZERO {
+            all.extend(
+                gal.objects
+                    .iter()
+                    .filter(|t| t.modseq > since)
+                    .map(|t| (t.modseq, Change::Destroyed(t.id))),
+            );
+        }
+        Ok(page(all, since, limit, book.meta.state))
     }
 
     async fn inbox_put(
@@ -848,7 +1040,7 @@ impl DavStore for MemDav {
         }
         let put = {
             let mut st = lock(&self.state);
-            let acc = st.entry(scope).or_default();
+            let acc = st.accounts.entry(scope).or_default();
             let prev = acc.inbox.get(name).map(|i| (i.id, i.received_at));
             if prev.is_none() && acc.inbox.len() >= self.limits.max_objects {
                 return Err(Error::QuotaExceeded);
@@ -883,7 +1075,7 @@ impl DavStore for MemDav {
 
     async fn inbox_list(&self, scope: AccountScope) -> Result<Inbox> {
         let st = lock(&self.state);
-        let Some(acc) = st.get(&scope) else {
+        let Some(acc) = st.accounts.get(&scope) else {
             return Ok(Inbox::default());
         };
         let mut items: Vec<InboxItem> = acc.inbox.values().cloned().collect();
@@ -897,7 +1089,7 @@ impl DavStore for MemDav {
     async fn inbox_delete(&self, scope: AccountScope, name: &str) -> Result<ModSeq> {
         let modseq = {
             let mut st = lock(&self.state);
-            let acc = st.get_mut(&scope).ok_or(Error::NotFound)?;
+            let acc = st.accounts.get_mut(&scope).ok_or(Error::NotFound)?;
             let item = acc.inbox.remove(name).ok_or(Error::NotFound)?;
             let modseq = acc.bump();
             acc.inbox_created.remove(&item.id);
@@ -911,6 +1103,7 @@ impl DavStore for MemDav {
 
     async fn inbox_state(&self, scope: AccountScope) -> Result<ModSeq> {
         Ok(lock(&self.state)
+            .accounts
             .get(&scope)
             .map_or(ModSeq::ZERO, |a| a.inbox_state))
     }
@@ -922,7 +1115,7 @@ impl DavStore for MemDav {
         limit: usize,
     ) -> Result<Changes<DavObjectId>> {
         let st = lock(&self.state);
-        let Some(acc) = st.get(&scope) else {
+        let Some(acc) = st.accounts.get(&scope) else {
             return untouched(since);
         };
         acc.check_since(since)?;
@@ -963,6 +1156,7 @@ impl FreeBusy for MemDav {
                 continue;
             }
             let periods = st
+                .accounts
                 .get(&AccountScope { tenant, account })
                 .map(|acc| {
                     acc.collections
@@ -1033,6 +1227,19 @@ mod tests {
         let bus = crate::MemEventBus::default();
         let store = MemDav::new().with_bus(Arc::new(bus.clone()));
         suite::dav::signals(&store, &bus, scope()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_dav_gal() {
+        let store = MemDav::new().with_limits(suite::dav::LIMITS);
+        suite::dav::gal(&store, &suite::dav::DavFixture::new()).await;
+    }
+
+    #[tokio::test]
+    async fn suite_dav_gal_signals() {
+        let bus = crate::MemEventBus::default();
+        let store = MemDav::new().with_bus(Arc::new(bus.clone()));
+        suite::dav::gal_signals(&store, &bus, TenantId::new()).await;
     }
 
     #[tokio::test]

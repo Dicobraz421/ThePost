@@ -28,8 +28,8 @@ use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::dav::{
     CardSearch, Collection, CollectionId, CollectionKind, Component, DavLimits, DavObject,
-    DavObjectId, DavStore, DeleteOutcome, MoveOutcome, Moved, ObjectIndex, ObjectRef, Precondition,
-    Put, PutOutcome, Span, TimeRange, dav_changed, valid_name,
+    DavObjectId, DavStore, DeleteOutcome, GalCard, MoveOutcome, Moved, ObjectIndex, ObjectRef,
+    Precondition, Put, PutOutcome, Span, TimeRange, dav_changed, valid_name,
 };
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::schedule::{
@@ -46,7 +46,8 @@ use crate::pool::with_system;
 use crate::schema::{begin, db_err, to_i64, to_u32, to_u64};
 use crate::shards::ShardId;
 
-/// Секция `meta.dav`: лимиты хранилища ([`DavLimits`]) и срок надгробий.
+/// Секция `meta.dav`: лимиты хранилища ([`DavLimits`]), срок надгробий и пересчёт поисковых строк контактов
+/// ([`PgMeta::reindex_cards`]).
 ///
 /// ```yaml
 /// meta:
@@ -56,6 +57,8 @@ use crate::shards::ShardId;
 ///     max_collections: 100
 ///     max_busy_instances: 20000
 ///     tombstone_ttl: 90d
+///     card_reindex_batch: 100
+///     card_reindex_pause: 100ms
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -74,6 +77,12 @@ pub struct DavConfig {
     #[serde(with = "duration")]
     #[schemars(with = "duration::HumanDuration")]
     pub tombstone_ttl: Duration,
+    /// Карточек в пачке пересчёта поисковых строк ([`PgMeta::reindex_cards`]).
+    pub card_reindex_batch: usize,
+    /// Пауза между пачками пересчёта: узел обслуживает клиентов во время пересчёта.
+    #[serde(with = "duration")]
+    #[schemars(with = "duration::HumanDuration")]
+    pub card_reindex_pause: Duration,
 }
 
 impl DavConfig {
@@ -100,7 +109,7 @@ impl DavConfig {
 }
 
 impl Default for DavConfig {
-    /// Лимиты [`DavLimits::default`], надгробия — 90 суток.
+    /// Лимиты [`DavLimits::default`], надгробия — 90 суток, пересчёт — по 100 карточек с паузой 100 мс.
     fn default() -> Self {
         let l = DavLimits::default();
         Self {
@@ -109,6 +118,8 @@ impl Default for DavConfig {
             max_collections: l.max_collections,
             max_busy_instances: l.max_busy_instances,
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
+            card_reindex_batch: 100,
+            card_reindex_pause: Duration::from_millis(100),
         }
     }
 }
@@ -1247,7 +1258,7 @@ impl DavStore for PgMeta {
                         sqlx::query(
                             "UPDATE dav_objects SET uid = $4, etag = $5, component = $6, span_start = $7,
                                                     span_end = $8, body = $9, modseq = $10, schedule_tag = $11,
-                                                    search = $12, recurring = $13
+                                                    search = $12, search_pending = false, recurring = $13
                              WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
                         )
                         .bind(scope.tenant.as_uuid())
@@ -1890,6 +1901,27 @@ impl DavStore for PgMeta {
         Err(Error::internal(
             "журнал входящих планирования в PostgreSQL — META-69",
         ))
+    }
+
+    // Книга GAL в PostgreSQL — META-63; до неё — только чтобы собирался workspace (CTR-60).
+    async fn sync_gal(
+        &self,
+        tenant: TenantId,
+        display_name: &str,
+        cards: Vec<GalCard>,
+    ) -> Result<ModSeq> {
+        let _ = (tenant, display_name, cards);
+        Err(Error::internal("книга GAL в PostgreSQL — META-63"))
+    }
+
+    async fn gal_changes(
+        &self,
+        tenant: TenantId,
+        since: ModSeq,
+        limit: usize,
+    ) -> Result<Changes<DavObjectId>> {
+        let _ = (tenant, since, limit);
+        Err(Error::internal("книга GAL в PostgreSQL — META-63"))
     }
 }
 

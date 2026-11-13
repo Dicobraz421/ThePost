@@ -362,7 +362,7 @@ impl RoleService for ImapRole {
             let server = server.clone();
             loops.spawn(async move { server.serve(listener).await });
         }
-        let server = tp_imap::Pop3Server::new(session());
+        let server = tp_imap::Pop3Server::new(session()).with_accounts(self.ext.accounts.clone());
         for listener in pop3 {
             let server = server.clone();
             loops.spawn(async move { server.serve(listener).await });
@@ -724,16 +724,45 @@ mod tests {
         MemEventBus, MemMailboxAudit, MemMetadata, MemQuota, MemTrash, SystemClock,
     };
 
-    /// Роль imap на хранилищах testkit с расширениями, как собирает их узел (`Services::imap_extensions`).
-    fn imap_role(bound: Bound) -> ImapRole {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let index = MemBlobIndex::new(clock.clone());
-        let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
-        let bus = MemEventBus::default();
+    /// Хранилища testkit роли imap, общие с тестом: учётные записи, шина, вход.
+    struct Stand {
+        clock: Arc<dyn Clock>,
+        index: MemBlobIndex,
+        meta: MemMetadata,
+        bus: MemEventBus,
+        auth: FakeAuthenticator,
+    }
+
+    impl Stand {
+        fn new() -> Self {
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let index = MemBlobIndex::new(clock.clone());
+            let meta = MemMetadata::new(clock.clone()).with_blob_index(index.clone());
+            Self {
+                clock,
+                index,
+                meta,
+                bus: MemEventBus::default(),
+                auth: FakeAuthenticator::default(),
+            }
+        }
+    }
+
+    /// Роль imap на хранилищах `stand` с расширениями, как собирает их узел (`Services::imap_extensions`);
+    /// `tls` — сертификаты слушателей.
+    fn imap_role(stand: &Stand, tls: Option<Arc<TlsCerts>>, bound: Bound) -> ImapRole {
+        let Stand {
+            clock,
+            index,
+            meta,
+            bus,
+            auth,
+        } = stand;
+        let (meta, bus) = (meta.clone(), bus.clone());
         let trash = MemTrash::new(&meta);
         let store = tp_mailstore::Store::new(tp_mailstore::Deps {
-            blobs: Arc::new(MemBlobStore::new(clock)),
-            index: Arc::new(index),
+            blobs: Arc::new(MemBlobStore::new(clock.clone())),
+            index: Arc::new(index.clone()),
             messages: Arc::new(meta.clone()),
             changes: Arc::new(meta.clone()),
             trash: Arc::new(trash.clone()),
@@ -741,7 +770,7 @@ mod tests {
             bus: Arc::new(bus.clone()),
             hooks: DecisionHooks::default(),
         });
-        let auth = Arc::new(FakeAuthenticator::default());
+        let auth = Arc::new(auth.clone());
         let deps = tp_imap::Deps {
             sasl: Arc::new(FakeSasl::new(auth.clone())),
             auth,
@@ -762,7 +791,7 @@ mod tests {
             acl: Some(acl.clone()),
             authz: Some(Arc::new(tp_auth::AclAuthorizer::new(acl, accounts))),
         };
-        ImapRole::new(deps, ext, None, Sockets::new(bound))
+        ImapRole::new(deps, ext, tls, Sockets::new(bound))
     }
 
     async fn first_line(addr: SocketAddr) -> String {
@@ -786,7 +815,7 @@ mod tests {
             ..Default::default()
         };
         let bound = Bound::default();
-        let role = imap_role(bound.clone());
+        let role = imap_role(&Stand::new(), None, bound.clone());
         let shutdown = CancellationToken::new();
         let ready = ReadyHandle::default();
         let ctx = RoleCtx {
@@ -822,6 +851,153 @@ mod tests {
         shutdown.cancel();
         task.await.expect("join").expect("run");
         assert!(!ready.is_ready());
+    }
+
+    /// APP-64: сигнал `AccountDisabled` потерян (обрыв потока шины), вход запрещён в хранилище — после
+    /// переподписки POP3 сверяет сеансы с `Extensions::accounts` и закрывает сеанс учётной записи.
+    #[tokio::test]
+    async fn pop3_session_closed_after_reconcile_with_account_store() {
+        use tokio::io::AsyncWriteExt;
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs};
+        use tp_contracts::auth::Principal;
+        use tp_contracts::meta::{AccountKind, AccountStore, AccountUpsert};
+        use tp_contracts::{DomainId, TenantId};
+        use tp_platform::TlsConfig;
+        use tp_testkit::MemSecretStore;
+
+        type Pop3Conn = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+        async fn line(c: &mut Pop3Conn) -> String {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), c.read_line(&mut line))
+                .await
+                .expect("no response in time")
+                .expect("read");
+            line
+        }
+        async fn send(c: &mut Pop3Conn, cmd: &str) {
+            let w = c.get_mut();
+            w.write_all(format!("{cmd}\r\n").as_bytes())
+                .await
+                .expect("write");
+            w.flush().await.expect("flush");
+        }
+
+        const CERT: &str = include_str!("testdata/cert.pem");
+        const KEY: &str = include_str!("testdata/key.pem");
+        const LOGIN: &str = "pop3@example.org";
+        const PASSWORD: &str = "secret";
+        let stand = Stand::new();
+        let upsert = |enabled| AccountUpsert {
+            domain: DomainId::new(),
+            login: LOGIN.into(),
+            display_name: "POP3".into(),
+            external_id: None,
+            enabled,
+            aliases: Vec::new(),
+            kind: AccountKind::User,
+        };
+        let tenant = TenantId::DEFAULT;
+        let account = stand
+            .meta
+            .upsert(tenant, upsert(true))
+            .await
+            .expect("account");
+        let principal = Principal {
+            tenant,
+            account: account.id,
+            login: LOGIN.into(),
+            groups: Default::default(),
+            scopes: None,
+        };
+        stand.auth.add_password(LOGIN, PASSWORD, principal);
+
+        // USER/PASS — только по TLS: слушатель POP3 с неявным TLS.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tls = TlsConfig {
+            cert_file: dir.path().join("cert.pem"),
+            ..TlsConfig::default()
+        };
+        std::fs::write(&tls.cert_file, CERT).expect("cert");
+        let secrets = Arc::new(MemSecretStore::default());
+        secrets.set(&tls.key, KEY);
+        let certs = Arc::new(TlsCerts::load(&tls, secrets).await.expect("tls"));
+        let mut endpoint = EndpointConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        endpoint.implicit_tls = true;
+        let mut cfg = tp_imap::ImapConfig {
+            pop3: tp_imap::config::Pop3Config {
+                enabled: true,
+                listeners: vec![endpoint],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.timeouts.resubscribe = Duration::from_millis(10);
+        let bound = Bound::default();
+        let role = imap_role(&stand, Some(certs), bound.clone());
+        let shutdown = CancellationToken::new();
+        let ready = ReadyHandle::default();
+        let ctx = RoleCtx {
+            config: fixed_config(cfg),
+            shutdown: shutdown.clone(),
+            drain_deadline: Duration::from_secs(1),
+            ready: ready.clone(),
+            load: fixed_load(LoadLevel::Normal),
+        };
+        let task = tokio::spawn(async move { role.run(ctx).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_ready() {
+            assert!(Instant::now() < deadline, "роль imap не готова");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let pop3 = bound.get(POP3);
+        assert_eq!(pop3.len(), 1, "{pop3:?}");
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(CERT.as_bytes()).expect("pem"))
+            .expect("root");
+        let client = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(pop3[0])
+            .await
+            .expect("connect");
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost").expect("name"), tcp)
+            .await
+            .expect("tls");
+        let mut c = BufReader::new(stream);
+        assert!(line(&mut c).await.starts_with("+OK"));
+        send(&mut c, &format!("USER {LOGIN}")).await;
+        assert!(line(&mut c).await.starts_with("+OK"));
+        send(&mut c, &format!("PASS {PASSWORD}")).await;
+        assert_eq!(line(&mut c).await, "+OK Logged in, 0 messages\r\n");
+
+        // Вход запрещён, сигнал не опубликован: поток шины оборвался — после переподписки сверка с хранилищем.
+        stand
+            .meta
+            .upsert(tenant, upsert(false))
+            .await
+            .expect("disable");
+        stand.bus.disconnect();
+        assert_eq!(line(&mut c).await, "-ERR [SYS/PERM] Account disabled\r\n");
+        // Соединение закрыто: сервер может закрыть TLS без close_notify.
+        let mut rest = String::new();
+        let closed = tokio::time::timeout(Duration::from_secs(5), c.read_line(&mut rest))
+            .await
+            .expect("соединение не закрыто");
+        assert!(
+            matches!(&closed, Ok(0))
+                || matches!(&closed, Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{closed:?} {rest:?}"
+        );
+
+        shutdown.cancel();
+        task.await.expect("join").expect("run");
     }
 
     #[test]

@@ -150,6 +150,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0032_sync_holds.sql"),
     ),
     (
+        33,
+        "card search pending",
+        include_str!("../migrations/0033_card_search_pending.sql"),
+    ),
+    (
         35,
         "delivery itip",
         include_str!("../migrations/0035_delivery_itip.sql"),

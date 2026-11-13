@@ -1,5 +1,5 @@
-//! DAV-12: глобальная адресная книга «Организация» на in-memory каталоге: состав, скрытые из GAL, запрет записи,
-//! синхронизация по версии снимка каталога.
+//! DAV-12: глобальная адресная книга «Организация» на in-memory каталоге: состав, скрытые из GAL (группы и учётные
+//! записи — DAV-27), запрет записи, синхронизация по версии снимка каталога (изменения от прежнего снимка — DAV-28).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -259,8 +259,8 @@ async fn sync_by_snapshot_version() {
     assert!(names(&r.body).is_empty(), "{}", r.body);
     assert_eq!(token(&r.body), first);
 
-    // Изменение каталога меняет токен и getctag; прежний токен недействителен — полная синхронизация. ETag
-    // меняется только у изменённой карточки.
+    // Изменение каталога меняет токен и getctag; от прежнего токена (DAV-28) — изменённая и новая карточки и
+    // удалённая (404). ETag меняется только у изменённой карточки.
     env.dir.upsert_account(
         t,
         account("u-ivan", "Иван Петров", &["ivan.petrov@example.org"], true),
@@ -271,9 +271,17 @@ async fn sync_by_snapshot_version() {
     );
     env.dir.remove_account(t, "u-maria");
     let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
-    assert!(r.body.contains("<d:valid-sync-token/>"), "{}", r.body);
+    assert_eq!(r.status, StatusCode::MULTI_STATUS);
+    assert_eq!(
+        names(&r.body),
+        ["u-ivan.vcf", "u-olga.vcf", "u-maria.vcf"],
+        "{}",
+        r.body
+    );
+    assert_eq!(r.body.matches("404 Not Found").count(), 1, "{}", r.body);
+    let delta_token = token(&r.body);
     let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(token(&r.body), delta_token);
     assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-olga.vcf"]);
     let second = token(&r.body);
     assert_ne!(second, first);
@@ -291,9 +299,59 @@ async fn sync_by_snapshot_version() {
     g.hidden_from_gal = false;
     env.groups.put(g).await.expect("группа");
     let r = env.send("REPORT", &gal(), &[], &sync_body(&second)).await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.status, StatusCode::MULTI_STATUS);
+    assert_eq!(names(&r.body), ["g-board.vcf"], "{}", r.body);
     let r = env.propfind(&gal(), "1", ETAGS).await;
     assert!(names(&r.body).contains(&"g-board.vcf".to_owned()));
+    // Токен первого снимка — ещё в истории: изменения за два снимка.
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
+    assert_eq!(
+        names(&r.body),
+        ["g-board.vcf", "u-ivan.vcf", "u-olga.vcf", "u-maria.vcf"],
+        "{}",
+        r.body
+    );
+}
+
+/// DAV-28: изменение одной записи каталога меняет ETag одной карточки — `sync-collection` от прежнего токена
+/// отдаёт одну; токен старше `dav.gal_sync_history` снимков — 403 `valid-sync-token`.
+#[tokio::test]
+async fn sync_changed_card_only() {
+    let env = Env::with_config(DavConfig {
+        gal_cache: Duration::ZERO,
+        gal_sync_history: 1,
+        ..Default::default()
+    });
+    let t = env.scope.tenant;
+    for (id, name, email) in [
+        ("u-1", "Первый", "one@example.org"),
+        ("u-2", "Второй", "two@example.org"),
+        ("u-3", "Третий", "three@example.org"),
+    ] {
+        env.dir.upsert_account(t, account(id, name, &[email], true));
+    }
+    let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(names(&r.body).len(), 3);
+    let first = token(&r.body);
+    env.dir.upsert_account(
+        t,
+        account("u-2", "Второй Иванов", &["two@example.org"], true),
+    );
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
+    assert_eq!(r.status, StatusCode::MULTI_STATUS);
+    assert_eq!(names(&r.body), ["u-2.vcf"], "{}", r.body);
+    assert!(!r.body.contains("404 Not Found"), "{}", r.body);
+    let second = token(&r.body);
+    assert_ne!(second, first);
+
+    // Ещё одно изменение: первый токен вышел из истории (один снимок).
+    env.dir.remove_account(t, "u-3");
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(r.body.contains("<d:valid-sync-token/>"), "{}", r.body);
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&second)).await;
+    assert_eq!(names(&r.body), ["u-3.vcf"], "{}", r.body);
+    assert_eq!(r.body.matches("404 Not Found").count(), 1, "{}", r.body);
 }
 
 #[tokio::test]
@@ -332,4 +390,34 @@ async fn no_directory_no_gal() {
     // Имя зарезервировано и без каталога.
     let r = env.send("MKCOL", &gal(), &[], "").await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// DAV-27: учётная запись, скрытая из адресной книги (`hidden_from_gal`), не видна в `addressbook-query` и
+/// `sync-collection`; после снятия признака — появляется.
+#[tokio::test]
+async fn hidden_account() {
+    let env = env().await;
+    let t = env.scope.tenant;
+    let mut maria = account("u-maria", "Мария Иванова", &["maria@example.org"], true);
+    maria.hidden_from_gal = true;
+    env.dir.upsert_account(t, maria.clone());
+    let query = r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+      <d:prop><d:getetag/></d:prop>
+      <card:filter><card:prop-filter name="FN"><card:text-match>Мария</card:text-match></card:prop-filter></card:filter>
+    </card:addressbook-query>"#;
+    let r = env.send("REPORT", &gal(), &[], query).await;
+    assert!(names(&r.body).is_empty(), "{}", r.body);
+    let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf"]);
+    let r = env
+        .send("GET", &format!("{}u-maria.vcf", gal()), &[], "")
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    maria.hidden_from_gal = false;
+    env.dir.upsert_account(t, maria);
+    let r = env.send("REPORT", &gal(), &[], query).await;
+    assert_eq!(names(&r.body), ["u-maria.vcf"], "{}", r.body);
+    let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-maria.vcf"]);
 }

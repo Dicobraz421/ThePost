@@ -4,7 +4,7 @@
 //! `PUT` — объект коллекции: тело не больше `max-resource-size` (меньшее из `dav.max_object_size` и лимита
 //! хранилища), индекс — [`crate::index`]; условия `If-Match` (в том числе `*` и список) и `If-None-Match: *` —
 //! 412 при несовпадении. Ответ — 201 (создан) или 204 (перезаписан) с `ETag`: тело хранится без изменений
-//! (RFC 4791 §5.3.4). Предусловия (403 с `<d:error>`): `valid-calendar-data` / `valid-address-data` (тело не
+//! (RFC 4791 §5.3.4); 8-битная карточка перекодируется в UTF-8 ([`card::put_text`]) — тогда ответ без `ETag`. Предусловия (403 с `<d:error>`): `valid-calendar-data` / `valid-address-data` (тело не
 //! разбирается calcard), `valid-calendar-object-resource` (один UID и один вид компонента, без `METHOD`),
 //! `supported-calendar-component`, `no-uid-conflict` (с `href` ресурса с тем же UID), `max-resource-size`,
 //! `min-date-time` / `max-date-time` (`dav.min_date_year`, `dav.max_date_year`); нет коллекции — 409. Проверка
@@ -242,7 +242,12 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
     let Some(c) = by_name(cx, kind, coll).await? else {
         return Ok(status(StatusCode::CONFLICT));
     };
-    let Ok(text) = String::from_utf8(bytes.to_vec()) else {
+    // 8-битная карточка — перекод по `CHARSET`; тело изменено сервером — ответ без `ETag`.
+    let text = match kind {
+        CollectionKind::AddressBook => card::put_text(&bytes),
+        CollectionKind::Calendar => String::from_utf8(bytes.to_vec()).ok().map(|t| (t, false)),
+    };
+    let Some((text, recoded)) = text else {
         return Ok(precondition(StatusCode::FORBIDDEN, valid_data(kind)));
     };
     let (idx, ical) = match checked_index(cx, kind, &text) {
@@ -298,7 +303,10 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
                 }
                 None => false,
             };
-            if !rewritten && let Some(e) = etag_header(&put.etag) {
+            if !rewritten
+                && !recoded
+                && let Some(e) = etag_header(&put.etag)
+            {
                 resp.headers_mut().insert(header::ETAG, e);
             }
             if let Some(t) = tag.as_deref().and_then(etag_header) {

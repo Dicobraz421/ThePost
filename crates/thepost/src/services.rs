@@ -13,7 +13,8 @@
 //! доставке smtp-in и submission и в JMAP `EmailSubmission/set` (доставка JMAP их не применяет повторно).
 //!
 //! Планирование встреч (APP-28, SRS 4.4) — одни зависимости на узел ([`Services::schedule`]): приём iTIP в календари
-//! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки smtp-in (iMIP извне, `Delivery::with_itip`); приглашения
+//! (`tp_dav::ItipInbox`) — у CalDAV, JMAP и доставки узла (iMIP извне и письма-приглашения из почтового клиента,
+//! `Delivery::with_itip`, права отправки — `Delivery::with_authz`); приглашения
 //! внешним участникам — письмом (`tp_dav::ImipSender`) через ту же доставку, что у JMAP; занятость — `PgMeta`.
 //!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
@@ -126,7 +127,7 @@ pub struct Services {
     pub sieve_limits: tp_sieve::Limits,
     /// Секция `sieve` на момент запуска: слушатели и лимиты сеансов ManageSieve (APP-27).
     pub sieve: Arc<tp_sieve::SieveConfig>,
-    /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки smtp-in.
+    /// Приём iTIP в календари учётных записей (APP-28): общий для CalDAV, JMAP и доставки узла.
     pub itip: Arc<tp_dav::ItipInbox>,
 }
 
@@ -359,8 +360,7 @@ impl Services {
     /// организации (профиль Milter, лимиты сеанса submission — `PgMeta`, SMTP-40), лимиты отправки в час — общие с
     /// submission и для отправки из JMAP (SMTP-43) — и правила потока почты модуля (если включён).
     pub fn delivery(&self, smtp: &SmtpConfig) -> Result<Arc<Delivery>> {
-        // Приглашения и ответы извне (iMIP, SMTP-33) после доставки в ящик применяются к календарю получателя.
-        let delivery = self.base_delivery(smtp)?.with_itip(self.itip.clone());
+        let delivery = self.base_delivery(smtp)?;
         Ok(Arc::new(match &self.mail_flow {
             Some(flow) => delivery.with_mail_flow(
                 flow.clone(),
@@ -373,6 +373,9 @@ impl Services {
 
     /// Доставка без правил потока почты: JMAP применяет их сам до `DecisionHooks::on_submission`
     /// (`Jmap::with_mail_flow`), повторный вызов нарушил бы «один раз на письмо».
+    /// Приглашения и ответы в письмах после доставки в ящик применяются к календарю получателя (`Delivery::with_itip`):
+    /// извне — iMIP с DMARC (SMTP-33), из submission, JMAP и DAV — если `From` принадлежит отправителю: свой адрес,
+    /// псевдоним или право Send As / Send on Behalf из ACL узла (`Delivery::with_authz`, SMTP-36, APP-62).
     fn base_delivery(&self, smtp: &SmtpConfig) -> Result<Delivery> {
         let resolver = system_resolver()?;
         let milter = (!smtp.milter.filters.is_empty())
@@ -402,7 +405,9 @@ impl Services {
             .with_forwarding(Arc::new(forwarding))
             .with_rules(self.rules.clone())
             .with_policies(Arc::new(self.meta.clone()))
-            .with_send_limits(self.send_limits.clone()))
+            .with_send_limits(self.send_limits.clone())
+            .with_itip(self.itip.clone())
+            .with_authz(self.authz.clone()))
     }
 
     /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
@@ -1232,6 +1237,205 @@ mod tests {
 
         stop.cancel();
         drop((services, delivery, meta));
+        crate::testutil::drop_database(&url, &db_name).await;
+    }
+
+    /// APP-62: приглашение-письмо, отправленное через доставку JMAP и DAV (`Outbound` из `base_delivery`) от имени
+    /// boss учётной записью alice с правом Send on Behalf (ACL узла, `PgMeta`), — в календаре bob (`ItipInbox` узла);
+    /// от имени boss без права — только письмо.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jmap_invite_on_behalf_reaches_calendar() {
+        use tp_contracts::acl::AclStore;
+        use tp_contracts::auth::SendRight;
+        use tp_contracts::dav::{CollectionKind, DavStore};
+        use tp_contracts::ids::DomainId;
+        use tp_contracts::meta::{AccountKind, AccountUpsert, SpecialUse};
+        use tp_contracts::queue::SubmitStatus;
+        use tp_contracts::role::CancellationToken;
+        use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
+        use tp_smtp::deliver::Resolved;
+
+        const ALICE: &str = "alice@corp.example";
+        const BOSS: &str = "boss@corp.example";
+        const BOB: &str = "bob@corp.example";
+        const DAVE: &str = "dave@corp.example";
+
+        let Some(url) = tp_testkit::pg_url() else {
+            eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+            return;
+        };
+        let url = crate::testutil::dev_url(&url);
+        let (db_name, url_db) = crate::testutil::create_database(&url).await;
+        let pool = crate::testutil::db_pool(&url_db).await;
+        tp_meta::schema::migrate(&pool).await.expect("migrate");
+        let bus: Arc<dyn EventBus> = Arc::new(tp_cluster::LocalBus::default());
+        let meta = PgMeta::new(pool, tp_meta::MetaConfig::default()).with_bus(bus.clone());
+        let cfg = crate::sections::registry_of(crate::modules::BUILTIN)
+            .expect("registry")
+            .parse(
+                "domain: example.org\nprofile: dev\nservice_http:\n  allow_plaintext: true\n\
+                 database:\n  url: postgres://thepost@localhost/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\n\
+                 blob:\n  url: file:///var/lib/thepost/blob\n",
+                Vec::new(),
+            )
+            .expect("config");
+        let ext = Registry::default();
+        let metrics = tp_platform::Metrics::default();
+        let services = Services::build(Base {
+            cfg: &cfg,
+            meta: meta.clone(),
+            blob: Arc::new(tp_testkit::MemBlobStore::default()),
+            bus: bus.clone(),
+            secrets: Arc::new(tp_testkit::MemSecretStore::default()),
+            ext: &ext,
+            metrics: &metrics,
+            node: NodeId::new("app-62").expect("node"),
+        })
+        .await
+        .expect("services");
+        let stop = CancellationToken::new();
+        tokio::spawn(services.routes.clone().watch(
+            bus.clone(),
+            stop.clone(),
+            std::time::Duration::from_millis(50),
+        ));
+        let t = TenantId::DEFAULT;
+
+        // Полномочный домен и учётные записи; boss доверил alice отправку от своего имени (Send on Behalf).
+        let version = TransportStore::cluster(&meta)
+            .await
+            .expect("cluster")
+            .version;
+        let domain = DomainId::new();
+        TransportStore::put_domain(
+            &meta,
+            version,
+            &AcceptedDomain {
+                id: domain,
+                tenant: t,
+                name: "corp.example".into(),
+                kind: DomainKind::Authoritative,
+            },
+        )
+        .await
+        .expect("domain");
+        let mut scope = std::collections::HashMap::new();
+        for login in [ALICE, BOSS, BOB, DAVE] {
+            let acc = AccountStore::upsert(
+                &meta,
+                t,
+                AccountUpsert {
+                    domain,
+                    login: login.into(),
+                    display_name: login.into(),
+                    external_id: None,
+                    enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
+                },
+            )
+            .await
+            .expect("account");
+            scope.insert(
+                login,
+                AccountScope {
+                    tenant: t,
+                    account: acc.id,
+                },
+            );
+        }
+        AclStore::set_send_delegation(&meta, scope[BOSS], ALICE, Some(SendRight::SendOnBehalf))
+            .await
+            .expect("delegate");
+
+        let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
+        // Та же доставка, что получают JMAP (`EmailSubmission/set`) и DAV (письма iMIP).
+        let outbound: Arc<dyn Outbound> =
+            Arc::new(services.base_delivery(&smtp).expect("delivery"));
+        let resolver = services.delivery(&smtp).expect("delivery");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = resolver.resolve(BOB).await.expect("resolve");
+            if matches!(r, Resolved::Local(_)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "домен не принят: {r:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Приглашение от имени boss (`From`), отправитель — `sender` (`Sender`, конверт — как у JMAP Send on Behalf).
+        let invite = |sender: &str, uid: &str| {
+            format!(
+                "From: <{BOSS}>\r\nSender: <{sender}>\r\nTo: {BOB}\r\nSubject: meeting\r\nMIME-Version: 1.0\r\n\
+                 Content-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\n\
+                 meeting\r\n--b\r\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\r\n\
+                 BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//app-62//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+                 UID:{uid}\r\nDTSTAMP:20261112T100000Z\r\nDTSTART:20261120T100000Z\r\nDTEND:20261120T110000Z\r\n\
+                 SUMMARY:meeting\r\nORGANIZER:mailto:{BOSS}\r\nATTENDEE:mailto:{BOB}\r\nEND:VEVENT\r\n\
+                 END:VCALENDAR\r\n--b--\r\n"
+            )
+        };
+        for (sender, uid) in [(ALICE, "app62-on-behalf"), (DAVE, "app62-no-right")] {
+            let sent = outbound
+                .submit(
+                    t,
+                    sender,
+                    &[BOB.to_owned()],
+                    bytes::Bytes::from(invite(sender, uid)),
+                )
+                .await
+                .expect("submit");
+            assert_eq!(sent.rcpts, [(BOB.to_owned(), SubmitStatus::Delivered)]);
+        }
+
+        let bob = scope[BOB];
+        let in_calendar = |uid: &'static str| {
+            let meta = meta.clone();
+            async move {
+                for c in DavStore::list_collections(&meta, bob, CollectionKind::Calendar)
+                    .await
+                    .expect("calendars")
+                {
+                    if DavStore::object_by_uid(&meta, bob, c.id, uid)
+                        .await
+                        .expect("object")
+                        .is_some()
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+        assert!(
+            in_calendar("app62-on-behalf").await,
+            "приглашение с правом Send on Behalf не в календаре"
+        );
+        assert!(
+            !in_calendar("app62-no-right").await,
+            "приглашение без права — только письмо"
+        );
+        // Письма — во «Входящих» bob при любом исходе.
+        let inbox = MailboxStore::list(&meta, bob)
+            .await
+            .expect("mailboxes")
+            .into_iter()
+            .find(|m| m.role == Some(SpecialUse::Inbox))
+            .expect("inbox")
+            .id;
+        assert_eq!(
+            MessageStore::list(&meta, bob, inbox, MessageQuery::All, 10)
+                .await
+                .expect("messages")
+                .len(),
+            2
+        );
+
+        stop.cancel();
+        drop((services, outbound, resolver, meta));
         crate::testutil::drop_database(&url, &db_name).await;
     }
 

@@ -1,5 +1,6 @@
 //! META-46…48: календари и контакты на PostgreSQL — общий набор `tp_testkit::suite::dav`, сигналы, RLS, миграция
-//! на базе прежней схемы, шард ящика, очистка надгробий и устаревшие токены синхронизации.
+//! на базе прежней схемы, шард ящика, очистка надгробий, устаревшие токены синхронизации и пересчёт поисковых
+//! строк контактов (META-78).
 
 mod common;
 
@@ -10,8 +11,8 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Executor, PgPool};
 use time::OffsetDateTime;
 use tp_contracts::dav::{
-    Collection, CollectionKind, Component, DavStore, DeleteOutcome, ObjectIndex, Precondition,
-    PutOutcome,
+    CardSearch, Collection, CollectionKind, Component, DavStore, DeleteOutcome, ObjectIndex,
+    Precondition, PutOutcome,
 };
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::{AccountId, DomainId, Error, ModSeq, TenantId};
@@ -424,4 +425,149 @@ async fn purge_tombstones_invalidates_old_tokens() {
         m_b
     );
     db.drop_db().await;
+}
+
+/// Поисковые строки тела для пересчёта: значения `FN` (в узле — `tp_dav::index::card`); без `FN` — тело не
+/// разбирается.
+fn fn_index(body: &str) -> Option<CardSearch> {
+    let names: Vec<&str> = body
+        .split(
+            "
+
+",
+        )
+        .filter_map(|l| l.strip_prefix("FN:"))
+        .collect();
+    (!names.is_empty()).then(|| CardSearch::new(names))
+}
+
+/// Тело карточки `uid` с полным именем `name`.
+fn vcard(uid: &str, name: &str) -> String {
+    format!(
+        "BEGIN:VCARD
+
+VERSION:3.0
+
+UID:{uid}
+
+FN:{name}
+
+END:VCARD
+
+"
+    )
+}
+
+/// META-78: карточка, записанная до миграции 0033 без поисковых строк, после пересчёта находится поиском;
+/// повторный пересчёт ничего не меняет; карточка, записанная после миграции, не пересчитывается.
+#[tokio::test]
+async fn reindex_cards_written_before_migration() {
+    let Some(url) = common::pg_url() else { return };
+    let version = schema::migrator()
+        .iter()
+        .find(|m| m.description == "card search pending")
+        .expect("миграция признака")
+        .version;
+    let (admin, pool, name) = db_until(&url, version - 1).await;
+    let cfg = MetaConfig {
+        dav: DavConfig {
+            card_reindex_batch: 1,
+            card_reindex_pause: std::time::Duration::ZERO,
+            ..DavConfig::default()
+        },
+        ..MetaConfig::default()
+    };
+    let meta = PgMeta::new(pool.clone(), cfg);
+    let tenant = common::tenant(&pool).await;
+    let domain = common::domain(&pool, tenant).await;
+    let scope = account_in(&meta, tenant, (domain.0, &domain.1)).await;
+    let book = Collection::new(CollectionKind::AddressBook, "contacts");
+    meta.create_collection(scope, book.clone())
+        .await
+        .expect("create");
+    // Запись до 0030: без поисковых строк.
+    let put = async |name: &str, body: String, index: ObjectIndex| match meta
+        .put_object(scope, book.id, name, body, index, Precondition::Any)
+        .await
+        .expect("put")
+    {
+        PutOutcome::Stored(p) => p.modseq,
+        other => panic!("{other:?}"),
+    };
+    put("old.vcf", vcard("old", "Иван Петров"), card("old")).await;
+    put(
+        "broken.vcf",
+        "BEGIN:VCARD
+
+END:VCARD
+
+"
+        .into(),
+        card("broken"),
+    )
+    .await;
+
+    schema::migrate(&pool).await.expect("migrate");
+    let mut fresh = card("new");
+    fresh.search = CardSearch::new(["пётр иванов"]);
+    put("new.vcf", vcard("new", "Пётр Иванов"), fresh).await;
+    let found = async |needle: &str| -> Vec<String> {
+        let mut names: Vec<String> = meta
+            .find_cards(scope, book.id, needle, 10)
+            .await
+            .expect("find")
+            .into_iter()
+            .map(|o| o.name)
+            .collect();
+        names.sort();
+        names
+    };
+    assert!(
+        found("петров").await.is_empty(),
+        "до пересчёта не находится"
+    );
+    let state = meta
+        .state(scope, CollectionKind::AddressBook)
+        .await
+        .expect("state");
+    let etag = |objs: Vec<tp_contracts::dav::DavObject>| {
+        objs.into_iter().map(|o| o.etag).collect::<Vec<_>>()
+    };
+    let before = etag(meta.find_cards(scope, book.id, "", 10).await.expect("all"));
+
+    // Записанная после миграции карточка не пересчитывается, тело без строк — без строк.
+    assert_eq!(meta.reindex_cards(fn_index).await.expect("reindex"), 1);
+    assert_eq!(found("петров").await, ["old.vcf"]);
+    assert_eq!(found("иван").await, ["new.vcf", "old.vcf"]);
+    assert_eq!(
+        meta.state(scope, CollectionKind::AddressBook)
+            .await
+            .expect("state"),
+        state,
+        "пересчёт не меняет состояние коллекции"
+    );
+    assert_eq!(
+        etag(meta.find_cards(scope, book.id, "", 10).await.expect("all")),
+        before,
+        "ETag прежние"
+    );
+
+    // Повторный пересчёт: непосчитанных нет.
+    assert_eq!(meta.reindex_cards(fn_index).await.expect("again"), 0);
+    let mut tx = schema::begin_system(&pool).await.expect("begin");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM dav_objects WHERE search_pending AND component = 'VCARD'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("pending");
+    tx.commit().await.expect("commit");
+    assert_eq!(pending, 0);
+    assert_eq!(found("петров").await, ["old.vcf"]);
+
+    pool.close().await;
+    admin
+        .execute(AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
+        .await
+        .expect("drop database");
 }
