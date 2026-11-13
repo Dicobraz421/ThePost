@@ -91,6 +91,12 @@ async fn forged_sender_is_ignored() {
     let reply = imip("REPLY", "bob@example.org", "boss@example.com");
     assert_eq!(send(&d, &request).await, 250);
     assert_eq!(send(&d, &reply).await, 250);
+    // Отправитель — `SENT-BY` организатора (SMTP-38): право представителя извне не проверить.
+    let sent_by = request.replace(
+        "ORGANIZER;CN=Org:",
+        "ORGANIZER;SENT-BY=\"mailto:sender@example.com\":",
+    );
+    assert_eq!(send(&d, &sent_by).await, 250);
     // Адрес организатора в `From`, но письмо не прошло DMARC (адрес вне SPF, подписи нет).
     let spoofed = imip("REQUEST", "sender@example.com", "bob@example.org");
     let r = d
@@ -106,7 +112,7 @@ async fn forged_sender_is_ignored() {
     assert_eq!(d.data(&e, Bytes::from(spoofed)).await.code, 250);
     assert!(itip.calls().is_empty());
     // Письма остаются в ящике.
-    assert_eq!(env.inbox("bob@example.org").await.len(), 4);
+    assert_eq!(env.inbox("bob@example.org").await.len(), 5);
 }
 
 #[tokio::test]

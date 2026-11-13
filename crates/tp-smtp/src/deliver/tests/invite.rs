@@ -208,3 +208,33 @@ async fn external_sender_of_submit_is_not_internal() {
     assert!(itip.calls().is_empty());
     assert_eq!(env.inbox(BOB).await.len(), 1);
 }
+
+/// SMTP-38: приглашение представителя — `From` alice совпал с `SENT-BY` организатора; сообщение — от имени
+/// организатора при праве alice на его адрес, иначе только письмо.
+#[tokio::test]
+async fn sent_by_delegate_needs_right_on_owner() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let on_behalf = |organizer: &str| {
+        invite(ALICE, organizer).replace(
+            "ORGANIZER:mailto:",
+            &format!("ORGANIZER;CN=Boss;SENT-BY=\"mailto:{ALICE}\":mailto:"),
+        )
+    };
+    let rights = Arc::new(SendRights::default());
+    rights.grant(ALICE, "boss@example.org", SendRight::SendOnBehalf);
+    let (d, itip) = delivery(&env, Some(rights));
+    submission(&env, &d, &on_behalf("boss@example.org")).await;
+    submit(&d, &on_behalf("boss@example.org")).await;
+    // Тот же `SENT-BY`, но у alice нет права на адрес организатора.
+    submission(&env, &d, &on_behalf("carol@example.org")).await;
+    submit(&d, &on_behalf("carol@example.org")).await;
+    assert_eq!(
+        reached(&env, &itip).await,
+        ["boss@example.org", "boss@example.org"]
+    );
+    // Без прав отправки представителю не верят.
+    let (d, itip) = delivery(&env, None);
+    submission(&env, &d, &on_behalf("boss@example.org")).await;
+    assert!(itip.calls().is_empty());
+    assert_eq!(env.inbox(BOB).await.len(), 5);
+}
