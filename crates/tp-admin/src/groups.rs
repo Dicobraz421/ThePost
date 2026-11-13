@@ -8,7 +8,8 @@
 //!   нельзя. В ответе — словарь `names`: имя входа каждой упомянутой учётной записи и имя каждой упомянутой
 //!   группы (участники, перечисленные отправители, модераторы); имена читаются страницами списка учётных записей
 //!   и одним списком групп, а не запросом на участника;
-//! - очередь модерации (`/api/v1/orgs/{org}/moderation`): письма по времени постановки, одобрение — доставка
+//! - очередь модерации (`/api/v1/orgs/{org}/moderation`): письма по времени постановки страницами (`after`,
+//!   продолжение — заголовок `Link` с `rel="next"`, как у списка учётных записей), одобрение — доставка
 //!   участникам, отклонение — уведомление отправителя с причиной. Письмо забирается из очереди
 //!   (`GroupStore::take_held`) и передаётся [`Moderation`] (контракт, CTR-31; реализация — `tp-smtp`: раскрытие группы,
 //!   приём в ящики, DSN, журнал доставки); ошибка решения возвращает его в очередь. Тема письма (`subject`) —
@@ -20,15 +21,15 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{MatchedPath, Path, Query, State};
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 pub use tp_contracts::groups::Moderation;
 use tp_contracts::groups::{
-    DistributionGroup, GroupMember, HeldMessage, HoldSource, Moderator, SenderRestriction,
-    validate_reject_reason,
+    DistributionGroup, GroupMember, HeldCursor, HeldMessage, HoldSource, Moderator,
+    SenderRestriction, validate_reject_reason,
 };
 use tp_contracts::{AccountId, Error, GroupId, HeldId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -343,6 +344,8 @@ pub struct HeldQuery {
     pub group: Option<GroupId>,
     /// Размер (по умолчанию и наибольший — из конфигурации).
     pub limit: Option<usize>,
+    /// Продолжение после этого письма — `after` из ссылки `rel="next"` предыдущей страницы (непрозрачная позиция).
+    pub after: Option<String>,
     /// `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
     /// к содержимому; размер — не больше `admin.content_page_size`.
     pub include: Option<String>,
@@ -559,10 +562,14 @@ async fn delete_group(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Очередь модерации организации или группы.
+/// Очередь модерации организации или группы по времени постановки. Есть продолжение — заголовок
+/// `Link: <…&after=…>; rel="next"` (RFC 8288), нет заголовка — страница последняя; неразборчивый `after` — 400.
 #[utoipa::path(get, path = "/api/v1/orgs/{org}/moderation", tag = "groups",
     params(("org" = String, Path, description = "Организация (UUID)"), HeldQuery),
-    responses((status = 200, body = Vec<HeldInfo>), (status = 400, body = Problem), (status = 403, body = Problem)))]
+    responses(
+        (status = 200, body = Vec<HeldInfo>, headers(("Link" = String,
+            description = "Следующая страница очереди: `<ссылка>; rel=\"next\"`; нет — страница последняя"))),
+        (status = 400, body = Problem), (status = 403, body = Problem)))]
 async fn list_held(
     State(a): State<Arc<Admin>>,
     Extension(caller): Extension<Caller>,
@@ -570,8 +577,9 @@ async fn list_held(
     uri: Uri,
     Path(org): Path<TenantId>,
     Query(q): Query<HeldQuery>,
-) -> ApiResult<Json<Vec<HeldInfo>>> {
+) -> ApiResult<(HeaderMap, Json<Vec<HeldInfo>>)> {
     let subjects = content::requested(q.include.as_deref())?;
+    let after = q.after.as_deref().map(parse_cursor).transpose()?;
     let access = Access {
         caller: &caller,
         org,
@@ -582,9 +590,23 @@ async fn list_held(
         access.check(&a).await?;
     }
     let limit = a.cfg.content_page(q.limit, subjects);
-    let held = a.d.groups.held(org, q.group, None, limit).await?;
+    // На одно письмо больше: продолжение есть, только если после страницы письма действительно есть.
+    let mut held =
+        a.d.groups
+            .held(org, q.group, after, limit.saturating_add(1))
+            .await?;
+    let mut headers = HeaderMap::new();
+    if held.len() > limit {
+        held.truncate(limit);
+        if let Some(last) = held.last() {
+            let link = next_link(org, q.group, subjects, &HeldCursor::of(last), limit);
+            let value = HeaderValue::from_str(&link)
+                .map_err(|e| Error::internal(format!("ссылка Link: {e}")))?;
+            headers.insert(header::LINK, value);
+        }
+    }
     if !subjects {
-        return Ok(Json(held.into_iter().map(Into::into).collect()));
+        return Ok((headers, Json(held.into_iter().map(Into::into).collect())));
     }
     access.record(&a, 200, held.len()).await?;
     let mut out = Vec::with_capacity(held.len());
@@ -600,7 +622,46 @@ async fn list_held(
         info.subject = Some(subject);
         out.push(info);
     }
-    Ok(Json(out))
+    Ok((headers, Json(out)))
+}
+
+/// Позиция в очереди для `after`: `<held_at, нс Unix>_<id>` — без символов, требующих кодирования в запросе.
+fn cursor_text(c: &HeldCursor) -> String {
+    format!("{}_{}", c.held_at.unix_timestamp_nanos(), c.id)
+}
+
+/// Разбор `after` ([`cursor_text`]); неразборчивая позиция — 400.
+fn parse_cursor(s: &str) -> Result<HeldCursor> {
+    let bad = || Error::invalid("after: позиция не из ссылки rel=\"next\"");
+    let (at, id) = s.split_once('_').ok_or_else(bad)?;
+    let held_at = at
+        .parse::<i128>()
+        .ok()
+        .and_then(|n| OffsetDateTime::from_unix_timestamp_nanos(n).ok())
+        .ok_or_else(bad)?;
+    let id = id.parse::<HeldId>().map_err(|_| bad())?;
+    Ok(HeldCursor { held_at, id })
+}
+
+/// Ссылка на следующую страницу очереди (RFC 8288; путь от корня Admin API) с теми же фильтром и `include`.
+fn next_link(
+    org: TenantId,
+    group: Option<GroupId>,
+    subjects: bool,
+    after: &HeldCursor,
+    limit: usize,
+) -> String {
+    let mut q = String::new();
+    if let Some(g) = group {
+        q.push_str(&format!("group={g}&"));
+    }
+    if subjects {
+        q.push_str("include=subject&");
+    }
+    format!(
+        "</api/v1/orgs/{org}/moderation?{q}limit={limit}&after={}>; rel=\"next\"",
+        cursor_text(after)
+    )
 }
 
 /// Возвращает письмо в очередь после неудачного решения.
@@ -716,6 +777,87 @@ mod tests {
             },
             size: 100,
             held_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// Путь следующей страницы из `Link: <путь>; rel="next"`; нет заголовка — `None`.
+    fn next(h: &axum::http::HeaderMap) -> Option<String> {
+        let v = h.get(axum::http::header::LINK)?.to_str().expect("link");
+        let path = v.strip_prefix('<')?.strip_suffix(">; rel=\"next\"")?;
+        Some(path.to_owned())
+    }
+
+    /// Приёмка ADM-21: очередь из 5 писем при `limit=2` читается тремя запросами по `Link` без пропусков и повторов;
+    /// фильтр группы переходит в ссылку; неразборчивый `after` — 400.
+    #[tokio::test]
+    async fn moderation_pages() {
+        let env = Env::new();
+        let mut gids = Vec::new();
+        for name in ["staff", "sales"] {
+            let body = json!({"name": name, "address": format!("{name}@example.org")});
+            let (s, _, g) = env
+                .call(
+                    "POST",
+                    &format!("{}/groups", base()),
+                    Some("org"),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(s, StatusCode::CREATED, "{g}");
+            let gid: GroupId = g["id"].as_str().expect("id").parse().expect("uuid");
+            gids.push(gid);
+        }
+        let (gid, other) = (gids[0], gids[1]);
+        let start = OffsetDateTime::now_utc();
+        let mut queued = Vec::new();
+        for i in 0..5_i64 {
+            // Два письма с одним `held_at`: порядок различает `id`.
+            let at = start + time::Duration::seconds(i.min(3));
+            let h = HeldMessage {
+                held_at: at,
+                ..held(gid, &format!("s{i}@ext"))
+            };
+            queued.push((h.held_at, h.id));
+            env.groups.hold(TenantId::DEFAULT, h).await.expect("hold");
+        }
+        // Письмо другой группы в выборку с фильтром не попадает.
+        env.groups
+            .hold(TenantId::DEFAULT, held(other, "other@ext"))
+            .await
+            .expect("hold");
+        queued.sort();
+        let expected: Vec<String> = queued.iter().map(|(_, id)| id.to_string()).collect();
+
+        let mut url = Some(format!("{}/moderation?group={gid}&limit=2", base()));
+        let (mut seen, mut requests) = (Vec::new(), 0);
+        while let Some(u) = url {
+            let (s, h, b) = env.call("GET", &u, Some("operator"), None).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            requests += 1;
+            let page = b.as_array().expect("page");
+            assert!(page.len() <= 2, "{b}");
+            seen.extend(
+                page.iter()
+                    .map(|m| m["id"].as_str().expect("id").to_owned()),
+            );
+            url = next(&h);
+            if let Some(link) = &url {
+                assert!(
+                    link.contains(&format!("group={gid}&limit=2&after=")),
+                    "{link}"
+                );
+            }
+        }
+        assert_eq!(requests, 3);
+        assert_eq!(
+            seen, expected,
+            "без пропусков и повторов, по времени постановки"
+        );
+
+        for bad in ["junk", "1_x", "x_00000000-0000-0000-0000-000000000000"] {
+            let u = format!("{}/moderation?after={bad}", base());
+            let (s, _, _) = env.call("GET", &u, Some("operator"), None).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
         }
     }
 
