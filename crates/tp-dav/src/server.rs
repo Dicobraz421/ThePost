@@ -27,7 +27,6 @@ use tp_contracts::dav::DavStore;
 use tp_contracts::meta::AccountScope;
 
 use crate::config::DavConfig;
-use crate::gal::GalDeps;
 use crate::path::Target;
 use crate::schedule::{self, ScheduleDeps};
 use crate::xml::{self, Element};
@@ -82,14 +81,8 @@ pub fn router(d: Deps, cfg: DavConfig) -> Router {
 }
 
 /// Маршруты DAV с необязательным планированием встреч `schedule` (RFC 6638: рассылка iTIP после `PUT` и `DELETE`,
-/// запрос занятости). Книгу GAL маршруты читают из хранилища, заполняет её [`crate::gal::sync`]; `_gal` не
-/// используется — аргумент убирает подключение `gal::sync` в узле (APP-49).
-pub fn router_with(
-    d: Deps,
-    _gal: Option<GalDeps>,
-    schedule: Option<ScheduleDeps>,
-    cfg: DavConfig,
-) -> Router {
+/// запрос занятости). Книгу GAL маршруты читают из хранилища, заполняет её [`crate::gal::sync`].
+pub fn router_with(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> Router {
     build(d, schedule, cfg)
 }
 
