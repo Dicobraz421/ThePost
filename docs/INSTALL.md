@@ -196,7 +196,7 @@ Ansible — `thepost_cli_oidc` (например `{ client_id: thepost-cli }`), 
 | `maintenance.verify.interval` | `24h` | период проходов; не в целых сутках — сетка проходов отсчитывается от `at` после полуночи UTC 1970-01-01 |
 | `maintenance.verify.lease_name` | `blob-verify` | имя лизы: в кластере проход выполняет один узел — её держатель |
 | `maintenance.verify.lease_ttl` | `2m` | срок лизы; продлевается во время прохода и держится после него — должен покрывать расхождение часов узлов |
-| `dav.schedule_keep_processed` | `false` | хранить применённые сервером сообщения iTIP для ленты уведомлений JMAP; во входящих планирования CalDAV они не видны. `true` — их удаляет очистка по сроку |
+| `dav.schedule_keep_processed` | `true` | хранить применённые сервером сообщения iTIP для ленты уведомлений JMAP (`CalendarEventNotification`); во входящих планирования CalDAV они не видны, их удаляет очистка по сроку (роль maintenance). `false` — не хранить, лента пуста |
 | `dav.schedule_processed_ttl` | `30d` | срок хранения этих сообщений при `dav.schedule_keep_processed: true` |
 
 `thepost config check` отклоняет нулевые `purge_interval`, `gal_interval`, `verify.interval`, `verify.lease_ttl`,
