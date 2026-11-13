@@ -4,15 +4,22 @@
 //! `name` — отображаемое имя коллекции, сегмент URL новой книги — её `id`. `myRights` — права владельца; общий
 //! доступ (`shareWith`) — JMAP-32. Книга по умолчанию (`isDefault`) — назначенная (`onSuccessSetIsDefault`,
 //! [`Collection::is_default`]), иначе правило [`default_of`]; `isSubscribed` — [`Collection::subscribed`] (JMAP-36).
-//! Состояние — [`DavStore::state`] вида (общее для `AddressBook` и `ContactCard`); push — по `DavChanged`.
+//! Состояние — [`State`] (общее для `AddressBook` и `ContactCard`); push — по `DavChanged`.
+//!
+//! Книга GAL организации ([`Collection::is_gal`], CTR-60, JMAP-39) — среди книг учётной записи, только для чтения:
+//! `myRights` без записи и удаления; её изменение, удаление, назначение по умолчанию — `forbidden`. Её появление и
+//! изменение (новое [`Collection::state`] книги) `AddressBook/changes` сообщает как создание или изменение книги.
 
+use std::fmt;
 use std::str::FromStr;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tp_contracts::Error;
-use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore, default_of};
+use tp_contracts::dav::{
+    Collection, CollectionId, CollectionKind, DavStore, GAL_COLLECTION_NAME, default_of,
+};
 use tp_contracts::meta::AccountScope;
+use tp_contracts::{Error, ModSeq};
 
 use crate::core::Ctx;
 use crate::core::error::{MethodError, MethodResult, changes_error, set_error};
@@ -36,13 +43,66 @@ pub(crate) fn default_book(books: &[Collection]) -> Option<CollectionId> {
     default_of(books).map(|b| b.id)
 }
 
-/// Текущее состояние контактов.
-pub(crate) async fn state(store: &dyn DavStore, scope: AccountScope) -> MethodResult<String> {
-    Ok(state_string(store.state(scope, KIND).await?))
+/// Книга GAL организации учётной записи; `None` — её ещё нет (не было [`DavStore::sync_gal`]).
+pub(crate) async fn gal_book(
+    store: &dyn DavStore,
+    scope: AccountScope,
+) -> tp_contracts::Result<Option<Collection>> {
+    Ok(store
+        .collection_by_name(scope, KIND, GAL_COLLECTION_NAME)
+        .await?
+        .filter(Collection::is_gal))
 }
 
-fn rights() -> Value {
-    json!({ "mayRead": true, "mayWrite": true, "mayShare": false, "mayDelete": true })
+/// Состояние контактов (`AddressBook` и `ContactCard`): состояние вида учётной записи ([`DavStore::state`]) и
+/// книги GAL организации ([`Collection::state`]; книги нет — `ModSeq::ZERO`). Строка — `<своё>.<GAL>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct State {
+    /// Книги и карточки учётной записи.
+    pub(crate) own: ModSeq,
+    /// Книга GAL.
+    pub(crate) gal: ModSeq,
+}
+
+impl State {
+    /// Текущее состояние.
+    pub(crate) async fn load(
+        store: &dyn DavStore,
+        scope: AccountScope,
+    ) -> tp_contracts::Result<Self> {
+        let own = store.state(scope, KIND).await?;
+        let gal = gal_book(store, scope)
+            .await?
+            .map_or(ModSeq::ZERO, |b| b.state);
+        Ok(Self { own, gal })
+    }
+
+    /// Состояние из строки клиента; чужая строка — `cannotCalculateChanges`.
+    pub(crate) fn parse(s: &str) -> MethodResult<Self> {
+        let (own, gal) = s
+            .split_once('.')
+            .ok_or_else(|| MethodError::new("cannotCalculateChanges"))?;
+        Ok(Self {
+            own: parse_state(own)?,
+            gal: parse_state(gal)?,
+        })
+    }
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", state_string(self.own), state_string(self.gal))
+    }
+}
+
+/// Текущее состояние контактов строкой.
+pub(crate) async fn state(store: &dyn DavStore, scope: AccountScope) -> MethodResult<String> {
+    Ok(State::load(store, scope).await?.to_string())
+}
+
+/// Права на книгу: книга GAL — только чтение.
+fn rights(gal: bool) -> Value {
+    json!({ "mayRead": true, "mayWrite": !gal, "mayShare": false, "mayDelete": !gal })
 }
 
 fn book_object(b: &Collection, default: Option<CollectionId>) -> Map<String, Value> {
@@ -54,7 +114,7 @@ fn book_object(b: &Collection, default: Option<CollectionId>) -> Map<String, Val
         "isDefault": default == Some(b.id),
         "isSubscribed": b.subscribed,
         "shareWith": null,
-        "myRights": rights(),
+        "myRights": rights(b.is_gal()),
     }))
 }
 
@@ -99,7 +159,8 @@ pub(crate) async fn get(
     })))
 }
 
-/// `AddressBook/changes` по журналу коллекций (изменения карточек — `ContactCard/changes`).
+/// `AddressBook/changes` по журналу коллекций (изменения карточек — `ContactCard/changes`) и состоянию книги GAL:
+/// книга появилась после `sinceState` — в `created`, изменилась — в `updated`.
 pub(crate) async fn changes(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -107,15 +168,36 @@ pub(crate) async fn changes(
     let a: ChangesArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
-    let since = parse_state(&a.since_state)?;
-    let c = ctx
-        .jmap
-        .dav_store()?
-        .collection_changes(ctx.scope, KIND, since, limit)
+    let since = State::parse(&a.since_state)?;
+    let store = ctx.jmap.dav_store()?;
+    let c = store
+        .collection_changes(ctx.scope, KIND, since.own, limit)
         .await
         .map_err(changes_error)?;
-    let c = map_changes(c, ToString::to_string);
+    let mut c = map_changes(c, ToString::to_string);
+    let gal = gal_book(store.as_ref(), ctx.scope).await?;
+    let gal_state = gal.as_ref().map_or(ModSeq::ZERO, |b| b.state);
+    if since.gal > gal_state {
+        return Err(MethodError::new("cannotCalculateChanges"));
+    }
+    let mut new = State {
+        own: c.new_state,
+        gal: gal_state,
+    };
+    if let Some(b) = gal.filter(|b| b.state > since.gal) {
+        let taken = c.created.len() + c.updated.len() + c.destroyed.len();
+        if c.has_more || taken >= limit {
+            // Книга GAL — на следующей странице.
+            c.has_more = true;
+            new.gal = since.gal;
+        } else if since.gal == ModSeq::ZERO {
+            c.created.push(b.id.to_string());
+        } else {
+            c.updated.push(b.id.to_string());
+        }
+    }
     let mut out = changes_response(&a.account_id, &a.since_state, &c);
+    out.insert("newState".into(), json!(new.to_string()));
     out.insert("updatedProperties".into(), Value::Null);
     Ok(out)
 }
@@ -182,6 +264,7 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
 pub(crate) fn store_error(e: Error) -> MethodResult<Value> {
     Ok(match e {
         Error::QuotaExceeded => set_error("overQuota", None, &[]),
+        Error::Forbidden => set_error("forbidden", None, &[]),
         Error::NotFound => set_error("notFound", None, &[]),
         Error::Invalid(m) => set_error("invalidProperties", Some(&m), &[]),
         e => return Err(e.into()),
@@ -207,7 +290,8 @@ pub(crate) async fn set_default(
     };
     let all = store.list_collections(ctx.scope, kind).await?;
     let old = default_of(&all).map(|c| c.id);
-    let Some(mut c) = all.into_iter().find(|c| c.id == id) else {
+    // Книга GAL только читается: назначить её нельзя.
+    let Some(mut c) = all.into_iter().find(|c| c.id == id && !c.is_gal()) else {
         return Ok(());
     };
     if !c.is_default {
@@ -283,7 +367,7 @@ pub(crate) async fn set(
                         "isDefault": default_book(&books) == Some(id),
                         "isSubscribed": subscribed,
                         "shareWith": null,
-                        "myRights": rights(),
+                        "myRights": rights(false),
                     }),
                 );
             }
@@ -305,6 +389,11 @@ pub(crate) async fn set(
             out.not_updated.insert(id, set_error("notFound", None, &[]));
             continue;
         };
+        if c.is_gal() {
+            out.not_updated
+                .insert(id, set_error("forbidden", None, &[]));
+            continue;
+        }
         if let Err(e) = apply_props(&mut c, &patch, false) {
             out.not_updated.insert(id, e);
             continue;
@@ -328,6 +417,11 @@ pub(crate) async fn set(
                 .insert(id, set_error("notFound", None, &[]));
             continue;
         };
+        if c.is_gal() {
+            out.not_destroyed
+                .insert(id, set_error("forbidden", None, &[]));
+            continue;
+        }
         if !extra.on_destroy_remove_contents
             && !store.list_objects(ctx.scope, c.id).await?.is_empty()
         {

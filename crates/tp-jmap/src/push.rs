@@ -107,9 +107,11 @@ impl States {
             None => None,
         };
         let contacts = match &jmap.dav {
-            Some(d) => Some(state_string(
-                d.state(scope, CollectionKind::AddressBook).await?,
-            )),
+            Some(d) => Some(
+                crate::contacts::State::load(d.as_ref(), scope)
+                    .await?
+                    .to_string(),
+            ),
             None => None,
         };
         let calendars = match &jmap.dav {
