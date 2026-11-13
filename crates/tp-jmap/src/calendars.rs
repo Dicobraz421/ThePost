@@ -3,12 +3,13 @@
 //!
 //! Редакция: draft-ietf-jmap-calendars (текущий черновик IETF, SRS 4.4 «по мере стабилизации», решение 35) с
 //! JSCalendar 2.0 (draft-ietf-calext-jscalendarbis — его реализует calcard). Отличия от черновика:
-//! - `isSubscribed`, `isVisible` — читаются из коллекции (CTR-56); запись `false` — `invalidProperties` (JMAP-36);
-//! - `isDefault` — назначенный календарь, иначе с сегментом URL `default`, иначе первый по порядку
-//!   (`tp_contracts::dav::default_of`); `onSuccessSetIsDefault` для другого календаря — `invalidArguments` (JMAP-36);
+//! - `isSubscribed`, `isVisible`, `defaultAlertsWithTime`, `defaultAlertsWithoutTime` — поля коллекции (CTR-56,
+//!   JMAP-36); у оповещения по умолчанию `trigger` — `OffsetTrigger`; единственность их `id` в учётной записи не
+//!   проверяется;
+//! - `isDefault` — назначенный календарь (`onSuccessSetIsDefault`, `Collection::is_default`), иначе с сегментом URL
+//!   `default`, иначе первый по порядку (`tp_contracts::dav::default_of`);
 //! - `includeInAvailability` — `all` или `none` (`schedule-calendar-transp` CalDAV, `Collection::transparent`);
 //!   `attending` — `invalidProperties`;
-//! - `defaultAlertsWithTime`, `defaultAlertsWithoutTime` — читаются из коллекции; запись — только `null` (JMAP-36);
 //! - `shareWith`, `myRights` — права владельца, общий доступ — JMAP-32; `participantIdentities`,
 //!   `CalendarEventNotification`, `Principal` — JMAP-30, JMAP-31.
 //!
@@ -24,7 +25,7 @@ use serde_json::{Map, Value, json};
 use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore, default_of};
 use tp_contracts::meta::AccountScope;
 
-use crate::contacts::store_error;
+use crate::contacts::{set_default, store_error};
 use crate::core::Ctx;
 use crate::core::config::CalendarsConfig;
 use crate::core::error::{MethodError, MethodResult, changes_error, set_error};
@@ -171,6 +172,26 @@ struct CalendarSetArgs {
     on_success_set_is_default: Option<String>,
 }
 
+/// Оповещения по умолчанию из значения `/set`: `null` — нет; `Id[Alert]` JSCalendar, у каждого `trigger` —
+/// `OffsetTrigger` (draft-ietf-jmap-calendars) — текст JSON для [`Collection`]; иначе — `Err`.
+fn default_alerts(v: &Value) -> Result<Option<String>, ()> {
+    let alerts = match v {
+        Value::Null => return Ok(None),
+        Value::Object(m) => m,
+        _ => return Err(()),
+    };
+    let offset = |t: &Value| {
+        t.get("@type").is_none_or(|x| x == "OffsetTrigger")
+            && t.get("offset").is_some_and(Value::is_string)
+    };
+    let ok = alerts.values().all(|a| {
+        a.is_object()
+            && a.get("@type").is_none_or(|x| x == "Alert")
+            && a.get("trigger").is_some_and(offset)
+    });
+    if ok { Ok(Some(v.to_string())) } else { Err(()) }
+}
+
 /// Применяет свойства `/set` к коллекции; ошибка — `invalidProperties`.
 fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value> {
     let Value::Object(p) = v else {
@@ -218,10 +239,21 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
                 c.transparent = s == "none";
                 true
             }
-            ("isSubscribed" | "isVisible", Value::Bool(true))
-            | ("shareWith" | "defaultAlertsWithTime" | "defaultAlertsWithoutTime", Value::Null) => {
+            ("isSubscribed", Value::Bool(b)) => {
+                c.subscribed = *b;
                 true
             }
+            ("isVisible", Value::Bool(b)) => {
+                c.visible = *b;
+                true
+            }
+            ("defaultAlertsWithTime", v) => {
+                default_alerts(v).map(|a| c.alerts_with_time = a).is_ok()
+            }
+            ("defaultAlertsWithoutTime", v) => {
+                default_alerts(v).map(|a| c.alerts_without_time = a).is_ok()
+            }
+            ("shareWith", Value::Null) => true,
             _ => false,
         };
         if !ok {
@@ -240,8 +272,9 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
     })
 }
 
-/// `Calendar/set`: создание, изменение (имя, описание, цвет, порядок, пояс, `includeInAvailability`), удаление
-/// (`onDestroyRemoveEvents`).
+/// `Calendar/set`: создание, изменение (имя, описание, цвет, порядок, пояс, `includeInAvailability`, подписка,
+/// видимость, оповещения по умолчанию), удаление (`onDestroyRemoveEvents`), календарь по умолчанию
+/// (`onSuccessSetIsDefault`).
 pub(crate) async fn set(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -259,21 +292,6 @@ pub(crate) async fn set(
     if a.if_in_state.as_ref().is_some_and(|s| *s != old) {
         return Err(MethodError::new("stateMismatch"));
     }
-    let before = store.list_collections(ctx.scope, KIND).await?;
-    if let Some(want) = &extra.on_success_set_is_default {
-        // Признак не хранится: допустимо только то, что и так станет календарём по умолчанию.
-        let ok = match want.strip_prefix('#') {
-            Some(cid) => {
-                before.is_empty() && a.create.as_ref().is_some_and(|c| c.contains_key(cid))
-            }
-            None => default_calendar(&before).is_some_and(|d| d.to_string() == *want),
-        };
-        if !ok {
-            return Err(MethodError::invalid(
-                "onSuccessSetIsDefault: changing the default calendar is not supported",
-            ));
-        }
-    }
     let mut out = SetOutcome::default();
     for (cid, v) in a.create.unwrap_or_default() {
         let mut c = Collection::new(KIND, DEFAULT_NAME);
@@ -283,6 +301,9 @@ pub(crate) async fn set(
             continue;
         }
         let (id, include) = (c.id, availability(&c));
+        let (subscribed, visible) = (c.subscribed, c.visible);
+        let with_time = alerts(c.alerts_with_time.as_deref());
+        let without_time = alerts(c.alerts_without_time.as_deref());
         match store.create_collection(ctx.scope, c).await {
             Ok(_) => {
                 ctx.created.insert(cid.clone(), id.to_string());
@@ -292,11 +313,11 @@ pub(crate) async fn set(
                     json!({
                         "id": id.to_string(),
                         "isDefault": default_calendar(&books) == Some(id),
-                        "isSubscribed": true,
-                        "isVisible": true,
+                        "isSubscribed": subscribed,
+                        "isVisible": visible,
                         "includeInAvailability": include,
-                        "defaultAlertsWithTime": null,
-                        "defaultAlertsWithoutTime": null,
+                        "defaultAlertsWithTime": with_time,
+                        "defaultAlertsWithoutTime": without_time,
                         "shareWith": null,
                         "myRights": rights(),
                     }),
@@ -356,6 +377,8 @@ pub(crate) async fn set(
             }
         }
     }
+    let want = extra.on_success_set_is_default.as_deref();
+    set_default(ctx, store.as_ref(), KIND, want, &mut out).await?;
     let new = state(store.as_ref(), ctx.scope).await?;
     Ok(out.response(&a.account_id, &old, &new))
 }
@@ -457,7 +480,7 @@ pub(crate) mod tests {
             json!({"accountId": acc, "ifInState": state0, "create": {
                 "c": {"name": "Работа", "color": "#ff0000", "sortOrder": 2, "timeZone": "Europe/Moscow",
                       "isSubscribed": true, "includeInAvailability": "none"},
-                "bad": {"color": 5, "includeInAvailability": "attending", "isSubscribed": false,
+                "bad": {"color": 5, "includeInAvailability": "attending", "isSubscribed": 1,
                         "timeZone": "Mars/Olympus"}}}),
         )
         .await;
@@ -639,36 +662,135 @@ pub(crate) mod tests {
         assert_eq!(r["destroyed"], json!([full]), "{r}");
     }
 
+    /// Смена календаря по умолчанию, скрытие и подписка, оповещения по умолчанию (JMAP-36).
     #[tokio::test]
-    async fn default_calendar() {
+    async fn default_hidden_and_alerts() {
+        use crate::contacts::tests::defaults;
         let env = Env::new().await;
         let acc = env.account();
         let a = create_calendar(&env, "A").await;
         let b = create_calendar(&env, "B").await;
         let g = call(&env, "Calendar/get", json!({"accountId": acc})).await;
-        let defaults: Vec<&Value> = g["list"]
-            .as_array()
-            .expect("list")
-            .iter()
-            .filter(|x| x["isDefault"] == true)
-            .collect();
-        assert_eq!(defaults.len(), 1, "{g}");
-        let default = defaults[0]["id"].as_str().expect("id");
-        let other = if default == a { &b } else { &a };
+        let before = defaults(&g);
+        assert_eq!(before.len(), 1, "{g}");
+        let other = if before[0] == a { &b } else { &a };
+        let with_time = json!({"a1": {"@type": "Alert", "action": "display",
+            "trigger": {"@type": "OffsetTrigger", "offset": "-PT15M"}}});
+        let without_time = json!({"a2": {"trigger": {"offset": "-PT12H", "relativeTo": "start"}}});
+
         let r = call(
             &env,
             "Calendar/set",
-            json!({"accountId": acc, "onSuccessSetIsDefault": default}),
+            json!({"accountId": acc, "update": {other: {
+                    "isVisible": false, "isSubscribed": false,
+                    "defaultAlertsWithTime": with_time, "defaultAlertsWithoutTime": without_time}},
+                "onSuccessSetIsDefault": other}),
+        )
+        .await;
+        assert_eq!(r["updated"][other], json!({"isDefault": true}), "{r}");
+        assert_eq!(r["updated"][&before[0]], json!({"isDefault": false}), "{r}");
+        let g = call(
+            &env,
+            "Calendar/get",
+            json!({"accountId": acc, "ids": [other]}),
+        )
+        .await;
+        let cal = &g["list"][0];
+        assert_eq!(cal["isDefault"], true, "{g}");
+        assert_eq!(cal["isVisible"], false, "{g}");
+        assert_eq!(cal["isSubscribed"], false, "{g}");
+        assert_eq!(cal["defaultAlertsWithTime"], with_time, "{g}");
+        assert_eq!(cal["defaultAlertsWithoutTime"], without_time, "{g}");
+        let g = call(&env, "Calendar/get", json!({"accountId": acc})).await;
+        assert_eq!(defaults(&g), [other.as_str()], "{g}");
+
+        // Событие без календаря — в календарь по умолчанию.
+        let r = call(
+            &env,
+            "CalendarEvent/set",
+            json!({"accountId": acc, "create": {"e": {
+                "@type": "Event", "title": "X", "start": "2026-03-01T10:00:00",
+                "duration": "PT1H", "timeZone": "Europe/Moscow"}}}),
+        )
+        .await;
+        let e = r["created"]["e"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"));
+        let g = call(
+            &env,
+            "CalendarEvent/get",
+            json!({"accountId": acc, "ids": [e]}),
+        )
+        .await;
+        assert_eq!(g["list"][0]["calendarIds"], json!({other: true}), "{g}");
+
+        // `useDefaultAlerts`: событие получает оповещения календаря (весь день — свои), а не собственные.
+        let own = json!({"own": {"trigger": {"@type": "OffsetTrigger", "offset": "-PT1M"}}});
+        let r = call(
+            &env,
+            "CalendarEvent/set",
+            json!({"accountId": acc, "create": {
+                "timed": {"calendarIds": {other: true}, "title": "Встреча", "start": "2026-03-02T10:00:00",
+                    "duration": "PT1H", "useDefaultAlerts": true, "alerts": own},
+                "day": {"calendarIds": {other: true}, "title": "День", "start": "2026-03-03T00:00:00",
+                    "duration": "P1D", "showWithoutTime": true, "useDefaultAlerts": true},
+                "plain": {"calendarIds": {other: true}, "title": "Своё", "start": "2026-03-04T10:00:00",
+                    "duration": "PT1H", "alerts": own}}}),
+        )
+        .await;
+        assert!(r["notCreated"].is_null(), "{r}");
+        let ids: Vec<&str> = ["timed", "day", "plain"]
+            .iter()
+            .map(|k| r["created"][k]["id"].as_str().expect("id"))
+            .collect();
+        let g = call(
+            &env,
+            "CalendarEvent/get",
+            json!({"accountId": acc, "ids": ids}),
+        )
+        .await;
+        assert_eq!(g["list"][0]["alerts"], with_time, "{g}");
+        assert_eq!(g["list"][1]["alerts"], without_time, "{g}");
+        assert_eq!(
+            g["list"][2]["alerts"]["own"]["trigger"]["offset"], "-PT1M",
+            "{g}"
+        );
+
+        // Снова видим; оповещения — `null`; неверные оповещения — `invalidProperties`.
+        let r = call(
+            &env,
+            "Calendar/set",
+            json!({"accountId": acc, "update": {
+                other: {"isVisible": true, "defaultAlertsWithTime": null},
+                &before[0]: {"defaultAlertsWithoutTime": {"x": {"trigger": {"@type": "AbsoluteTrigger",
+                    "when": "2026-01-01T00:00:00Z"}}}}}}),
+        )
+        .await;
+        assert!(r["updated"][other].is_null(), "{r}");
+        assert_eq!(
+            r["notUpdated"][&before[0]]["properties"],
+            json!(["defaultAlertsWithoutTime"]),
+            "{r}"
+        );
+        let g = call(
+            &env,
+            "Calendar/get",
+            json!({"accountId": acc, "ids": [other]}),
+        )
+        .await;
+        assert_eq!(g["list"][0]["isVisible"], true, "{g}");
+        assert!(g["list"][0]["defaultAlertsWithTime"].is_null(), "{g}");
+
+        // Неизвестный календарь — без ошибки, признак на месте.
+        let r = call(
+            &env,
+            "Calendar/set",
+            json!({"accountId": acc, "onSuccessSetIsDefault": "nope"}),
         )
         .await;
         assert!(r["newState"].is_string(), "{r}");
-        let r = call(
-            &env,
-            "Calendar/set",
-            json!({"accountId": acc, "onSuccessSetIsDefault": other}),
-        )
-        .await;
-        assert_eq!(r["type"], "invalidArguments", "{r}");
+        let g = call(&env, "Calendar/get", json!({"accountId": acc})).await;
+        assert_eq!(defaults(&g), [other.as_str()], "{g}");
     }
 
     /// Изменение календаря → push `Calendar`, `CalendarEvent`; состояние контактов не меняется.

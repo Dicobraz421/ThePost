@@ -2,11 +2,13 @@
 //! `/set`, `/copy` поверх [`DavStore`].
 //!
 //! Хранится vCard — тот же объект, что читает и пишет CardDAV; JSContact ↔ vCard — calcard, индекс объекта —
-//! `tp_dav::index::card`. Карточка — в одной адресной книге (`maxAddressBooksPerCard` = 1): перенос между книгами
-//! сменой `addressBookIds` не поддерживается (контракт не переносит объект с сохранением `id`). `/copy` — между
-//! учётными записями, а доступна только своя: чужая — `fromAccountNotFound`. Запрос читает карточки книг и
-//! фильтрует в памяти (фильтры RFC 9610 §3.3.1; `text` — имя, псевдонимы, организации, адреса, телефоны, сервисы,
-//! почтовые адреса, заметки).
+//! `tp_dav::index::card`. Карточка — в одной адресной книге (`maxAddressBooksPerCard` = 1); смена `addressBookIds`
+//! переносит её в другую книгу с прежним `id` ([`DavStore::move_object`], JMAP-34). `/copy` — между учётными
+//! записями, а доступна только своя: чужая — `fromAccountNotFound`. Фильтры запроса — RFC 9610 §3.3.1 (`text` — имя,
+//! псевдонимы, организации, адреса, телефоны, сервисы, почтовые адреса, заметки). Условие `name`, `name/given`,
+//! `name/surname` или `email` (само или внутри `AND`) берёт кандидатов из поискового индекса
+//! ([`DavStore::find_cards`]: полное имя, части имени, псевдонимы, адреса e-mail) и проверяется по карточке; прочие
+//! фильтры, в том числе `text` (ищет и по полям вне индекса), — перебором карточек книг.
 
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -18,8 +20,8 @@ use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use tp_contracts::Error;
 use tp_contracts::dav::{
-    CollectionId, DavObject, DavObjectId, DavStore, DeleteOutcome, ObjectIndex, Precondition,
-    PutOutcome,
+    CollectionId, DavObject, DavObjectId, DavStore, DeleteOutcome, MoveOutcome, ObjectIndex,
+    Precondition, PutOutcome,
 };
 use tp_contracts::meta::AccountScope;
 
@@ -261,7 +263,7 @@ fn matches(filter: &Value, card: &Map<String, Value>) -> MethodResult<bool> {
         let ok = match key.as_str() {
             "inAddressBook" => {
                 let id = val.as_str().ok_or_else(unsupported)?;
-                card["addressBookIds"].get(id).is_some()
+                card.get("addressBookIds").and_then(|b| b.get(id)).is_some()
             }
             "hasMember" => {
                 let uid = val.as_str().ok_or_else(unsupported)?;
@@ -321,6 +323,53 @@ fn sort_key(card: &Map<String, Value>, prop: &str) -> String {
     }
 }
 
+/// Условия, кандидатов которых даёт поисковый индекс карточки: его строки (полное имя, части имени, псевдонимы,
+/// адреса e-mail) содержат всё, в чём ищут эти условия.
+const INDEXED: [&str; 4] = ["name", "name/given", "name/surname", "email"];
+
+/// Строка для выборки кандидатов по индексу: самое длинное значение условий [`INDEXED`] фильтра — самого
+/// условия или одного из условий `AND` (на любом уровне); иначе — `None` (нужен перебор всех карточек).
+fn index_needle(filter: &Value) -> Option<String> {
+    let f = filter.as_object()?;
+    let found = match f.get("operator") {
+        Some(op) if op == "AND" => f
+            .get("conditions")?
+            .as_array()?
+            .iter()
+            .filter_map(index_needle)
+            .max_by_key(String::len),
+        Some(_) => None,
+        None => INDEXED
+            .iter()
+            .filter_map(|k| f.get(*k)?.as_str())
+            .map(|v| v.trim().to_lowercase())
+            .max_by_key(String::len),
+    };
+    found.filter(|n| !n.is_empty())
+}
+
+/// Кандидаты запроса по индексу ([`DavStore::find_cards`]) из книг `books`. Выборка книги, обрезанная пределом
+/// (больше объектов, чем допускает книга, — лимиты хранилища изменились), заменяется всеми карточками книги.
+async fn candidates(
+    store: &dyn DavStore,
+    scope: AccountScope,
+    books: &[CollectionId],
+    needle: &str,
+) -> MethodResult<Vec<DavObject>> {
+    let limit = store.limits().max_objects.saturating_add(1);
+    let mut out = Vec::new();
+    for b in books {
+        match store.find_cards(scope, *b, needle, limit).await {
+            Ok(found) if found.len() < limit => out.extend(found),
+            Ok(_) => out.extend(load(store, scope, std::slice::from_ref(b)).await?),
+            // Книгу удалили между запросами.
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryArgs {
@@ -343,8 +392,12 @@ async fn run_query(ctx: &Ctx<'_>, a: &QueryArgs) -> MethodResult<Vec<String>> {
     let store = ctx.jmap.dav_store()?;
     let books = book_ids(store.as_ref(), ctx.scope).await?;
     let filter = a.filter.as_ref().filter(|f| !f.is_null());
+    let objects = match filter.and_then(index_needle) {
+        Some(needle) => candidates(store.as_ref(), ctx.scope, &books, &needle).await?,
+        None => load(store.as_ref(), ctx.scope, &books).await?,
+    };
     let mut cards = Vec::new();
-    for obj in load(store.as_ref(), ctx.scope, &books).await? {
+    for obj in objects {
         let card = card_json(&obj);
         if match filter {
             Some(f) => matches(f, &card)?,
@@ -534,20 +587,47 @@ async fn update_one(ctx: &Ctx<'_>, id: &str, patch: &Value) -> MethodResult<Resu
     if card.get("uid") != before.get("uid") {
         return Ok(Err(invalid("uid cannot be changed", &["uid"])));
     }
-    let book = obj.collection.to_string();
-    if card.get("addressBookIds").and_then(single_book) != Some(book.as_str()) {
-        let why = "moving a card to another address book is not supported";
+    let Some(to) = card
+        .get("addressBookIds")
+        .and_then(single_book)
+        .and_then(|id| CollectionId::from_str(ctx.resolve_id(id)).ok())
+    else {
+        let why = "exactly one existing address book is required";
         return Ok(Err(invalid(why, &["addressBookIds"])));
-    }
+    };
     let now = utc_date(OffsetDateTime::now_utc());
     card.insert("updated".into(), now.clone());
     let (body, index) = match to_vcard(card) {
         Ok(x) => x,
         Err(e) => return Ok(Err(e)),
     };
-    let pre = Precondition::IfMatch(obj.etag.clone());
+    let mut etag = obj.etag.clone();
+    if to != obj.collection {
+        // Перенос в другую книгу (JMAP-34): тот же объект и `id`, затем запись изменённой карточки.
+        let pre = Precondition::IfMatch(obj.etag.clone());
+        match store
+            .move_object(ctx.scope, obj.collection, &obj.name, to, pre)
+            .await
+        {
+            Ok(MoveOutcome::Moved(m)) => etag = m.etag,
+            Ok(MoveOutcome::UidConflict { .. }) => {
+                let why = "uid is used by another card of the address book";
+                return Ok(Err(invalid(why, &["uid"])));
+            }
+            Ok(MoveOutcome::PreconditionFailed) => {
+                let why = "the card was changed concurrently or its resource name is taken in the address book";
+                return Ok(Err(set_error("serverFail", Some(why), &[])));
+            }
+            Err(Error::NotFound | Error::Invalid(_)) => {
+                let why = "exactly one existing address book is required";
+                return Ok(Err(invalid(why, &["addressBookIds"])));
+            }
+            Err(e) => return Ok(Err(store_error(e)?)),
+        }
+    }
+    let pre = Precondition::IfMatch(etag);
     let put = store
-        .put_object(ctx.scope, obj.collection, &obj.name, body, index, pre)
+        .put_object(ctx.scope, to, &obj.name, body, index, pre)
         .await;
     Ok(put_error(put)?.map(|_| {
         if patch.contains_key("updated") {
@@ -653,31 +733,27 @@ pub(crate) mod tests {
     use crate::contacts::tests::{call, create_book};
     use crate::testenv::{Env, http10};
 
-    /// Корпус vCard: полная карточка, организация, vCard 3.0 с группой и расширениями.
-    const CORPUS: &[(&str, &str)] = &[
-        (
-            "ivan.vcf",
-            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:urn:uuid:11111111-2222-3333-4444-555555555555\r\n\
-             FN:Иван Петров\r\nN:Петров;Иван;Сергеевич;;\r\nNICKNAME:Ваня\r\n\
-             EMAIL;TYPE=work;PREF=1:ivan@example.org\r\nEMAIL;TYPE=home:vanya@example.com\r\n\
-             TEL;TYPE=cell:+7 900 123-45-67\r\nORG:ООО Ромашка;Отдел продаж\r\nTITLE:Менеджер\r\n\
-             ADR;TYPE=work:;;ул. Ленина\\, 1;Москва;;101000;Россия\r\nBDAY:19850412\r\n\
-             NOTE:Заметка\\nвторая строка\r\nCATEGORIES:друзья,работа\r\nX-CUSTOM;X-P=1:значение\r\n\
-             URL:https://example.org/ivan\r\nREV:20261101T100000Z\r\nEND:VCARD\r\n",
-        ),
-        (
-            "romashka.vcf",
-            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:org-romashka\r\nKIND:org\r\nFN:ООО Ромашка\r\n\
-             ORG:ООО Ромашка\r\nEMAIL:info@romashka.example\r\nTEL;TYPE=work,voice:+7 495 000-00-00\r\n\
-             END:VCARD\r\n",
-        ),
-        (
-            "anna.vcf",
-            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:anna-3\r\nFN:Anna Schmidt\r\nN:Schmidt;Anna;;;\r\n\
-             item1.EMAIL;TYPE=INTERNET:anna@example.net\r\nitem1.X-ABLabel:Личная\r\n\
-             TEL;TYPE=HOME:+49 30 1234567\r\nX-PHONETIC-FIRST-NAME:Anna\r\nEND:VCARD\r\n",
-        ),
-    ];
+    /// Корпус vCard `tp-testkit` (KIT-09); карточке без `UID` (выгрузки клиентов) — `UID` по имени файла: CardDAV
+    /// его требует (RFC 6352 §5.1).
+    async fn corpus() -> Vec<(String, String)> {
+        let cards = tokio::task::spawn_blocking(tp_testkit::vcards)
+            .await
+            .expect("join")
+            .expect("corpus");
+        assert!(!cards.is_empty());
+        cards
+            .into_iter()
+            .map(|c| {
+                let text = if c.text.lines().any(|l| l.starts_with("UID")) {
+                    c.text
+                } else {
+                    let uid = format!("BEGIN:VCARD\r\nUID:corpus-{}\r\n", c.name);
+                    c.text.replacen("BEGIN:VCARD\r\n", &uid, 1)
+                };
+                (format!("{}.vcf", c.name), text)
+            })
+            .collect()
+    }
 
     /// Сервер CardDAV поверх того же хранилища и входа.
     pub(crate) async fn dav(env: &Env) -> std::net::SocketAddr {
@@ -735,6 +811,22 @@ pub(crate) mod tests {
         v
     }
 
+    /// Параметр `PREF` без значения (vCard 2.1, свойство вне JSContact): calcard читает его как `"0"`, а пишет
+    /// `PREF=`, которое читает как `""`. Значения нет в обоих случаях; для сравнения — `""`.
+    fn bare_pref(mut v: Value) -> Value {
+        if let Some(props) = v
+            .pointer_mut("/vCard/properties")
+            .and_then(Value::as_array_mut)
+        {
+            for p in props {
+                if p[1]["pref"] == "0" {
+                    p[1]["pref"] = json!("");
+                }
+            }
+        }
+        v
+    }
+
     /// JSContact из vCard (calcard) для сравнения.
     fn jscontact(vcard: &str) -> Value {
         let js = VCard::parse(vcard)
@@ -753,7 +845,8 @@ pub(crate) mod tests {
         format!("/dav/addressbooks/user@example.org/{}/", c.name)
     }
 
-    /// Карточки, записанные CardDAV, читаются JMAP без потери полей; изменение из JMAP сохраняет остальное.
+    /// Корпус vCard туда и обратно: карточки, записанные CardDAV, читаются JMAP без потери полей; запись из JMAP
+    /// (vCard заново из JSContact) сохраняет все поля, изменение — только то, что изменено.
     #[tokio::test]
     async fn carddav_to_jmap() {
         let env = Env::new().await;
@@ -761,14 +854,34 @@ pub(crate) mod tests {
         let addr = dav(&env).await;
         let book = create_book(&env, "Контакты").await;
         let base = book_path(&env, &book).await;
-        for (name, body) in CORPUS {
+        let corpus = corpus().await;
+        for (name, body) in &corpus {
+            if body.contains("\r\nVERSION:2.1\r\n") {
+                // CardDAV принимает vCard 3.0 и 4.0 (`supported-address-data`); выгрузку 2.1 кладёт импорт —
+                // прямо в хранилище.
+                let index = tp_dav::index::card(body).expect("index");
+                let put = env
+                    .dav
+                    .put_object(
+                        env.scope,
+                        book.parse().expect("id"),
+                        name,
+                        body.clone(),
+                        index,
+                        tp_contracts::dav::Precondition::Any,
+                    )
+                    .await;
+                assert!(put.is_ok(), "{name}: {put:?}");
+                continue;
+            }
             let (status, resp) = dav_request(addr, "PUT", &format!("{base}{name}"), body).await;
             assert_eq!(status, 201, "{name}: {resp}");
         }
         let got = call(&env, "ContactCard/get", json!({"accountId": acc})).await;
         let list = got["list"].as_array().expect("list");
-        assert_eq!(list.len(), CORPUS.len(), "{got}");
-        for (name, body) in CORPUS {
+        assert_eq!(list.len(), corpus.len(), "{got}");
+        let mut lost: Vec<&str> = Vec::new();
+        for (name, body) in &corpus {
             let want = jscontact(body);
             let card = list
                 .iter()
@@ -776,38 +889,52 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("{name}: {got}"));
             assert_eq!(card["addressBookIds"], json!({&book: true}), "{name}");
             assert_eq!(plain(card), want, "{name}");
-        }
-        let ivan = list
-            .iter()
-            .find(|c| c["name"]["full"] == "Иван Петров")
-            .expect("ivan");
-        assert_eq!(
-            ivan["emails"]["k1"]["address"], "ivan@example.org",
-            "{ivan}"
-        );
-        assert_eq!(ivan["organizations"]["k1"]["name"], "ООО Ромашка", "{ivan}");
 
-        // Изменение из JMAP: новая заметка и телефон; остальные поля vCard — как были.
-        let id = ivan["id"].as_str().expect("id");
+            // Обратно: JMAP пишет vCard заново из JSContact — поля те же.
+            let id = card["id"].as_str().expect("id");
+            let r = call(
+                &env,
+                "ContactCard/set",
+                json!({"accountId": acc, "update": {id: {}}}),
+            )
+            .await;
+            assert!(r["notUpdated"].is_null(), "{name}: {r}");
+            let (status, back) = dav_request(addr, "GET", &format!("{base}{name}"), "").await;
+            assert_eq!(status, 200, "{name}: {back}");
+            let (back_js, want) = (bare_pref(jscontact(&back)), bare_pref(want));
+            if back_js != want {
+                eprintln!("{name}: {back}\n  было: {want}\n  стало: {back_js}");
+                lost.push(name);
+            }
+        }
+        // Известная потеря calcard при записи vCard из JSContact: `TZ;VALUE=TEXT` (выгрузка Thunderbird)
+        // записывается пустым, пояс адреса теряется.
+        assert_eq!(lost, ["12-export-thunderbird.vcf"], "потери полей");
+
+        // Изменение из JMAP: новая заметка и телефон; остальные поля vCard, в том числе X-свойства, — как были.
+        let (name, body) = &corpus[0];
+        let want = jscontact(body);
+        let card = list.iter().find(|c| c["uid"] == want["uid"]).expect("card");
+        let id = card["id"].as_str().expect("id");
         let r = call(
             &env,
             "ContactCard/set",
             json!({"accountId": acc, "update": {id: {
-                "notes/k1/note": "Новая заметка",
+                "notes": {"n": {"note": "Новая заметка"}},
                 "phones/p2": {"number": "+7 495 111-22-33"},
                 "nicknames": null,
             }}}),
         )
         .await;
         assert!(r["notUpdated"].is_null(), "{r}");
-        let (status, body) = dav_request(addr, "GET", &format!("{base}ivan.vcf"), "").await;
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("X-CUSTOM;X-P=1:значение"), "{body}");
-        let mut want = jscontact(CORPUS[0].1);
-        want["notes"]["k1"]["note"] = json!("Новая заметка");
+        let (status, back) = dav_request(addr, "GET", &format!("{base}{name}"), "").await;
+        assert_eq!(status, 200, "{back}");
+        assert!(back.contains("X-THEPOST-TEST:"), "{back}");
+        let mut want = want;
+        want["notes"] = json!({"n": {"note": "Новая заметка"}});
         want["phones"]["p2"] = json!({"number": "+7 495 111-22-33"});
         want.as_object_mut().expect("card").remove("nicknames");
-        assert_eq!(jscontact(&body), want, "{body}");
+        assert_eq!(jscontact(&back), want, "{back}");
     }
 
     /// Карточка, созданная JMAP, читается CardDAV; обратно — те же поля.
@@ -1040,7 +1167,7 @@ pub(crate) mod tests {
                 },
                 "update": {
                     &ivan: {"name/full": "Иван Петрович Петров"},
-                    &anna: {"addressBookIds": {&other: true}},
+                    &anna: {"addressBookIds": {&book: true, &other: true}},
                     "nope": {"name/full": "x"},
                 },
                 "destroy": ["nope"]}),
@@ -1118,5 +1245,179 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(r["type"], "invalidArguments", "{r}");
+    }
+
+    /// Смена `addressBookIds` переносит карточку в другую книгу (JMAP-34): прежний `id`, изменение — в
+    /// `ContactCard/changes`, ресурс — в другой книге CardDAV.
+    #[tokio::test]
+    async fn move_between_books() {
+        let env = Env::new().await;
+        let acc = env.account();
+        let addr = dav(&env).await;
+        let work = create_book(&env, "Работа").await;
+        let home = create_book(&env, "Дом").await;
+        let ivan = create_card(&env, &work, "Иван Петров", "Иван", "ivan@example.org").await;
+        let state0 = call(
+            &env,
+            "ContactCard/get",
+            json!({"accountId": acc, "ids": []}),
+        )
+        .await["state"]
+            .clone();
+        let name = env
+            .dav
+            .objects_by_id(env.scope, &[ivan.parse().expect("id")])
+            .await
+            .expect("object")[0]
+            .name
+            .clone();
+
+        let r = call(
+            &env,
+            "ContactCard/set",
+            json!({"accountId": acc, "update": {&ivan: {
+                "addressBookIds": {&home: true}, "name/full": "Иван Сергеевич Петров"}}}),
+        )
+        .await;
+        assert!(
+            r["updated"]
+                .as_object()
+                .is_some_and(|u| u.contains_key(&ivan)),
+            "{r}"
+        );
+        let g = call(
+            &env,
+            "ContactCard/get",
+            json!({"accountId": acc, "ids": [&ivan]}),
+        )
+        .await;
+        assert_eq!(g["list"][0]["id"], json!(ivan), "{g}");
+        assert_eq!(g["list"][0]["addressBookIds"], json!({&home: true}), "{g}");
+        assert_eq!(g["list"][0]["name"]["full"], "Иван Сергеевич Петров", "{g}");
+        let c = call(
+            &env,
+            "ContactCard/changes",
+            json!({"accountId": acc, "sinceState": state0}),
+        )
+        .await;
+        assert_eq!(c["updated"], json!([ivan]), "{c}");
+        assert_eq!(c["created"], json!([]), "{c}");
+        assert_eq!(c["destroyed"], json!([]), "{c}");
+        let q = call(
+            &env,
+            "ContactCard/query",
+            json!({"accountId": acc, "filter": {"inAddressBook": home}}),
+        )
+        .await;
+        assert_eq!(q["ids"], json!([ivan]), "{q}");
+
+        // CardDAV: ресурс с прежним именем — в новой книге, в старой его нет.
+        let (status, body) = dav_request(
+            addr,
+            "GET",
+            &format!("{}{name}", book_path(&env, &home).await),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("FN:Иван Сергеевич Петров"), "{body}");
+        let (status, _) = dav_request(
+            addr,
+            "GET",
+            &format!("{}{name}", book_path(&env, &work).await),
+            "",
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        // Несколько книг или несуществующая книга — отказ, карточка на месте.
+        let r = call(
+            &env,
+            "ContactCard/set",
+            json!({"accountId": acc, "update": {
+                &ivan: {"addressBookIds": {&home: true, &work: true}}}}),
+        )
+        .await;
+        assert_eq!(
+            r["notUpdated"][&ivan]["properties"],
+            json!(["addressBookIds"]),
+            "{r}"
+        );
+        let nope = tp_contracts::dav::CollectionId::new().to_string();
+        let r = call(
+            &env,
+            "ContactCard/set",
+            json!({"accountId": acc, "update": {&ivan: {"addressBookIds": {&nope: true}}}}),
+        )
+        .await;
+        assert_eq!(
+            r["notUpdated"][&ivan]["properties"],
+            json!(["addressBookIds"]),
+            "{r}"
+        );
+        let g = call(
+            &env,
+            "ContactCard/get",
+            json!({"accountId": acc, "ids": [&ivan], "properties": ["addressBookIds"]}),
+        )
+        .await;
+        assert_eq!(g["list"][0]["addressBookIds"], json!({&home: true}), "{g}");
+    }
+
+    /// Запрос по имени и адресу берёт кандидатов из поискового индекса, а не читает все карточки: объект без
+    /// поисковых строк в индексе находит только перебор (`text`).
+    #[tokio::test]
+    async fn query_uses_index() {
+        use tp_contracts::dav::{Component, ObjectIndex, Precondition, PutOutcome};
+        let env = Env::new().await;
+        let acc = env.account();
+        let book = create_book(&env, "Контакты").await;
+        let ivan = create_card(&env, &book, "Иван Петров", "Иван", "ivan@example.org").await;
+        let body = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:hidden\r\nFN:Иван Скрытый\r\nN:Скрытый;Иван;;;\r\n\
+                    EMAIL:hidden@example.org\r\nEND:VCARD\r\n";
+        let put = env
+            .dav
+            .put_object(
+                env.scope,
+                book.parse().expect("id"),
+                "hidden.vcf",
+                body.to_owned(),
+                ObjectIndex::new(Component::Card, "hidden", None),
+                Precondition::Any,
+            )
+            .await
+            .expect("put");
+        let PutOutcome::Stored(hidden) = put else {
+            panic!("put: not stored");
+        };
+        let hidden = hidden.id.to_string();
+        let q = |filter: Value| {
+            let (env, acc) = (&env, acc.clone());
+            async move {
+                call(
+                    env,
+                    "ContactCard/query",
+                    json!({"accountId": acc, "filter": filter}),
+                )
+                .await["ids"]
+                    .clone()
+            }
+        };
+        assert_eq!(q(json!({"name": "иван"})).await, json!([ivan]));
+        assert_eq!(q(json!({"name/given": "иван"})).await, json!([ivan]));
+        assert_eq!(q(json!({"email": "example.org"})).await, json!([ivan]));
+        assert_eq!(q(json!({"email": "hidden"})).await, json!([]));
+        assert_eq!(
+            q(json!({"operator": "AND", "conditions": [
+                {"inAddressBook": book}, {"name/surname": "скрыт"}]}))
+            .await,
+            json!([])
+        );
+        // Перебор: `text`, `OR` — и объект вне индекса.
+        assert_eq!(q(json!({"text": "hidden"})).await, json!([hidden]));
+        assert_eq!(
+            q(json!({"operator": "OR", "conditions": [{"email": "hidden"}]})).await,
+            json!([hidden])
+        );
     }
 }

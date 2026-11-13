@@ -169,6 +169,8 @@ pub struct Jmap {
     pub(crate) profile_signer: Option<Arc<dyn ProfileSigner>>,
     /// Скрипты Sieve и автоответ; `None` — capability `vacationresponse` и `sieve` не объявляются.
     pub(crate) sieve: Option<Arc<dyn SieveStore>>,
+    /// Пределы разбора скриптов Sieve в `SieveScript/set`, `/validate` и capability (JMAP-35).
+    pub(crate) sieve_limits: tp_sieve::Limits,
     /// Календари и контакты; `None` — capability `contacts` и `calendars` не объявляются.
     pub(crate) dav: Option<Arc<dyn DavStore>>,
     /// Занятость учётных записей; `None` — capability `principals:availability` не объявляется.
@@ -294,6 +296,7 @@ impl Jmap {
             mail_flow: None,
             profile_signer: None,
             sieve: None,
+            sieve_limits: tp_sieve::Limits::default(),
             dav: None,
             freebusy: None,
             schedule: None,
@@ -327,6 +330,15 @@ impl Jmap {
     #[must_use]
     pub fn with_sieve(mut self, sieve: Option<Arc<dyn SieveStore>>) -> Self {
         self.sieve = sieve;
+        self
+    }
+
+    /// Пределы разбора скриптов Sieve (JMAP-35, решение 83): те же, с которыми скрипт выполняется при доставке, —
+    /// секция `sieve` (`tp_sieve::SieveConfig::limits`). Ими проверяется текст в `SieveScript/set` и `/validate`,
+    /// их объявляет capability `urn:ietf:params:jmap:sieve`. Не задано — `tp_sieve::Limits::default()`.
+    #[must_use]
+    pub fn with_sieve_limits(mut self, limits: tp_sieve::Limits) -> Self {
+        self.sieve_limits = limits;
         self
     }
 
@@ -505,7 +517,7 @@ impl Jmap {
             caps.insert(SIEVE.into(), crate::sieve::session_capability());
             account_caps.insert(
                 SIEVE.into(),
-                crate::sieve::account_capability(sieve.limits()),
+                crate::sieve::account_capability(sieve.limits(), &self.sieve_limits),
             );
             primary.insert(SIEVE.into(), json!(account));
         }
