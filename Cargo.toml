@@ -37,6 +37,7 @@ tp-jmap = { path = "crates/tp-jmap" }
 tp-dav = { path = "crates/tp-dav" }
 tp-search = { path = "crates/tp-search" }
 tp-admin = { path = "crates/tp-admin" }
+tp-admin-client = { path = "crates/tp-admin-client" }
 # Внешние (SRS 7.4). Добавление/обновление — только полоса deps (класс B).
 anyhow = "1.0.104"
 argon2 = "0.6.0"

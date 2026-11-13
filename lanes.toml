@@ -52,10 +52,11 @@ paths = ["crates/tp-dav/*"]
 paths = ["crates/tp-search/*"]
 
 [lane.admin]
-# admin_client.rs — CLI администратора (`thepost admin …`): клиент Admin API живёт в крейте thepost, но правят его
-# карточки полосы admin вместе с tp-admin (CI-07). Секция выше [lane.app]: первое совпадение — admin, иначе каждая
-# правка CLI была бы PR на две полосы (класс B). Остальные файлы крейта thepost — полоса app.
-paths = ["crates/tp-admin/*", "crates/thepost/src/admin_client.rs"]
+# tp-admin-client — общий клиент Admin API для CLI и текстового интерфейса (решение 118, ADM-44); admin_cli.rs —
+# CLI администратора (`thepost admin …`) в крейте thepost, его правят карточки полосы admin вместе с tp-admin (CI-07).
+# Секция выше [lane.app]: первое совпадение — admin, иначе каждая правка CLI была бы PR на две полосы (класс B).
+# Остальные файлы крейта thepost — полоса app.
+paths = ["crates/tp-admin/*", "crates/tp-admin-client/*", "crates/thepost/src/admin_cli.rs"]
 
 [lane.app]
 paths = ["crates/thepost/*"]

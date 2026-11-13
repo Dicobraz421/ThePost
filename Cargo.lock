@@ -4667,6 +4667,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tp-admin",
+ "tp-admin-client",
  "tp-auth",
  "tp-blob",
  "tp-cluster",
@@ -4961,6 +4962,22 @@ dependencies = [
  "tp-testkit",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "tp-admin-client"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tp-admin",
+ "tp-auth",
+ "tp-contracts",
+ "tp-testkit",
 ]
 
 [[package]]

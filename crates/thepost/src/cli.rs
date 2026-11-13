@@ -9,7 +9,7 @@ use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
 use tp_platform::config::ENV_CONFIG_PATH;
 
-use crate::{admin_client, doctor, local_admin, openapi, secrets, sections, serve, verify};
+use crate::{admin_cli, doctor, local_admin, openapi, secrets, sections, serve, verify};
 
 /// Путь к config.yaml по умолчанию.
 pub const DEFAULT_CONFIG: &str = "/etc/thepost/config.yaml";
@@ -63,7 +63,7 @@ pub enum Command {
     Admin {
         /// Подключение к Admin API.
         #[command(flatten)]
-        api: admin_client::ApiArgs,
+        api: admin_cli::ApiArgs,
         /// Действие.
         #[command(subcommand)]
         action: AdminAction,
@@ -96,7 +96,7 @@ pub enum AdminAction {
     },
     /// Команды Admin API: `thepost admin <ресурс> <действие>`.
     #[command(flatten)]
-    Api(admin_client::ApiAction),
+    Api(admin_cli::ApiAction),
 }
 
 /// Действия с конфигурацией.
@@ -221,7 +221,7 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Admin {
             api,
             action: AdminAction::Api(action),
-        } => admin_client::command(&path, api, action).await,
+        } => admin_cli::command(&path, api, action).await,
         Command::Serve => serve_until_signal(path).await,
         Command::SearchExtract => {
             // Подпроцесс запускается до рантайма (`main`): сюда приходит только вызов из кода.

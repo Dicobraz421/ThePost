@@ -32,6 +32,7 @@ tp-jmap.workspace = true
 tp-dav.workspace = true
 tp-search.workspace = true
 tp-admin.workspace = true
+tp-admin-client.workspace = true
 tp-sys.workspace = true
 schemars.workspace = true
 anyhow.workspace = true

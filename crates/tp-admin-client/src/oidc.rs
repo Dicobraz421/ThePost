@@ -1,12 +1,12 @@
 //! Вход администратора через поставщика OpenID Connect с устройства без браузера (APP-42, решение 2026-11-11
 //! п. 79): OAuth 2.0 Device Authorization Grant (RFC 8628).
 //!
-//! - Поставщик — `auth.oidc` из config.yaml (тот же, чьи токены проверяет узел): из его документа discovery —
-//!   `device_authorization_endpoint` и `token_endpoint`. Клиент и области доступа — секция `cli.oidc`.
-//! - Адрес и код для пользователя — в stderr; токен доступа — единственной строкой в stdout, чтобы он не попал
-//!   в историю оболочки: `export THEPOST_ADMIN_TOKEN="$(…)"`.
-//! - Опрос токена — с паузой `interval` поставщика (нет — `cli.oidc.poll_interval`); `slow_down` увеличивает
-//!   паузу на `cli.oidc.slow_down_step`; срок кода — `expires_in`, но не дольше `cli.oidc.max_wait`.
+//! - Поставщик — `auth.oidc` (тот же, чьи токены проверяет узел): из его документа discovery —
+//!   `device_authorization_endpoint` и `token_endpoint`. Клиент и области доступа — [`DeviceSettings`].
+//! - Адрес и код для пользователя показывает вызывающий ([`DeviceLogin::login`], текст — [`prompt_text`]).
+//! - Опрос токена — с паузой `interval` поставщика (нет — [`DeviceSettings::poll_interval`]); `slow_down`
+//!   увеличивает паузу на [`DeviceSettings::slow_down_step`]; срок кода — `expires_in`, но не дольше
+//!   [`DeviceSettings::max_wait`].
 //!
 //! Библиотеки OAuth нет: три запроса reqwest (решение 2026-10-31 — зависимость дороже своего кода такого объёма).
 
@@ -21,12 +21,25 @@ use tp_auth::OidcConfig;
 use tp_contracts::secrets::{Secret, SecretStore};
 use tp_contracts::tls::{InternalTls, KeySource, Profile};
 
-use crate::sections::{self, AUTH, AuthSection, CLI, CliOidc, CliSection};
+use crate::{Error, Result};
 
 /// Тип разрешения RFC 8628.
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-type CliResult<T> = std::result::Result<T, String>;
+/// Клиент OAuth у поставщика и опрос токена (в config.yaml узла — `cli.oidc`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSettings {
+    /// Идентификатор открытого клиента (public client) с разрешённым Device Authorization Grant.
+    pub client_id: String,
+    /// Запрашиваемые области доступа через пробел.
+    pub scope: String,
+    /// Пауза между опросами токена, если поставщик не задал `interval`.
+    pub poll_interval: Duration,
+    /// Прибавка к паузе на ответ `slow_down`.
+    pub slow_down_step: Duration,
+    /// Наибольшее время ожидания подтверждения, даже если код поставщика действует дольше.
+    pub max_wait: Duration,
+}
 
 /// Документ discovery поставщика: поля для входа с устройства.
 #[derive(Debug, Deserialize)]
@@ -80,26 +93,19 @@ pub struct DeviceLogin {
     http: reqwest::Client,
     issuer: String,
     max_response: usize,
-    cli: CliOidc,
-    client_id: String,
+    settings: DeviceSettings,
 }
 
 impl DeviceLogin {
-    /// Клиент к поставщику `oidc` с настройками `cli`; канал — как у узла (`auth.oidc.tls`, открытый — только dev;
-    /// ключ сертификата клиента `tls.key` — из хранилища `secrets`).
+    /// Клиент к поставщику `oidc` с настройками `settings`; канал — как у узла (`auth.oidc.tls`, открытый — только
+    /// dev; ключ сертификата клиента `tls.key` — из хранилища `secrets`).
     pub async fn new(
         oidc: &OidcConfig,
-        cli: &CliOidc,
+        settings: DeviceSettings,
         profile: Profile,
         secrets: &dyn SecretStore,
-    ) -> CliResult<Self> {
+    ) -> Result<Self> {
         let plaintext = oidc.check(profile).map_err(|e| format!("auth.oidc: {e}"))?;
-        cli.check().map_err(|e| e.to_string())?;
-        let client_id = cli.client_id.clone().ok_or_else(|| {
-            "не задан cli.oidc.client_id — идентификатор открытого клиента (public client) с разрешённым \
-             Device Authorization Grant у поставщика OIDC"
-                .to_owned()
-        })?;
         let key = client_key(&oidc.tls, secrets).await?;
         let tls = oidc.tls.clone();
         let (roots, identity) = tokio::task::spawn_blocking(move || read_tls(&tls, key))
@@ -119,52 +125,55 @@ impl DeviceLogin {
             http: http.build().map_err(|e| format!("клиент HTTP: {e}"))?,
             issuer: oidc.issuer.clone(),
             max_response: oidc.max_response,
-            cli: cli.clone(),
-            client_id,
+            settings,
         })
     }
 
     /// Вход: код устройства → `prompt` (показать пользователю адрес и код) → опрос токена до подтверждения,
     /// отказа или истечения кода. Возвращает токен доступа.
-    pub async fn login(&self, prompt: impl FnOnce(&DeviceCode)) -> CliResult<String> {
+    pub async fn login(&self, prompt: impl FnOnce(&DeviceCode)) -> Result<String> {
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             self.issuer.trim_end_matches('/')
         );
         let d: Discovery = match self.http.get(&discovery_url).send().await {
             Ok(resp) => self.json(&discovery_url, resp).await?,
-            Err(e) => return Err(format!("поставщик OIDC {discovery_url}: {e}")),
+            Err(e) => return Err(fail(format!("поставщик OIDC {discovery_url}: {e}"))),
         };
         if d.issuer != self.issuer {
-            return Err(format!(
+            return Err(fail(format!(
                 "поставщик OIDC: издатель в discovery {:?} не совпадает с auth.oidc.issuer {:?}",
                 d.issuer, self.issuer
-            ));
+            )));
         }
         let device_endpoint = d.device_authorization_endpoint.ok_or_else(|| {
-            format!(
+            fail(format!(
                 "поставщик OIDC {} не объявляет device_authorization_endpoint: вход с устройства (RFC 8628) \
                  не поддерживается или выключен",
                 self.issuer
-            )
+            ))
         })?;
 
+        let s = &self.settings;
         let code: DeviceCode = self
             .post(
                 &device_endpoint,
-                &[("client_id", &self.client_id), ("scope", &self.cli.scope)],
+                &[("client_id", &s.client_id), ("scope", &s.scope)],
             )
             .await?
-            .map_err(|e| format!("поставщик OIDC отказал в коде устройства: {}", e.text()))?;
+            .map_err(|e| {
+                fail(format!(
+                    "поставщик OIDC отказал в коде устройства: {}",
+                    e.text()
+                ))
+            })?;
         prompt(&code);
 
         let expired =
-            || "код устройства истёк: вход не подтверждён вовремя — повторите команду".to_owned();
-        let lifetime = Duration::from_secs(code.expires_in).min(self.cli.max_wait);
+            || fail("код устройства истёк: вход не подтверждён вовремя — повторите команду");
+        let lifetime = Duration::from_secs(code.expires_in).min(s.max_wait);
         let deadline = tokio::time::Instant::now() + lifetime;
-        let mut interval = code
-            .interval
-            .map_or(self.cli.poll_interval, Duration::from_secs);
+        let mut interval = code.interval.map_or(s.poll_interval, Duration::from_secs);
         loop {
             if tokio::time::Instant::now() + interval >= deadline {
                 return Err(expired());
@@ -176,7 +185,7 @@ impl DeviceLogin {
                     &[
                         ("grant_type", DEVICE_GRANT),
                         ("device_code", &code.device_code),
-                        ("client_id", &self.client_id),
+                        ("client_id", &s.client_id),
                     ],
                 )
                 .await?;
@@ -184,12 +193,17 @@ impl DeviceLogin {
                 Ok(token) => return Ok(token.access_token),
                 Err(e) => match e.error.as_str() {
                     "authorization_pending" => {}
-                    "slow_down" => interval += self.cli.slow_down_step,
+                    "slow_down" => interval += s.slow_down_step,
                     "expired_token" => return Err(expired()),
                     "access_denied" => {
-                        return Err("вход отклонён на странице поставщика OIDC".to_owned());
+                        return Err(fail("вход отклонён на странице поставщика OIDC"));
                     }
-                    _ => return Err(format!("поставщик OIDC отказал в токене: {}", e.text())),
+                    _ => {
+                        return Err(fail(format!(
+                            "поставщик OIDC отказал в токене: {}",
+                            e.text()
+                        )));
+                    }
                 },
             }
         }
@@ -200,7 +214,7 @@ impl DeviceLogin {
         &self,
         url: &str,
         form: &[(&str, &str)],
-    ) -> CliResult<std::result::Result<T, OAuthError>> {
+    ) -> Result<std::result::Result<T, OAuthError>> {
         let resp = self
             .http
             .post(url)
@@ -217,22 +231,28 @@ impl DeviceLogin {
         let body = self.body(url, resp).await?;
         match serde_json::from_slice::<OAuthError>(&body) {
             Ok(e) => Ok(Err(e)),
-            Err(_) => Err(format!("поставщик OIDC {url}: HTTP {}", status.as_u16())),
+            Err(_) => Err(fail(format!(
+                "поставщик OIDC {url}: HTTP {}",
+                status.as_u16()
+            ))),
         }
     }
 
-    async fn json<T: DeserializeOwned>(&self, url: &str, resp: reqwest::Response) -> CliResult<T> {
+    async fn json<T: DeserializeOwned>(&self, url: &str, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
         if status != StatusCode::OK {
-            return Err(format!("поставщик OIDC {url}: HTTP {}", status.as_u16()));
+            return Err(fail(format!(
+                "поставщик OIDC {url}: HTTP {}",
+                status.as_u16()
+            )));
         }
         let body = self.body(url, resp).await?;
         serde_json::from_slice(&body)
-            .map_err(|e| format!("поставщик OIDC {url}: ответ не разобран: {e}"))
+            .map_err(|e| fail(format!("поставщик OIDC {url}: ответ не разобран: {e}")))
     }
 
     /// Тело ответа не больше `auth.oidc.max_response`.
-    async fn body(&self, url: &str, mut resp: reqwest::Response) -> CliResult<Vec<u8>> {
+    async fn body(&self, url: &str, mut resp: reqwest::Response) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         while let Some(chunk) = resp
             .chunk()
@@ -240,9 +260,9 @@ impl DeviceLogin {
             .map_err(|e| format!("поставщик OIDC {url}: {e}"))?
         {
             if body.len() + chunk.len() > self.max_response {
-                return Err(format!(
+                return Err(fail(format!(
                     "поставщик OIDC {url}: ответ больше auth.oidc.max_response"
-                ));
+                )));
             }
             body.extend_from_slice(&chunk);
         }
@@ -250,8 +270,13 @@ impl DeviceLogin {
     }
 }
 
+/// Ошибка клиента с текстом `msg`.
+fn fail(msg: impl Into<String>) -> Error {
+    Error::Client(msg.into())
+}
+
 /// Тело `application/x-www-form-urlencoded` (кодировщик формы `url` — тот же, что у строки запроса адреса).
-fn urlencoded(form: &[(&str, &str)]) -> CliResult<String> {
+fn urlencoded(form: &[(&str, &str)]) -> Result<String> {
     let mut url = Url::parse("http://form.invalid/").map_err(|e| e.to_string())?;
     url.query_pairs_mut().extend_pairs(form);
     Ok(url.query().unwrap_or_default().to_owned())
@@ -259,17 +284,22 @@ fn urlencoded(form: &[(&str, &str)]) -> CliResult<String> {
 
 /// Ключ сертификата клиента канала к поставщику (`auth.oidc.tls.key`, PEM) из хранилища `secrets`, как у узла;
 /// `None` — без mTLS. `tls.key_file` не поддерживается (решение 100).
-async fn client_key(tls: &InternalTls, secrets: &dyn SecretStore) -> CliResult<Option<Secret>> {
-    match tls.key_source().map_err(|e| format!("auth.oidc.tls: {e}"))? {
+async fn client_key(tls: &InternalTls, secrets: &dyn SecretStore) -> Result<Option<Secret>> {
+    match tls
+        .key_source()
+        .map_err(|e| format!("auth.oidc.tls: {e}"))?
+    {
         None => Ok(None),
-        Some(KeySource::File(_)) => Err(
-            "auth.oidc.tls.key_file не поддерживается; задайте tls.key: { secret: \"<путь>#<поле>\" }".to_owned(),
-        ),
-        Some(KeySource::Secret(r)) => secrets
-            .get(r)
-            .await
-            .map(Some)
-            .map_err(|e| format!("auth.oidc.tls.key: секрет {}#{}: {e}", r.path(), r.field())),
+        Some(KeySource::File(_)) => Err(fail(
+            "auth.oidc.tls.key_file не поддерживается; задайте tls.key: { secret: \"<путь>#<поле>\" }",
+        )),
+        Some(KeySource::Secret(r)) => secrets.get(r).await.map(Some).map_err(|e| {
+            fail(format!(
+                "auth.oidc.tls.key: секрет {}#{}: {e}",
+                r.path(),
+                r.field()
+            ))
+        }),
     }
 }
 
@@ -277,7 +307,7 @@ async fn client_key(tls: &InternalTls, secrets: &dyn SecretStore) -> CliResult<O
 fn read_tls(
     tls: &InternalTls,
     key: Option<Secret>,
-) -> CliResult<(Vec<reqwest::Certificate>, Option<reqwest::Identity>)> {
+) -> Result<(Vec<reqwest::Certificate>, Option<reqwest::Identity>)> {
     let read =
         |p: &Path| std::fs::read(p).map_err(|e| format!("auth.oidc.tls: {}: {e}", p.display()));
     let roots = match &tls.ca_file {
@@ -316,58 +346,8 @@ pub fn prompt_text(code: &DeviceCode) -> String {
     text
 }
 
-/// Вход с устройства по config.yaml `config`: приглашение — в stderr, токен доступа — строкой в stdout.
-/// Код возврата: 0 — токен получен, 1 — отказ или ошибка.
-pub async fn command(config: &Path) -> i32 {
-    match run(config).await {
-        Ok(token) => {
-            println!("{token}");
-            eprintln!(
-                "thepost: admin: токен OIDC получен; без записи в историю оболочки: \
-                 export {}=\"$(thepost admin login --oidc)\"",
-                crate::admin_client::ENV_TOKEN
-            );
-            0
-        }
-        Err(msg) => {
-            eprintln!("thepost: admin: {msg}");
-            1
-        }
-    }
-}
-
-async fn run(config: &Path) -> CliResult<String> {
-    let registry = sections::registry().map_err(|e| e.to_string())?;
-    let path = config.to_owned();
-    let cfg = tokio::task::spawn_blocking(move || registry.load(&path))
-        .await
-        .map_err(|e| format!("чтение конфигурации прервано: {e}"))?
-        .map_err(|e| format!("{}: {e}", config.display()))?;
-    let auth = cfg
-        .section::<AuthSection>(AUTH)
-        .map_err(|e| format!("{}: секция auth: {e}", config.display()))?;
-    let oidc = auth.oidc.as_ref().ok_or_else(|| {
-        format!(
-            "{}: нет auth.oidc — поставщик OIDC не настроен",
-            config.display()
-        )
-    })?;
-    let cli = cfg
-        .section::<CliSection>(CLI)
-        .map_err(|e| format!("{}: секция cli: {e}", config.display()))?;
-    let secrets = crate::secrets::store(&cfg, None)
-        .await
-        .map_err(|e| format!("{}: хранилище секретов: {e}", config.display()))?;
-    DeviceLogin::new(oidc, &cli.oidc, cfg.profile(), secrets.as_ref())
-        .await?
-        .login(|code| eprint!("{}", prompt_text(code)))
-        .await
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::secrets::NoSecretStore;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -376,6 +356,9 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Form, Json, Router};
     use serde_json::{Value, json};
+    use tp_testkit::MemSecretStore;
+
+    use super::*;
 
     /// Заглушка поставщика: ответы `token_endpoint` по очереди и моменты опросов.
     #[derive(Clone)]
@@ -427,6 +410,30 @@ mod tests {
         (Status::BAD_REQUEST, json!({ "error": error }))
     }
 
+    /// Настройки входа по умолчанию узла (`cli.oidc`) с клиентом `client_id`.
+    fn settings(client_id: &str) -> DeviceSettings {
+        DeviceSettings {
+            client_id: client_id.to_owned(),
+            scope: "openid".to_owned(),
+            poll_interval: Duration::from_secs(5),
+            slow_down_step: Duration::from_secs(5),
+            max_wait: Duration::from_secs(15 * 60),
+        }
+    }
+
+    /// Поставщик `issuer` в профиле dev, открытый канал.
+    fn plaintext_oidc(issuer: String) -> OidcConfig {
+        OidcConfig {
+            issuer,
+            audience: vec!["thepost".into()],
+            tls: InternalTls {
+                allow_plaintext: true,
+                ..InternalTls::default()
+            },
+            ..OidcConfig::default()
+        }
+    }
+
     /// Поставщик на loopback и клиент к нему (профиль dev, открытый канал).
     async fn provider(device: Value, answers: Vec<(Status, Value)>) -> (Provider, DeviceLogin) {
         let p = Provider {
@@ -447,23 +454,18 @@ mod tests {
             .route("/token", post(token))
             .with_state(p.clone());
         tokio::spawn(async move { axum::serve(listener, router).await });
-        let oidc = OidcConfig {
-            issuer,
-            audience: vec!["thepost".into()],
-            tls: InternalTls {
-                allow_plaintext: true,
-                ..InternalTls::default()
-            },
-            ..OidcConfig::default()
-        };
-        let cli = CliOidc {
-            client_id: Some("thepost cli".into()),
+        let settings = DeviceSettings {
             slow_down_step: Duration::from_millis(400),
-            ..CliOidc::default()
+            ..settings("thepost cli")
         };
-        let login = DeviceLogin::new(&oidc, &cli, Profile::Dev, &NoSecretStore)
-            .await
-            .expect("client");
+        let login = DeviceLogin::new(
+            &plaintext_oidc(issuer),
+            settings,
+            Profile::Dev,
+            &MemSecretStore::default(),
+        )
+        .await
+        .expect("client");
         (p, login)
     }
 
@@ -525,24 +527,23 @@ mod tests {
     async fn expired_code_is_reported() {
         let (_p, login) = provider(device_code(600), vec![pending("expired_token")]).await;
         let e = login.login(|_| {}).await.expect_err("expired");
-        assert!(e.contains("код устройства истёк"), "{e}");
+        assert!(e.to_string().contains("код устройства истёк"), "{e}");
 
         let mut code = device_code(1);
         code["interval"] = json!(null);
         let (p, mut login) = provider(code, vec![pending("authorization_pending")]).await;
-        login.cli.poll_interval = Duration::from_millis(300);
+        login.settings.poll_interval = Duration::from_millis(300);
         let e = login.login(|_| {}).await.expect_err("expired");
-        assert!(e.contains("код устройства истёк"), "{e}");
+        assert!(e.to_string().contains("код устройства истёк"), "{e}");
         assert!(!p.polls.lock().expect("lock").is_empty());
     }
 
-    /// Отказ пользователя и поставщик без входа с устройства — отдельные понятные ошибки; без `client_id`
-    /// клиент не создаётся.
+    /// Отказ пользователя и поставщик без входа с устройства — отдельные понятные ошибки.
     #[tokio::test]
-    async fn denied_unsupported_and_no_client() {
+    async fn denied_and_unsupported() {
         let (_p, login) = provider(device_code(600), vec![pending("access_denied")]).await;
         let e = login.login(|_| {}).await.expect_err("denied");
-        assert!(e.contains("вход отклонён"), "{e}");
+        assert!(e.to_string().contains("вход отклонён"), "{e}");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -554,31 +555,21 @@ mod tests {
             get(move || async move { Json(doc) }),
         );
         tokio::spawn(async move { axum::serve(listener, router).await });
-        let oidc = OidcConfig {
-            issuer,
-            audience: vec!["thepost".into()],
-            tls: InternalTls {
-                allow_plaintext: true,
-                ..InternalTls::default()
-            },
-            ..OidcConfig::default()
-        };
-        let cli = CliOidc {
-            client_id: Some("thepost-cli".into()),
-            ..CliOidc::default()
-        };
-        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev, &NoSecretStore)
-            .await
-            .expect("client")
-            .login(|_| {})
-            .await
-            .expect_err("unsupported");
-        assert!(e.contains("device_authorization_endpoint"), "{e}");
-
-        let e = DeviceLogin::new(&oidc, &CliOidc::default(), Profile::Dev, &NoSecretStore)
-            .await
-            .expect_err("no client");
-        assert!(e.contains("cli.oidc.client_id"), "{e}");
+        let e = DeviceLogin::new(
+            &plaintext_oidc(issuer),
+            settings("thepost-cli"),
+            Profile::Dev,
+            &MemSecretStore::default(),
+        )
+        .await
+        .expect("client")
+        .login(|_| {})
+        .await
+        .expect_err("unsupported");
+        assert!(
+            e.to_string().contains("device_authorization_endpoint"),
+            "{e}"
+        );
     }
 
     /// APP-56: ключ сертификата клиента `auth.oidc.tls.key` — из хранилища секретов; секрета нет — ошибка с путём;
@@ -587,41 +578,39 @@ mod tests {
     async fn client_key_from_secret_store() {
         use tp_contracts::secrets::SecretRef;
 
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testdata");
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tp-admin/src/testdata");
         let r = SecretRef::new("thepost/oidc", "tls_key").expect("ref");
         let mut oidc = OidcConfig {
             issuer: "https://sso.example.test".into(),
             audience: vec!["thepost".into()],
             tls: InternalTls {
-                cert_file: Some(dir.join("cert.pem")),
+                cert_file: Some(dir.join("client.pem")),
                 key: Some(r.clone()),
                 ..InternalTls::default()
             },
             ..OidcConfig::default()
         };
-        let cli = CliOidc {
-            client_id: Some("thepost-cli".into()),
-            ..CliOidc::default()
+        let store = MemSecretStore::default();
+        let login = |oidc: OidcConfig, store: MemSecretStore| async move {
+            DeviceLogin::new(&oidc, settings("thepost-cli"), Profile::Dev, &store).await
         };
-        let store = tp_testkit::MemSecretStore::default();
-        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev, &store)
+        let e = login(oidc.clone(), store.clone())
             .await
             .expect_err("нет секрета");
-        assert!(e.contains("thepost/oidc#tls_key"), "{e}");
+        assert!(e.to_string().contains("thepost/oidc#tls_key"), "{e}");
 
         store.set(
             &r,
-            std::fs::read_to_string(dir.join("key.pem")).expect("key"),
+            std::fs::read_to_string(dir.join("client-key.pem")).expect("key"),
         );
-        DeviceLogin::new(&oidc, &cli, Profile::Dev, &store)
+        login(oidc.clone(), store.clone())
             .await
             .expect("клиент с ключом из хранилища");
 
         oidc.tls.key = None;
-        oidc.tls.key_file = Some(dir.join("key.pem"));
-        let e = DeviceLogin::new(&oidc, &cli, Profile::Dev, &store)
-            .await
-            .expect_err("key_file");
-        assert!(e.contains("key_file"), "{e}");
+        oidc.tls.key_file = Some(dir.join("client-key.pem"));
+        let e = login(oidc, store).await.expect_err("key_file");
+        assert!(e.to_string().contains("key_file"), "{e}");
     }
 }

@@ -1,27 +1,24 @@
-//! `thepost admin <ресурс> <действие>` — клиент Admin API (APP-11, SRS 5.2): интерфейс без собственной логики.
+//! `thepost admin <ресурс> <действие>` — CLI Admin API (APP-11, SRS 5.2): интерфейс без собственной логики поверх
+//! общего клиента [`tp_admin_client`] (решение 118, ADM-44).
 //!
 //! - Адрес — `--url`, иначе `THEPOST_ADMIN_URL`, иначе `http.admin.listen` из config.yaml (`allow_plaintext` — `http`,
 //!   иначе `https`; сертификат на другое имя — `--ca-file` или `--insecure`).
 //! - Вход — `Authorization: Bearer`: сессия Admin API (`tps_…`) или токен OIDC; значение — `THEPOST_ADMIN_TOKEN`
 //!   (или `--token`, но ключ виден в списке процессов). Сессию выдаёт [`ApiAction::Login`] — вход по паролю
 //!   администратора (`POST /api/v1/session`, решение 117): пароль — из терминала без эха или `--password-stdin`,
-//!   не из аргумента. Одноразовый токен `admin init` (`tpa_…`) клиент не принимает.
+//!   не из аргумента; `--oidc` — вход у поставщика `auth.oidc` с устройства (RFC 8628, клиент — `cli.oidc`).
+//!   Одноразовый токен `admin init` (`tpa_…`) клиент не принимает.
 //! - Организация — `--org`, иначе `THEPOST_ADMIN_ORG`, иначе организация администратора (`GET /api/v1/whoami`).
-//! - Вывод — таблица или ответ API (`--json`); и то и другое — из типизированного ответа.
+//! - Вывод — таблица или ответ API (`--json`); и то и другое — из типизированного ответа tp-admin.
 //!
-//! Тела запросов, параметры и ответы — прямо структуры tp-admin, из которых строится спецификация OpenAPI
-//! (APP-21, APP-22; у них обе стороны serde — ADM-13).
-//! Операции клиента — [`OPERATIONS`]: тест сверяет каждую со спецификацией OpenAPI tp-admin
-//! (`tp_admin::server::openapi_spec`), команды проверяются против роутера tp-admin. Генератор клиента (progenitor)
-//! не используется: спецификация — OpenAPI 3.1, progenitor читает только 3.0.
+//! Команды проверяются против роутера tp-admin.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, LINK};
-use reqwest::{Method, StatusCode, Url};
+use reqwest::Url;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tp_admin::AdminRole;
@@ -32,30 +29,26 @@ use tp_admin::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword
 use tp_admin::audit::{AuditPage, AuditParams};
 use tp_admin::delivery::{DeliveryParams, DeliveryResults};
 use tp_admin::groups::{GroupInfo, GroupPatch, NewGroup};
-use tp_admin::init::{AdminSession, PasswordLogin};
 use tp_admin::retention::{PageQuery, RestoredMessage, TrashPage};
-use tp_admin::server::{Problem, WhoAmI};
-use tp_admin::sieve::{Script, ScriptBody, ScriptProblem, ScriptText, VacationBody};
+use tp_admin::server::WhoAmI;
+use tp_admin::sieve::{Script, ScriptBody, ScriptText, VacationBody};
 use tp_admin::transport::{
     DomainBody, DomainList, DomainWritten, RouteBody, RouteList, SourceBody, SourceList,
     VersionQuery, Written,
 };
-use tp_contracts::admin_token::is_local_admin_token;
+use tp_admin_client::oidc::{DeviceLogin, DeviceSettings, prompt_text};
+use tp_admin_client::ops::*;
+use tp_admin_client::{
+    Client, DEFAULT_TIMEOUT_SECS, ENV_TOKEN, ENV_URL, NO_BODY, Options, query, setting,
+};
 use tp_contracts::groups::{GroupMember, SenderRestriction};
 use tp_contracts::transport::{
     AcceptedDomain, DestinationPolicy, DomainKind, SourceKind, SourceMatch, TlsRequirement,
     TrustedSource,
 };
-use tp_contracts::{AccountId, DomainId, GroupId, TenantId};
+use tp_contracts::{AccountId, DomainId, GroupId};
 
-use crate::sections::{self, HTTP, HttpSection};
-
-/// Переменная окружения: адрес Admin API.
-pub const ENV_URL: &str = "THEPOST_ADMIN_URL";
-/// Переменная окружения: токен (сессия `tps_…` или токен OIDC).
-pub const ENV_TOKEN: &str = "THEPOST_ADMIN_TOKEN";
-/// Переменная окружения: организация (UUID).
-pub const ENV_ORG: &str = "THEPOST_ADMIN_ORG";
+use crate::sections::{self, AUTH, AuthSection, CLI, CliOidc, CliSection, HTTP, HttpSection};
 
 /// Подключение к Admin API (общие ключи `thepost admin`; `admin init` их не использует).
 #[derive(Debug, Clone, Args)]
@@ -83,9 +76,6 @@ pub struct ApiArgs {
     pub timeout: u64,
 }
 
-/// Предельное время запроса по умолчанию, секунд.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
-
 impl Default for ApiArgs {
     fn default() -> Self {
         Self {
@@ -96,6 +86,20 @@ impl Default for ApiArgs {
             ca_file: None,
             insecure: false,
             timeout: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl ApiArgs {
+    /// Канал к Admin API по `--ca-file`, `--insecure` (с предупреждением в stderr) и `--timeout`.
+    fn options(&self) -> Options {
+        if self.insecure {
+            eprintln!("thepost: admin: сертификат TLS Admin API не проверяется (--insecure)");
+        }
+        Options {
+            ca_file: self.ca_file.clone(),
+            insecure: self.insecure,
+            timeout: Duration::from_secs(self.timeout),
         }
     }
 }
@@ -674,485 +678,8 @@ pub enum VacationAction {
     },
 }
 
-/// Операция Admin API: метод и шаблон пути, как в спецификации OpenAPI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Op {
-    /// Метод HTTP.
-    pub method: &'static str,
-    /// Шаблон пути (`{имя}` — параметр).
-    pub path: &'static str,
-}
-
-/// Обмен одноразового токена на сессию.
-pub const SESSION: Op = Op {
-    method: "POST",
-    path: "/api/v1/session",
-};
-/// Текущий администратор.
-pub const WHOAMI: Op = Op {
-    method: "GET",
-    path: "/api/v1/whoami",
-};
-/// Поиск учётной записи по имени входа и страница списка.
-pub const ACCOUNT_FIND: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts",
-};
-/// Новая учётная запись.
-pub const ACCOUNT_CREATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts",
-};
-/// Учётная запись по идентификатору.
-pub const ACCOUNT_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}",
-};
-/// Пароли приложений учётной записи.
-/// Изменение учётной записи: отображаемое имя, блокировка входа.
-pub const ACCOUNT_PATCH: Op = Op {
-    method: "PATCH",
-    path: "/api/v1/orgs/{org}/accounts/{account}",
-};
-pub const APP_PASSWORD_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/app-passwords",
-};
-/// Выпуск пароля приложения.
-pub const APP_PASSWORD_CREATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/app-passwords",
-};
-/// Отзыв пароля приложения.
-pub const APP_PASSWORD_REVOKE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/accounts/{account}/app-passwords/{id}",
-};
-/// Принятые домены организации.
-pub const DOMAIN_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/transport/domains",
-};
-/// Новый принятый домен.
-pub const DOMAIN_CREATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/transport/domains",
-};
-/// Удаление принятого домена.
-pub const DOMAIN_DELETE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/transport/domains/{id}",
-};
-/// Скрипты Sieve учётной записи.
-pub const SIEVE_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts",
-};
-/// Скрипт с текстом.
-pub const SIEVE_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}",
-};
-/// Создание или замена текста скрипта.
-pub const SIEVE_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}",
-};
-/// Включение скрипта.
-pub const SIEVE_ACTIVATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}/activate",
-};
-/// Отключение правил учётной записи.
-pub const SIEVE_DEACTIVATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/deactivate",
-};
-/// Удаление скрипта (активный — 409).
-pub const SIEVE_DELETE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/accounts/{account}/sieve/scripts/{name}",
-};
-/// Автоответ учётной записи.
-pub const VACATION_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/vacation",
-};
-/// Замена автоответа учётной записи целиком.
-pub const VACATION_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/accounts/{account}/vacation",
-};
-/// Скрипт организации.
-pub const ORG_SIEVE_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/sieve",
-};
-/// Запись скрипта организации.
-pub const ORG_SIEVE_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/sieve",
-};
-/// Удаление скрипта организации.
-pub const ORG_SIEVE_DELETE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/sieve",
-};
-
-/// Организация и её политика.
-pub const ORG_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}",
-};
-/// Политика организации целиком.
-pub const ORG_POLICY_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/policy",
-};
-/// Политика домена и действующая политика.
-pub const DOMAIN_POLICY_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/transport/domains/{id}/policy",
-};
-/// Политика домена целиком.
-pub const DOMAIN_POLICY_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/transport/domains/{id}/policy",
-};
-/// Политика ящика целиком.
-pub const ACCOUNT_POLICY_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/accounts/{account}/policy",
-};
-/// Группы организации.
-pub const GROUP_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/groups",
-};
-/// Новая группа.
-pub const GROUP_CREATE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/groups",
-};
-/// Группа.
-pub const GROUP_GET: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/groups/{group}",
-};
-/// Изменение группы.
-pub const GROUP_PATCH: Op = Op {
-    method: "PATCH",
-    path: "/api/v1/orgs/{org}/groups/{group}",
-};
-/// Удаление группы.
-pub const GROUP_DELETE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/groups/{group}",
-};
-/// Корзина ящика.
-pub const TRASH_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/trash",
-};
-/// Восстановление письма из корзины.
-pub const TRASH_RESTORE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
-};
-/// Скрытые письма корзины.
-pub const TRASH_HIDDEN_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
-};
-/// Восстановление скрытого письма.
-pub const TRASH_HIDDEN_RESTORE: Op = Op {
-    method: "POST",
-    path: "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
-};
-/// Журнал аудита организации.
-pub const AUDIT_SEARCH: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/audit",
-};
-/// Поиск в журнале доставки.
-pub const DELIVERY_SEARCH: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/delivery",
-};
-/// Доверенные источники организации.
-pub const SOURCE_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/transport/sources",
-};
-/// Создание или замена доверенного источника.
-pub const SOURCE_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/transport/sources/{name}",
-};
-/// Удаление доверенного источника.
-pub const SOURCE_DELETE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/transport/sources/{name}",
-};
-/// Политики доменов назначения.
-pub const ROUTE_LIST: Op = Op {
-    method: "GET",
-    path: "/api/v1/orgs/{org}/transport/routes",
-};
-/// Создание или замена политики домена назначения.
-pub const ROUTE_PUT: Op = Op {
-    method: "PUT",
-    path: "/api/v1/orgs/{org}/transport/routes/{pattern}",
-};
-/// Удаление политики домена назначения.
-pub const ROUTE_DELETE: Op = Op {
-    method: "DELETE",
-    path: "/api/v1/orgs/{org}/transport/routes/{pattern}",
-};
-
-/// Все операции клиента (сверка со спецификацией OpenAPI — тест).
-pub const OPERATIONS: &[Op] = &[
-    SESSION,
-    WHOAMI,
-    ACCOUNT_FIND,
-    ACCOUNT_CREATE,
-    ACCOUNT_GET,
-    ACCOUNT_PATCH,
-    APP_PASSWORD_LIST,
-    APP_PASSWORD_CREATE,
-    APP_PASSWORD_REVOKE,
-    DOMAIN_LIST,
-    DOMAIN_CREATE,
-    DOMAIN_DELETE,
-    SIEVE_LIST,
-    SIEVE_GET,
-    SIEVE_PUT,
-    SIEVE_ACTIVATE,
-    SIEVE_DEACTIVATE,
-    SIEVE_DELETE,
-    VACATION_GET,
-    VACATION_PUT,
-    ORG_SIEVE_GET,
-    ORG_SIEVE_PUT,
-    ORG_SIEVE_DELETE,
-    ORG_GET,
-    ORG_POLICY_PUT,
-    DOMAIN_POLICY_GET,
-    DOMAIN_POLICY_PUT,
-    ACCOUNT_POLICY_PUT,
-    GROUP_LIST,
-    GROUP_CREATE,
-    GROUP_GET,
-    GROUP_PATCH,
-    GROUP_DELETE,
-    TRASH_LIST,
-    TRASH_RESTORE,
-    TRASH_HIDDEN_LIST,
-    TRASH_HIDDEN_RESTORE,
-    AUDIT_SEARCH,
-    DELIVERY_SEARCH,
-    SOURCE_LIST,
-    SOURCE_PUT,
-    SOURCE_DELETE,
-    ROUTE_LIST,
-    ROUTE_PUT,
-    ROUTE_DELETE,
-];
-
 /// Результат команды: текст для stdout или сообщение об ошибке.
 type CliResult<T> = std::result::Result<T, String>;
-
-/// Запрос без тела.
-const NO_BODY: Option<&()> = None;
-
-/// Клиент Admin API: адрес и токен входа (нет — только вход по паролю).
-#[derive(Debug, Clone)]
-pub struct Client {
-    http: reqwest::Client,
-    base: Url,
-    token: Option<String>,
-}
-
-impl Client {
-    /// Клиент к `base` с токеном `token`; TLS — по `args` (`--ca-file`, `--insecure`), предельное время — `--timeout`.
-    pub fn new(base: Url, token: String, args: &ApiArgs) -> CliResult<Self> {
-        Self::build(base, Some(token), args)
-    }
-
-    /// Клиент без токена — для входа по паролю ([`login`]).
-    pub fn anonymous(base: Url, args: &ApiArgs) -> CliResult<Self> {
-        Self::build(base, None, args)
-    }
-
-    fn build(base: Url, token: Option<String>, args: &ApiArgs) -> CliResult<Self> {
-        let mut b = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(args.timeout.max(1)));
-        if let Some(path) = &args.ca_file {
-            let pem = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem)
-                .map_err(|e| format!("{}: не PEM: {e}", path.display()))?;
-            for c in certs {
-                b = b.add_root_certificate(c);
-            }
-        }
-        if args.insecure {
-            eprintln!("thepost: admin: сертификат TLS Admin API не проверяется (--insecure)");
-            b = b.danger_accept_invalid_certs(true);
-        }
-        let http = b.build().map_err(|e| format!("клиент HTTP: {e}"))?;
-        Ok(Self { http, base, token })
-    }
-
-    /// Адрес операции: параметры шаблона по порядку (кодируются как сегменты пути) и запрос `query`.
-    fn url(&self, op: Op, params: &[&str], query: &[(String, String)]) -> CliResult<Url> {
-        let mut url = self.base.clone();
-        {
-            let mut segs = url
-                .path_segments_mut()
-                .map_err(|()| format!("адрес Admin API {}: не HTTP", self.base))?;
-            segs.pop_if_empty();
-            let mut params = params.iter();
-            for seg in op.path.split('/').filter(|s| !s.is_empty()) {
-                if seg.starts_with('{') {
-                    let value = params
-                        .next()
-                        .ok_or_else(|| format!("{}: нет параметра {seg}", op.path))?;
-                    segs.push(value);
-                } else {
-                    segs.push(seg);
-                }
-            }
-        }
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
-        }
-        Ok(url)
-    }
-
-    /// Запрос `op` с телом `body` (JSON); ответ 2xx — заголовки и тело как есть, иначе — ошибка с кодом и причиной
-    /// из problem details.
-    async fn send<B: Serialize + ?Sized>(
-        &self,
-        op: Op,
-        params: &[&str],
-        query: &[(String, String)],
-        body: Option<&B>,
-    ) -> CliResult<(HeaderMap, Vec<u8>)> {
-        let url = self.url(op, params, query)?;
-        let method = Method::from_bytes(op.method.as_bytes()).map_err(|e| e.to_string())?;
-        let mut req = self.http.request(method, url);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-            req = req.header(CONTENT_TYPE, "application/json").body(bytes);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Admin API {}: {e}", self.base))?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Admin API: ответ: {e}"))?;
-        if status.is_success() {
-            Ok((headers, bytes.to_vec()))
-        } else {
-            Err(problem(op, status, &bytes))
-        }
-    }
-
-    /// Запрос `op`; ответ — структура ответа tp-admin `R`.
-    pub async fn call<B: Serialize + ?Sized, R: DeserializeOwned>(
-        &self,
-        op: Op,
-        params: &[&str],
-        query: &[(String, String)],
-        body: Option<&B>,
-    ) -> CliResult<R> {
-        self.call_page(op, params, query, body)
-            .await
-            .map(|(r, _)| r)
-    }
-
-    /// Запрос `op`; ответ — структура ответа tp-admin `R` и цель ссылки `Link: <…>; rel="next"` (RFC 8288), если есть.
-    pub async fn call_page<B: Serialize + ?Sized, R: DeserializeOwned>(
-        &self,
-        op: Op,
-        params: &[&str],
-        query: &[(String, String)],
-        body: Option<&B>,
-    ) -> CliResult<(R, Option<String>)> {
-        let (headers, bytes) = self.send(op, params, query, body).await?;
-        let r = serde_json::from_slice(&bytes).map_err(|e| {
-            format!(
-                "{} {}: ответ не по спецификации Admin API: {e}",
-                op.method, op.path
-            )
-        })?;
-        Ok((r, next_link(&headers)))
-    }
-
-    /// Параметры запроса из ссылки Admin API (`/api/v1/…?…`, путь от корня Admin API).
-    fn link_query(&self, link: &str) -> CliResult<Vec<(String, String)>> {
-        let url = self
-            .base
-            .join(link)
-            .map_err(|e| format!("ссылка Link {link:?}: {e}"))?;
-        Ok(url.query_pairs().into_owned().collect())
-    }
-
-    /// Запрос `op` без тела ответа (`204`).
-    pub async fn call_empty<B: Serialize + ?Sized>(
-        &self,
-        op: Op,
-        params: &[&str],
-        query: &[(String, String)],
-        body: Option<&B>,
-    ) -> CliResult<()> {
-        self.send(op, params, query, body).await.map(drop)
-    }
-}
-
-/// Цель первой ссылки `rel="next"` заголовков `Link` (RFC 8288).
-fn next_link(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get_all(LINK)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .find_map(|link| {
-            let (target, params) = link.trim().strip_prefix('<')?.split_once('>')?;
-            params
-                .split(';')
-                .filter_map(|p| p.trim().strip_prefix("rel="))
-                .any(|rel| {
-                    rel.trim_matches('"')
-                        .split_ascii_whitespace()
-                        .any(|r| r.eq_ignore_ascii_case("next"))
-                })
-                .then(|| target.to_owned())
-        })
-}
-
-/// Параметры запроса из структуры запроса tp-admin: поля объекта JSON, `null` пропускается.
-fn query<Q: Serialize>(q: &Q) -> CliResult<Vec<(String, String)>> {
-    match serde_json::to_value(q).map_err(|e| e.to_string())? {
-        serde_json::Value::Object(fields) => Ok(fields
-            .into_iter()
-            .filter_map(|(k, v)| match v {
-                serde_json::Value::Null => None,
-                serde_json::Value::String(s) => Some((k, s)),
-                other => Some((k, other.to_string())),
-            })
-            .collect()),
-        other => Err(format!("параметры запроса — не объект: {other}")),
-    }
-}
 
 /// Поле ответа `v` как в JSON Admin API (даты — RFC 3339, форматом tp-admin); `null` или нет поля — «—».
 fn json_field<T: Serialize>(v: &T, field: &str) -> String {
@@ -1173,50 +700,10 @@ fn value_text(v: &serde_json::Value) -> String {
     }
 }
 
-/// Сообщение об отказе: код, описание и подробность ответа (RFC 9457, [`Problem`]), подсказка для 401.
-fn problem(op: Op, status: StatusCode, body: &[u8]) -> String {
-    let p = serde_json::from_slice::<Problem>(body).ok();
-    let title = p
-        .as_ref()
-        .map(|p| p.title.as_str())
-        .filter(|t| !t.is_empty())
-        .or_else(|| status.canonical_reason())
-        .unwrap_or_default();
-    let mut msg = format!("{} {}: {} {title}", op.method, op.path, status.as_u16());
-    if let Some(detail) = p.as_ref().and_then(|p| p.detail.as_deref()) {
-        msg.push_str(&format!(": {detail}"));
-    }
-    if let Ok(script) = serde_json::from_slice::<ScriptProblem>(body) {
-        for e in &script.errors {
-            msg.push_str(&format!(
-                "\n  строка {}, столбец {}: {}",
-                e.line, e.column, e.message
-            ));
-        }
-    }
-    let hint = match (op == SESSION, status) {
-        (true, StatusCode::UNAUTHORIZED) => {
-            " (неверное имя входа или пароль, либо вход временно заблокирован после неудачных попыток)"
-        }
-        (true, StatusCode::FORBIDDEN) => {
-            " (у учётной записи нет ролей администрирования: admin.roles)"
-        }
-        (true, StatusCode::NOT_FOUND) => {
-            " (вход по паролю выключен: admin.password_login; вход через OIDC — thepost admin login --oidc)"
-        }
-        (false, StatusCode::UNAUTHORIZED) => {
-            " (токен не принят: сессия истекла или токен OIDC неверен; новая сессия — thepost admin login)"
-        }
-        _ => "",
-    };
-    msg.push_str(hint);
-    msg
-}
-
 /// `thepost admin <ресурс> <действие>`: код возврата (0 — успех, 1 — отказ или ошибка).
 pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
     if matches!(action, ApiAction::Login { oidc: true, .. }) {
-        return crate::oidc_device::command(config).await;
+        return oidc_command(config).await;
     }
     match run(config, &args, action).await {
         Ok(out) => {
@@ -1231,6 +718,7 @@ pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
 }
 
 async fn run(config: &Path, args: &ApiArgs, action: ApiAction) -> CliResult<String> {
+    let options = args.options();
     if let ApiAction::Login {
         user: Some(user),
         password_stdin,
@@ -1238,13 +726,76 @@ async fn run(config: &Path, args: &ApiArgs, action: ApiAction) -> CliResult<Stri
     } = &action
     {
         let password = read_password(*password_stdin).await?;
-        let client = Client::anonymous(base_url(config, args)?, args)?;
+        let client = Client::anonymous(base_url(config, args)?, &options)?;
         return login(&client, args, user, password).await;
     }
-    let token = token(args)?;
-    let base = base_url(config, args)?;
-    let client = Client::new(base, token, args)?;
+    let token = tp_admin_client::token(args.token.clone())?;
+    let client = Client::new(base_url(config, args)?, token, &options)?;
     execute(&client, args, action).await
+}
+
+/// `login --oidc` — вход с устройства по config.yaml `config`: приглашение — в stderr, токен доступа — строкой
+/// в stdout, чтобы он не попал в историю оболочки: `export THEPOST_ADMIN_TOKEN="$(…)"`.
+async fn oidc_command(config: &Path) -> i32 {
+    match oidc_login(config).await {
+        Ok(token) => {
+            println!("{token}");
+            eprintln!(
+                "thepost: admin: токен OIDC получен; без записи в историю оболочки: \
+                 export {ENV_TOKEN}=\"$(thepost admin login --oidc)\""
+            );
+            0
+        }
+        Err(msg) => {
+            eprintln!("thepost: admin: {msg}");
+            1
+        }
+    }
+}
+
+/// Токен OIDC: поставщик — `auth.oidc`, клиент — `cli.oidc`, ключ канала — из хранилища секретов узла.
+async fn oidc_login(config: &Path) -> CliResult<String> {
+    let registry = sections::registry().map_err(|e| e.to_string())?;
+    let path = config.to_owned();
+    let cfg = tokio::task::spawn_blocking(move || registry.load(&path))
+        .await
+        .map_err(|e| format!("чтение конфигурации прервано: {e}"))?
+        .map_err(|e| format!("{}: {e}", config.display()))?;
+    let auth = cfg
+        .section::<AuthSection>(AUTH)
+        .map_err(|e| format!("{}: секция auth: {e}", config.display()))?;
+    let oidc = auth.oidc.as_ref().ok_or_else(|| {
+        format!(
+            "{}: нет auth.oidc — поставщик OIDC не настроен",
+            config.display()
+        )
+    })?;
+    let cli = cfg
+        .section::<CliSection>(CLI)
+        .map_err(|e| format!("{}: секция cli: {e}", config.display()))?;
+    let settings = device_settings(&cli.oidc)?;
+    let secrets = crate::secrets::store(&cfg, None)
+        .await
+        .map_err(|e| format!("{}: хранилище секретов: {e}", config.display()))?;
+    let login = DeviceLogin::new(oidc, settings, cfg.profile(), secrets.as_ref()).await?;
+    Ok(login.login(|code| eprint!("{}", prompt_text(code))).await?)
+}
+
+/// Настройки входа с устройства из `cli.oidc`; без `client_id` вход недоступен.
+fn device_settings(cli: &CliOidc) -> CliResult<DeviceSettings> {
+    cli.check().map_err(|e| e.to_string())?;
+    let client_id = cli.client_id.clone().ok_or_else(|| {
+        "не задан cli.oidc.client_id — идентификатор открытого клиента (public client) с разрешённым \
+         Device Authorization Grant у поставщика OIDC"
+            .to_owned()
+    })?;
+    Ok(DeviceSettings {
+        client_id,
+        scope: cli.scope.clone(),
+        poll_interval: cli.poll_interval,
+        slow_down_step: cli.slow_down_step,
+        max_wait: cli.max_wait,
+    })
 }
 
 /// Пароль входа: первая строка stdin (`--password-stdin`) или ввод в терминале без эха; чтение — вне потоков async.
@@ -1281,11 +832,7 @@ pub async fn login(
     user: &str,
     password: String,
 ) -> CliResult<String> {
-    let body = PasswordLogin {
-        login: user.trim().to_owned(),
-        password,
-    };
-    let s: AdminSession = client.call(SESSION, &[], &[], Some(&body)).await?;
+    let s = client.login(user, password).await?;
     let text = format!(
         "{}Значение сессии показывается один раз. Дальше: export {ENV_TOKEN}=<сессия>\n",
         record(&[
@@ -1299,47 +846,13 @@ pub async fn login(
     out(args, &s, text)
 }
 
-/// Токен из `--token` или `THEPOST_ADMIN_TOKEN`: сессия или токен OIDC, не одноразовый токен `admin init`.
-fn token(args: &ApiArgs) -> CliResult<String> {
-    let token = args
-        .token
-        .clone()
-        .or_else(|| std::env::var(ENV_TOKEN).ok())
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "нет токена: задайте {ENV_TOKEN} (сессия tps_… из thepost admin login или токен OIDC) или --token"
-            )
-        })?;
-    if is_local_admin_token(&token) {
-        return Err(
-            "одноразовый токен admin init (tpa_…) не принимается: войдите по паролю — \
-             thepost admin login --user <адрес>"
-                .to_owned(),
-        );
-    }
-    Ok(token)
-}
-
 /// Адрес Admin API: `--url`, `THEPOST_ADMIN_URL` или `http.admin` из config.yaml.
 fn base_url(config: &Path, args: &ApiArgs) -> CliResult<Url> {
-    let explicit = args
-        .url
-        .clone()
-        .or_else(|| std::env::var(ENV_URL).ok())
-        .filter(|u| !u.trim().is_empty());
-    let raw = match explicit {
-        Some(u) => u.trim().to_owned(),
+    let raw = match setting(args.url.clone(), ENV_URL) {
+        Some(u) => u,
         None => url_from_config(config)?,
     };
-    let url = Url::parse(&raw).map_err(|e| format!("адрес Admin API {raw:?}: {e}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!(
-            "адрес Admin API {raw:?}: нужна схема http или https"
-        ));
-    }
-    Ok(url)
+    Ok(tp_admin_client::base_url(&raw)?)
 }
 
 /// `https://<http.admin.listen>` (`http://` при `allow_plaintext`); адрес — только внутренний (проверка секции).
@@ -1383,11 +896,11 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             "login — вход по паролю или у поставщика OIDC (thepost admin login), не запрос с сессией".to_owned(),
         ),
         ApiAction::Whoami => {
-            let w: WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
+            let w = client.whoami().await?;
             out(args, &w, whoami_record(&w))
         }
         ApiAction::Account { action } => {
-            let org = org(client, args).await?;
+            let org = client.org(args.org.clone()).await?;
             match *action {
                 AccountAction::Create { login, name } => {
                     let body = NewAccount {
@@ -1484,7 +997,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             }
         }
         ApiAction::AppPassword { action } => {
-            let org = org(client, args).await?;
+            let org = client.org(args.org.clone()).await?;
             match action {
                 AppPasswordAction::Create { account, label } => {
                     let id = account_id(client, &org, &account).await?;
@@ -1555,7 +1068,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
         ApiAction::Audit { action } => audit_command(client, args, *action).await,
         ApiAction::Delivery { action } => delivery_command(client, args, *action).await,
         ApiAction::Transport { action } => {
-            let org = org(client, args).await?;
+            let org = client.org(args.org.clone()).await?;
             match *action {
                 TransportAction::Domain { action } => {
                     domain_command(client, args, &org, action).await
@@ -1569,7 +1082,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             }
         }
         ApiAction::Sieve { action } => {
-            let org = org(client, args).await?;
+            let org = client.org(args.org.clone()).await?;
             match action {
                 SieveAction::List { account } => {
                     let id = account_id(client, &org, &account).await?;
@@ -1675,7 +1188,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             }
         }
         ApiAction::Vacation { action } => {
-            let org = org(client, args).await?;
+            let org = client.org(args.org.clone()).await?;
             match *action {
                 VacationAction::Get { account } => {
                     let id = account_id(client, &org, &account).await?;
@@ -1746,7 +1259,7 @@ async fn policy_command(
     args: &ApiArgs,
     action: PolicyAction,
 ) -> CliResult<String> {
-    let org = org(client, args).await?;
+    let org = client.org(args.org.clone()).await?;
     match action {
         PolicyAction::Get { level: l } => {
             let p: Policies = match level(client, &org, l).await? {
@@ -1813,7 +1326,7 @@ fn policy_table(policy: &PolicyBody, effective: Option<&PolicyBody>) -> String {
 
 /// `thepost admin group …`.
 async fn group_command(client: &Client, args: &ApiArgs, action: GroupAction) -> CliResult<String> {
-    let org = org(client, args).await?;
+    let org = client.org(args.org.clone()).await?;
     match action {
         GroupAction::List => {
             let list = groups(client, &org).await?;
@@ -1887,7 +1400,7 @@ const GROUP_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ИМЯ", "АДР
 
 /// Группы организации.
 async fn groups(client: &Client, org: &str) -> CliResult<Vec<GroupInfo>> {
-    client.call(GROUP_LIST, &[org], &[], NO_BODY).await
+    Ok(client.call(GROUP_LIST, &[org], &[], NO_BODY).await?)
 }
 
 /// Идентификатор группы: UUID как есть, иначе единственная группа с таким именем или адресом (без учёта регистра).
@@ -1994,7 +1507,7 @@ fn group_record(g: &GroupInfo) -> String {
 
 /// `thepost admin trash …`.
 async fn trash_command(client: &Client, args: &ApiArgs, action: TrashAction) -> CliResult<String> {
-    let org = org(client, args).await?;
+    let org = client.org(args.org.clone()).await?;
     match action {
         TrashAction::List {
             account,
@@ -2079,7 +1592,7 @@ async fn audit_command(client: &Client, args: &ApiArgs, action: AuditAction) -> 
         limit,
         after,
     } = action;
-    let org = org(client, args).await?;
+    let org = client.org(args.org.clone()).await?;
     let params: AuditParams = from_json(
         serde_json::json!({
             "since": since, "until": until, "actor": actor, "method": method, "route": route,
@@ -2139,7 +1652,7 @@ async fn delivery_command(
         limit,
         after,
     } = action;
-    let org = org(client, args).await?;
+    let org = client.org(args.org.clone()).await?;
     let params: DeliveryParams = from_json(
         serde_json::json!({
             "sender": sender, "recipient": recipient, "message_id": message_id, "since": since,
@@ -2511,9 +2024,9 @@ async fn patch_account(
     patch: &AccountPatch,
 ) -> CliResult<AccountInfo> {
     let id = account_id(client, org, account).await?;
-    client
+    Ok(client
         .call(ACCOUNT_PATCH, &[org, id.as_str()], &[], Some(patch))
-        .await
+        .await?)
 }
 
 /// Текст из файла `file` (`-` — stdin); чтение — вне потоков async.
@@ -2607,33 +2120,13 @@ fn optional<T: ToString>(v: Option<&T>) -> String {
     v.map_or_else(|| "—".to_owned(), ToString::to_string)
 }
 
-/// Организация: `--org`, `THEPOST_ADMIN_ORG` или организация администратора (`whoami`).
-async fn org(client: &Client, args: &ApiArgs) -> CliResult<String> {
-    let explicit = args
-        .org
-        .clone()
-        .or_else(|| std::env::var(ENV_ORG).ok())
-        .map(|o| o.trim().to_owned())
-        .filter(|o| !o.is_empty());
-    let org = match explicit {
-        Some(o) => o,
-        None => {
-            let w: WhoAmI = client.call(WHOAMI, &[], &[], NO_BODY).await?;
-            w.tenant
-        }
-    };
-    org.parse::<TenantId>()
-        .map_err(|e| format!("организация {org:?}: {e}"))?;
-    Ok(org)
-}
-
 /// Учётные записи с именем входа `login`.
 async fn find_accounts(client: &Client, org: &str, login: String) -> CliResult<Vec<AccountInfo>> {
     let query = query(&AccountQuery {
         login: Some(login),
         ..AccountQuery::default()
     })?;
-    client.call(ACCOUNT_FIND, &[org], &query, NO_BODY).await
+    Ok(client.call(ACCOUNT_FIND, &[org], &query, NO_BODY).await?)
 }
 
 /// Список учётных записей: страницы Admin API по ссылке `rel="next"`, не больше `limit` записей (`None` — все);
@@ -2645,36 +2138,13 @@ async fn list_accounts(
     after: Option<String>,
     limit: Option<usize>,
 ) -> CliResult<(Vec<AccountInfo>, bool)> {
-    let mut query = query(&AccountQuery {
+    let query = query(&AccountQuery {
         prefix,
         after,
         limit,
         login: None,
     })?;
-    let mut out = Vec::new();
-    loop {
-        let (page, next): (Vec<AccountInfo>, _) = client
-            .call_page(ACCOUNT_FIND, &[org], &query, NO_BODY)
-            .await?;
-        let empty = page.is_empty();
-        out.extend(page);
-        if let Some(limit) = limit.filter(|l| out.len() >= *l) {
-            let more = out.len() > limit || next.is_some();
-            out.truncate(limit);
-            return Ok((out, more));
-        }
-        match next {
-            // Пустая страница со ссылкой дальше — ошибка узла; без проверки — бесконечный цикл.
-            Some(_) if empty => {
-                return Err(format!(
-                    "{} {}: пустая страница со ссылкой rel=\"next\"",
-                    ACCOUNT_FIND.method, ACCOUNT_FIND.path
-                ));
-            }
-            Some(link) => query = client.link_query(&link)?,
-            None => return Ok((out, false)),
-        }
-    }
+    Ok(client.pages(ACCOUNT_FIND, &[org], query, limit).await?)
 }
 
 /// Идентификатор учётной записи: UUID как есть, иначе поиск по имени входа.
@@ -2692,7 +2162,7 @@ async fn account_id(client: &Client, org: &str, account: &str) -> CliResult<Stri
 
 /// Принятые домены организации и версия снимка кластера (для записи — из последнего чтения).
 async fn domains(client: &Client, org: &str) -> CliResult<DomainList> {
-    client.call(DOMAIN_LIST, &[org], &[], NO_BODY).await
+    Ok(client.call(DOMAIN_LIST, &[org], &[], NO_BODY).await?)
 }
 
 /// Строки «подпись: значение».
@@ -2760,6 +2230,7 @@ mod tests {
 
     use serde_json::{Value, json};
     use tp_admin::{AdminConfig, AdminRole, Deps, InitRequest, RoleBinding};
+    use tp_contracts::TenantId;
     use tp_contracts::auth::Principal;
     use tp_contracts::ext::DecisionHooks;
     use tp_testkit::{
@@ -2770,24 +2241,6 @@ mod tests {
     use tp_testkit::{MemAddressBook, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
     use super::*;
-
-    /// Каждая операция клиента есть в спецификации OpenAPI tp-admin (метод и шаблон пути): расхождение — ошибка.
-    #[test]
-    fn operations_match_openapi() {
-        let spec = serde_json::to_value(tp_admin::server::openapi_spec()).expect("spec");
-        let paths = spec["paths"].as_object().expect("paths");
-        for op in OPERATIONS {
-            let item = paths
-                .get(op.path)
-                .unwrap_or_else(|| panic!("{}: нет в спецификации Admin API", op.path));
-            assert!(
-                item.get(op.method.to_ascii_lowercase()).is_some(),
-                "{} {}: нет в спецификации Admin API",
-                op.method,
-                op.path
-            );
-        }
-    }
 
     #[test]
     fn parses_admin_commands() {
@@ -3227,17 +2680,6 @@ mod tests {
     }
 
     #[test]
-    fn token_kinds() {
-        let args = |t: &str| ApiArgs {
-            token: Some(t.to_owned()),
-            ..ApiArgs::default()
-        };
-        let err = token(&args("tpa_x")).expect_err("local token");
-        assert!(err.contains("thepost admin login --user"), "{err}");
-        assert_eq!(token(&args(" tps_x ")).expect("session"), "tps_x");
-    }
-
-    #[test]
     fn url_from_config_yaml() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.yaml");
@@ -3293,71 +2735,6 @@ mod tests {
             r.contains("Роли:") && r.contains("installation_admin, operator"),
             "{r}"
         );
-    }
-
-    /// Параметры запроса — из структур запроса tp-admin; `null` пропускается.
-    #[test]
-    fn query_from_tp_admin_structs() {
-        let sorted = |mut v: Vec<(String, String)>| {
-            v.sort();
-            v
-        };
-        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
-        assert_eq!(
-            query(&AccountQuery {
-                login: Some("a@b.test".into()),
-                ..AccountQuery::default()
-            }),
-            Ok(vec![pair("login", "a@b.test")])
-        );
-        assert_eq!(
-            query(&AccountQuery {
-                login: None,
-                prefix: Some("a".into()),
-                after: Some("a@b.test".into()),
-                limit: Some(10),
-            })
-            .map(sorted),
-            Ok(vec![
-                pair("after", "a@b.test"),
-                pair("limit", "10"),
-                pair("prefix", "a")
-            ])
-        );
-        assert_eq!(
-            query(&VersionQuery { version: 3 }),
-            Ok(vec![pair("version", "3")])
-        );
-    }
-
-    /// Ссылка `rel="next"` (RFC 8288): среди нескольких ссылок, `rel` с несколькими значениями, без кавычек.
-    #[test]
-    fn next_link_header() {
-        let headers = |values: &[&str]| {
-            let mut h = HeaderMap::new();
-            for v in values {
-                h.append(LINK, v.parse().expect("header"));
-            }
-            h
-        };
-        let next = "/api/v1/orgs/x/accounts?limit=2&after=b@b.test";
-        assert_eq!(
-            next_link(&headers(&[format!("<{next}>; rel=\"next\"").as_str()])),
-            Some(next.to_owned())
-        );
-        assert_eq!(
-            next_link(&headers(&[
-                "</first>; rel=\"first\"",
-                format!("<{next}>; title=\"x\"; rel=\"last next\"").as_str()
-            ])),
-            Some(next.to_owned())
-        );
-        assert_eq!(
-            next_link(&headers(&["</a>; rel=prev, </b>; rel=next"])),
-            Some("/b".to_owned())
-        );
-        assert_eq!(next_link(&headers(&["</a>; rel=\"prev\""])), None);
-        assert_eq!(next_link(&HeaderMap::new()), None);
     }
 
     /// Admin API tp-admin на хранилищах testkit на loopback: локальный вход подключён, `oidc` — токен OIDC
@@ -3484,7 +2861,7 @@ mod tests {
             })
             .await
             .expect("init");
-        let anon = Client::anonymous(url, &ApiArgs::default()).expect("client");
+        let anon = Client::anonymous(url, &Options::default()).expect("client");
         let args = ApiArgs::default();
         for _ in 0..3 {
             let err = login(&anon, &args, &granted.login, "wrong".into())
@@ -3538,7 +2915,7 @@ mod tests {
     }
 
     fn client(url: &Url, token: &str) -> Client {
-        Client::new(url.clone(), token.to_owned(), &ApiArgs::default()).expect("client")
+        Client::new(url.clone(), token.to_owned(), &Options::default()).expect("client")
     }
 
     async fn exec(c: &Client, json: bool, action: ApiAction) -> CliResult<String> {
@@ -3583,7 +2960,7 @@ mod tests {
             .expect("init");
 
         // Вход по паролю admin init: сессия; неверный пароль — 401 с подсказкой.
-        let anon = Client::anonymous(url.clone(), &ApiArgs::default()).expect("client");
+        let anon = Client::anonymous(url.clone(), &Options::default()).expect("client");
         let json_args = ApiArgs {
             json: true,
             ..ApiArgs::default()
@@ -4341,6 +3718,22 @@ mod tests {
             help.contains("--oidc") && help.contains("RFC 8628") && help.contains(ENV_TOKEN),
             "{help}"
         );
+    }
+
+    /// `cli.oidc` без `client_id` — вход с устройства недоступен (понятная ошибка до запросов к поставщику);
+    /// с ним — настройки клиента как в секции.
+    #[test]
+    fn device_settings_need_client_id() {
+        let e = device_settings(&CliOidc::default()).expect_err("no client");
+        assert!(e.contains("cli.oidc.client_id"), "{e}");
+        let s = device_settings(&CliOidc {
+            client_id: Some("thepost-cli".into()),
+            ..CliOidc::default()
+        })
+        .expect("settings");
+        assert_eq!(s.client_id, "thepost-cli");
+        assert_eq!(s.scope, "openid");
+        assert_eq!(s.max_wait, CliOidc::default().max_wait);
     }
 
     /// ADM-38: политики, группы, корзина, журнал аудита, журнал доставки, источники и маршруты транспорта —
