@@ -82,9 +82,10 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Изменяет локальную учётную запись: отображаемое имя и блокировка входа (`enabled: false` — вход запрещён).
-         *     Пустое тело (`{}`) — 422. У записи каталога (`external_id` задан) оба поля ведёт каталог: синхронизация
-         *     перезаписывает и имя, и признак блокировки, поэтому изменение — 409 с пояснением.
+         * Изменяет локальную учётную запись: отображаемое имя, блокировка входа (`enabled: false` — вход запрещён),
+         *     псевдонимы (целиком) и скрытие из книги «Организация». Пустое тело (`{}`) — 422. Псевдоним в домене, не принятом
+         *     организацией, или адрес, занятый учётной записью, группой или контактом, — 409. У записи каталога (`external_id`
+         *     задан) эти поля ведёт каталог: синхронизация перезаписывает их, поэтому изменение — 409 с пояснением.
          */
         patch: operations["patch_account"];
         trace?: never;
@@ -1076,14 +1077,20 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа. */
+        /**
+         * Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`) и вход по паролю
+         *     (`admin.password_login`). Без входа.
+         */
         get: operations["session_info"];
         put?: never;
         /**
-         * Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
-         *     первой проверкой; повтор, срок, отзыв — 401.
+         * Новая сессия Admin API. С телом `PasswordLogin` — вход администратора по паролю (решение 117): неверный пароль
+         *     или блокировка перебора — 401, нет ролей администрирования — 403, вход по паролю выключен
+         *     (`admin.password_login`) — 404. Без тела — обмен одноразового токена `admin init`
+         *     (`Authorization: Bearer tpa_…`): токен гасится первой проверкой; повтор, срок, отзыв — 401. Каждая попытка — в
+         *     журнал аудита.
          */
-        post: operations["exchange"];
+        post: operations["create_session"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1159,6 +1166,8 @@ export interface components {
         };
         /** @description Учётная запись. */
         AccountInfo: components["schemas"]["Policies"] & {
+            /** @description Псевдонимы — адреса, доставляемые учётной записи, кроме основного (нижний регистр, в порядке задания). */
+            aliases: string[];
             /** @description Отображаемое имя. */
             display_name: string;
             /** @description Основной домен. */
@@ -1167,6 +1176,8 @@ export interface components {
             enabled: boolean;
             /** @description Идентификатор в каталоге; `null` — локальная запись. */
             external_id?: string | null;
+            /** @description Скрыта из книги «Организация» (GAL): вход и приём почты — как обычно. */
+            hidden_from_gal: boolean;
             /** @description Идентификатор. */
             id: string;
             /** @description Имя входа. */
@@ -1176,10 +1187,21 @@ export interface components {
         };
         /** @description Изменение учётной записи: заданные поля заменяются, отсутствующие — без изменений; хотя бы одно поле обязательно. */
         AccountPatch: {
+            /**
+             * @description Псевдонимы целиком (заменяют прежние, `[]` — без псевдонимов; регистр не важен, повторы и основной адрес
+             *     отбрасываются): адреса в принятых доменах организации, не занятые другой учётной записью, группой рассылки или
+             *     почтовым контактом, — иначе 409. У записи каталога — 409.
+             */
+            aliases?: string[] | null;
             /** @description Отображаемое имя (непустое, одна строка); у записи каталога — 409. */
             display_name?: string | null;
             /** @description Вход разрешён; `false` — учётная запись заблокирована. У записи каталога — 409. */
             enabled?: boolean | null;
+            /**
+             * @description Скрыть из книги «Организация» (GAL); книга меняется не позже чем через `maintenance.gal_interval`. У записи
+             *     каталога — 409.
+             */
+            hidden_from_gal?: boolean | null;
         };
         /** @description Запись прав на коллекцию. */
         AclEntryBody: {
@@ -1730,6 +1752,16 @@ export interface components {
             /** @description Идентификатор. */
             id: string;
         };
+        /** @description Вход администратора по паролю. */
+        PasswordLogin: {
+            /** @description Имя входа (адрес учётной записи). */
+            login: string;
+            /**
+             * Format: password
+             * @description Пароль: каталога (`auth.ldap`) или приложения, в том числе выданный `thepost admin init`.
+             */
+            password: string;
+        };
         /** @description Политика уровня и действующая политика. */
         Policies: {
             /** @description Действующее с учётом вышестоящих уровней; `null` — значение по умолчанию конфигурации. */
@@ -1971,6 +2003,8 @@ export interface components {
         /** @description Способы входа консоли. */
         SessionInfo: {
             oidc?: components["schemas"]["OidcLogin"] | null;
+            /** @description Вход по паролю администратора включён (`POST /api/v1/session` с телом `PasswordLogin`, `admin.password_login`). */
+            password: boolean;
         };
         /** @description Политика общего доступа организации к календарям и адресным книгам. */
         SharingPolicyBody: {
@@ -2550,6 +2584,14 @@ export interface operations {
                 };
             };
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6709,14 +6751,19 @@ export interface operations {
             };
         };
     };
-    exchange: {
+    create_session: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description Вход по паролю; без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`) */
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PasswordLogin"] | null;
+            };
+        };
         responses: {
             201: {
                 headers: {
@@ -6726,7 +6773,43 @@ export interface operations {
                     "application/json": components["schemas"]["AdminSession"];
                 };
             };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description неверный пароль или токен, блокировка перебора */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description у учётной записи нет ролей администрирования */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description вход по паролю выключен (`admin.password_login`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description тело больше `admin.max_body_size` */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

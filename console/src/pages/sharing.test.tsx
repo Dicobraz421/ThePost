@@ -24,6 +24,8 @@ const account = {
   display_name: "Алиса",
   enabled: true,
   external_id: null,
+  aliases: [],
+  hidden_from_gal: false,
   quota: { used_bytes: 0, messages: 0, limit_bytes: null },
   policy: empty,
   effective: empty,

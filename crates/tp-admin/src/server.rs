@@ -1,7 +1,8 @@
 //! Каркас Admin API (SRS 5.2): HTTP — `axum`, спецификация OpenAPI — `utoipa` (`GET /api/openapi.json`, без входа).
 //!
-//! Вход — только `Authorization: Bearer` (токен OpenID Connect, проверяет [`Authenticator`] — `tp-auth`
-//! `OidcAuthenticator`); многофакторную аутентификацию обеспечивает поставщик удостоверений. Роли администраторов
+//! Вход — только `Authorization: Bearer`: токен OpenID Connect (проверяет [`Authenticator`] — `tp-auth`
+//! `OidcAuthenticator`; многофакторную аутентификацию обеспечивает поставщик удостоверений) или сессия Admin API
+//! (`tps_…`, [`crate::init`]: вход по паролю администратора или обмен токена `admin init`). Роли администраторов
 //! назначает секция `admin` config.yaml по имени входа или группе каталога ([`RoleBinding`]):
 //! - [`AdminRole::InstallationAdmin`] — все организации;
 //! - [`AdminRole::OrganizationAdmin`] — только организация администратора;
@@ -160,6 +161,7 @@ pub struct RoleBinding {
 /// audit:
 ///   syslog: { address: "siem.example.org:6514" }
 /// console: { enabled: true, connect_src: ["https://idp.example.org"] }
+/// password_login: false
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -193,6 +195,9 @@ pub struct AdminConfig {
     pub console: ConsoleConfig,
     /// Клиент консоли у поставщика OIDC `auth.oidc` (`GET /api/v1/session`); по умолчанию не настроен.
     pub oidc: Option<OidcClient>,
+    /// Вход администратора по паролю (`POST /api/v1/session` с телом [`crate::init::PasswordLogin`], решение 117):
+    /// не задано — включён без `admin.oidc` и выключен с ним ([`AdminConfig::password_login_enabled`]).
+    pub password_login: Option<bool>,
 }
 
 impl Default for AdminConfig {
@@ -212,6 +217,7 @@ impl Default for AdminConfig {
             init: InitConfig::default(),
             console: ConsoleConfig::default(),
             oidc: None,
+            password_login: None,
         }
     }
 }
@@ -269,6 +275,11 @@ impl AdminConfig {
         Ok(())
     }
 
+    /// Вход по паролю включён: `password_login`, а не задано — нет клиента консоли OIDC (`admin.oidc`).
+    pub fn password_login_enabled(&self) -> bool {
+        self.password_login.unwrap_or(self.oidc.is_none())
+    }
+
     /// Размер страницы по запросу клиента.
     pub(crate) fn page(&self, limit: Option<usize>) -> usize {
         limit.unwrap_or(self.page_size).clamp(1, self.max_page_size)
@@ -311,7 +322,8 @@ impl Caller {
 /// Зависимости Admin API: реализации контрактов, выбранные приложением.
 #[derive(Clone)]
 pub struct Deps {
-    /// Проверка Bearer-токенов (OIDC).
+    /// Проверка учётных данных — та же, что у входа пользователя на узле: Bearer OIDC и пароль (вход по паролю,
+    /// [`crate::init`]); защиту от перебора (`AbuseGuard` по адресу клиента и учётной записи) ведёт реализация узла.
     pub auth: Arc<dyn Authenticator>,
     /// Журнал аудита: запись и чтение (CTR-25); выгрузку в SIEM из него делает [`crate::export`].
     pub audit_log: Arc<dyn AuditLog>,
@@ -371,7 +383,7 @@ pub struct Admin {
     pub(crate) cfg: AdminConfig,
     /// Настройки транспорта; `None` — не подключено (маршруты отвечают 503).
     pub(crate) transport: Option<Arc<dyn TransportStore>>,
-    /// Локальный вход (`admin init`, сессии); `None` — не подключено (обмен отвечает 503).
+    /// Локальный вход (`admin init`, сессии); `None` — не подключено (вход по паролю и обмен отвечают 503).
     pub(crate) local: Option<Arc<Local>>,
     /// Правила Sieve и автоответ; `None` — не подключено (маршруты отвечают 503).
     pub(crate) sieve: Option<crate::sieve::Sieve>,
@@ -1251,6 +1263,8 @@ mod tests {
             display_name: "Анна".into(),
             external_id: Some("ext-1".into()),
             enabled: true,
+            aliases: vec!["a.petrova@example.org".into()],
+            hidden_from_gal: false,
             quota: QuotaInfo {
                 used_bytes: 10,
                 messages: 1,

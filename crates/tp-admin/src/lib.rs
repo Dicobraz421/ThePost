@@ -20,7 +20,8 @@
 //! - `extract` — разбор тела, строки и пути запроса (`Json`, `Query`, `Path`): отказ — 400 problem+json с полем;
 //! - `cors` — CORS `/api/v1/*` для консоли на отдельном веб-сервере (`admin.console.cors_origins`);
 //! - [`console`] — веб-консоль: вшитая статика `console/dist` (фича `console`), маршруты SPA, заголовки безопасности;
-//! - [`init`] — первый администратор без OIDC (`thepost admin init`): локальный сокет, одноразовый токен, сессия.
+//! - [`init`] — вход администратора без OIDC: `thepost admin init` (локальный сокет, одноразовый токен), вход по
+//!   паролю, сессии Admin API.
 
 pub mod accounts;
 pub mod app_passwords;

@@ -18,8 +18,11 @@
 
 1. **Планирование включено:** `curl -su $U -X OPTIONS -i $S/dav/calendars/ivan@example.org/` — в заголовке `DAV`
    есть `calendar-auto-schedule`, в `Allow` — `POST`.
-2. **Входящие и исходящие:** `curl -su $U -X PROPFIND -H 'Depth: 1' $S/dav/calendars/ivan@example.org/` — `207`,
-   в ответе `inbox/` и `outbox/`.
+2. **Входящие и исходящие:** `curl -su $U -X PROPFIND -H 'Depth: 0' $S/dav/principals/ivan@example.org/` с
+   `<c:schedule-inbox-URL/><c:schedule-outbox-URL/>` — `207`, в ответе `/dav/calendars/ivan@example.org/inbox/` и
+   `…/outbox/`; прямой `PROPFIND -H 'Depth: 0'` каждого — `207`, `resourcetype` `schedule-inbox`/`schedule-outbox`.
+   В `Depth: 1` дома календарей `inbox/` и `outbox/` не перечисляются: клиенты находят их по свойствам принципала
+   (RFC 6638).
 
 ## Встреча внутри организации (Thunderbird ↔ iOS)
 Иван — Thunderbird, Ольга — iOS.

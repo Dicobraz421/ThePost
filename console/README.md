@@ -15,8 +15,8 @@ NODE_EXTRA_CA_CERTS=/путь/к/ca.pem THEPOST_ADMIN=https://127.0.0.1:8443 npm
 
 Консоль — `http://localhost:5173/console/`; запросы `/api/*` сервер разработки передаёт узлу (`THEPOST_ADMIN`,
 по умолчанию `https://127.0.0.1:8443`: Admin API слушает только TLS, `http.admin.listen`). Сертификат узла
-проверяется: CA, которым он выпущен, — в `NODE_EXTRA_CA_CERTS` (стандартная переменная Node). Вход — одноразовый
-токен: `thepost admin init` на узле.
+проверяется: CA, которым он выпущен, — в `NODE_EXTRA_CA_CERTS` (стандартная переменная Node). Вход — имя входа и пароль
+администратора (первый пароль выдаёт `thepost admin init` на узле) или OIDC.
 
 ## Консоль на отдельном веб-сервере
 

@@ -44,7 +44,7 @@ ManageSieve — `openssl s_client -starttls sieve`, письма — `swaks`.
 | № | Шаг | Ожидается | Клиент |
 |---|---|---|---|
 | 1.1 | `GET $B/.well-known/caldav`, `/.well-known/carddav` | `301`, `Location` — `/dav/` | протокол |
-| 1.2 | `PROPFIND -H 'Depth: 1' $B/dav/calendars/org@…/` | `207`: `calendar/`, `tasks/`, `inbox/`, `outbox/` | протокол |
+| 1.2 | `PROPFIND -H 'Depth: 1' $B/dav/calendars/org@…/`; `PROPFIND -H 'Depth: 0' $B/dav/principals/org@…/` с `schedule-inbox-URL`, `schedule-outbox-URL` | дом: `207`, `calendar/`, `tasks/` (без `inbox/` и `outbox/`); принципал: `…/inbox/` и `…/outbox/`, их прямой `PROPFIND` — `207` (RFC 6638) | протокол |
 | 1.3 | `OPTIONS $B/dav/calendars/org@…/` | `DAV` содержит `calendar-access`, `calendar-auto-schedule` | протокол |
 | 1.4 | `PROPFIND -H 'Depth: 1' $B/dav/addressbooks/card@…/` | `207`: `contacts/` и `gal/` «Организация» | протокол |
 | 1.5 | `GET $B/.well-known/jmap` | capability `calendars`, `contacts`, `vacationresponse`, `sieve` | протокол |
@@ -113,6 +113,10 @@ ManageSieve — `openssl s_client -starttls sieve`, письма — `swaks`.
 | 4.7 | `ContactCard/set` в свою книгу | карточка видна по CardDAV | протокол |
 | 4.8 | `VacationResponse/set` (`isEnabled`, тема, текст) | `GET …/accounts/<id>/vacation` Admin API — те же значения; письмо `j2@` → `j1@` — ровно один автоответ за период | протокол |
 | 4.9 | Сценарии JMAP-28 и APP-26 «Автоответ в Postman» в Postman (push без перезапуска) | `JMAP-28.md`, `APP-26.md` | клиент |
+
+Примечание к 4.4: лента работает без настройки с dav-14 (DAV-36): `dav.schedule_keep_processed` по умолчанию `true`,
+применённые сообщения iTIP хранятся `dav.schedule_processed_ttl` (30 суток) и удаляются ролью maintenance. На
+сборке до dav-14 нужно `dav.schedule_keep_processed: true` в конфигурации, иначе лента пуста.
 
 ## 5. Правила Sieve
 | № | Шаг | Ожидается | Клиент |
