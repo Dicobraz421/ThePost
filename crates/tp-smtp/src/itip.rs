@@ -56,7 +56,7 @@ pub(crate) fn extract(raw: &[u8]) -> Option<Result<Imip, &'static str>> {
         let lines = unfold(&ics);
         let mut methods = lines.iter().filter_map(|l| property(l, "METHOD"));
         match (methods.next(), methods.next()) {
-            (Some(m), None) if m.trim().eq_ignore_ascii_case(method.as_str()) => {}
+            (Some((_, m)), None) if m.trim().eq_ignore_ascii_case(method.as_str()) => {}
             _ => return Err("METHOD объекта не совпадает с параметром method части письма"),
         }
         let role = if method.from_organizer() {
