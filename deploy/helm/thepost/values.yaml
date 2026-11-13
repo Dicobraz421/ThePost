@@ -221,11 +221,29 @@ config:
     jmap: { listen: "0.0.0.0:4443" }
     admin: { listen: "127.0.0.1:8443" }
   # Роль maintenance: очистка по сроку (надгробия DAV, журналы автоответов и доставки, токены admin init);
-  # сроки хранения — meta. Проверку BLOB в кластере выполняет один под — держатель лизы verify.lease_name.
+  # сроки хранения — meta. Значения — умолчания узла.
   maintenance:
     purge_interval: 1h
-    admin_token_retention: 30d
-    verify: { at: "03:00", interval: 24h }
+    admin_token_retention: 30d     # хранение истёкших токенов admin init (аудит); 0s — удалять сразу
+    gal_interval: 1m               # книга GAL «Организация» из каталога (auth.ldap или PostgreSQL)
+    # Проверка целостности BLOB (thepost verify без --fix) по расписанию, UTC: итог — журнал и /metrics
+    # (tp_blob_verify_*), исправление — вручную (kubectl exec … thepost verify --fix). В кластере проход выполняет
+    # один под — держатель лизы lease_name; lease_ttl покрывает расхождение часов узлов.
+    verify:
+      enabled: true
+      at: "03:00"
+      interval: 24h
+      lease_name: blob-verify
+      lease_ttl: 2m
+  # Вход администратора `thepost admin login --oidc` (RFC 8628) у поставщика auth.oidc: client_id — открытый клиент
+  # с Device Authorization Grant; не задан — вход с устройства выключен.
+  cli:
+    oidc:
+      # client_id: thepost-cli
+      scope: openid
+      poll_interval: 5s
+      slow_down_step: 5s
+      max_wait: 15m
   meta:
     dav: { tombstone_ttl: 90d }
     sieve: { vacation_log_ttl: 90d }

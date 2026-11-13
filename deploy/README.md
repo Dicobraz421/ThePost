@@ -157,7 +157,9 @@ Compose и Ansible его не копируют, а подставляют зн�
 | `secrets.auth.approle` | `role_id` — `/etc/thepost/openbao`, `secret_id` — учётные данные systemd | `secret_id` — том `openbao-approle` | `thepost_secrets_role_id_file` |
 | `tls`, `acme` | цепочка `/etc/thepost/tls`, ключ — секрет `thepost/tls#key` | том `tls` | `thepost_tls_mode` |
 | `blob.gc.window` | по умолчанию | — | `thepost_blob_gc_window` |
-| `maintenance`, `dav`, `http.dav` | период очистки, лимиты DAV | — | `thepost_maintenance`, `thepost_dav`, `thepost_dav_listen` |
+| `maintenance` | очистка по сроку, книга GAL, проверка BLOB `verify` (03:00 UTC, раз в сутки) | — | `thepost_maintenance` |
+| `cli.oidc` | вход с устройства выключен (`client_id` не задан) | — | `thepost_cli_oidc` |
+| `dav`, `http.dav` | лимиты DAV | — | `thepost_dav`, `thepost_dav_listen` |
 
 Остальное (слушатели 25, 465, 587, 143, 993, 443, ManageSieve 4190, роли, BLOB) — из пресета без изменений; новый параметр эталона
 добавляется в пресет, а не в compose или шаблон роли. Проверка пресета — `thepost config check --config
