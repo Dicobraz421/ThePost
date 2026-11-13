@@ -1,5 +1,6 @@
 //! Индекс объекта ([`ObjectIndex`]) из тела iCalendar или vCard (calcard): компонент, UID, интервал с развёрнутыми
-//! повторами. Им пользуются `tp-dav` (`PUT`) и `tp-jmap` (CalendarEvent, ContactCard).
+//! повторами. Им пользуются `tp-dav` (`PUT`) и `tp-jmap` (CalendarEvent, ContactCard). Индекс объекта календаря для
+//! записи — [`for_write`]: интервал, занятость и `Schedule-Tag` одинаково у CalDAV, приёма iTIP и JMAP (DAV-32).
 //!
 //! Интервал — от начала первого вхождения до конца последнего (UTC; даты без часового пояса — как UTC). Повторы
 //! разворачиваются до горизонта [`IndexOptions::horizon`] и не более [`IndexOptions::max_instances`] вхождений;
@@ -107,6 +108,15 @@ pub(crate) fn entry_parts(e: &VCardEntry) -> Vec<Cow<'_, str>> {
 pub fn calendar(body: &str, opts: &IndexOptions) -> Result<ObjectIndex, IndexError> {
     let ical = ICalendar::parse(body).map_err(|_| IndexError::Calendar)?;
     of_calendar(&ical, opts)
+}
+
+/// Индекс объекта календаря для записи в хранилище (DAV-32; CalDAV `PUT`, приём iTIP, JMAP `CalendarEvent/set`):
+/// [`of_calendar`] — интервал и занятость (не больше `MAX_BUSY_PERIODS` периодов) — и `Schedule-Tag` объекта
+/// планирования ([`crate::itip::schedule_tag`]). Параметры развёртки — `DavConfig::index_options` в момент записи.
+pub fn for_write(ical: &ICalendar, opts: &IndexOptions) -> Result<ObjectIndex, IndexError> {
+    let mut idx = of_calendar(ical, opts)?;
+    idx.schedule_tag = crate::itip::schedule_tag(ical);
+    Ok(idx)
 }
 
 /// Индекс разобранного iCalendar (см. [`calendar`]).

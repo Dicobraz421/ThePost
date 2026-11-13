@@ -541,6 +541,104 @@ pub fn rescheduled(old: &ICalendar, new: &ICalendar) -> bool {
     timing(old) != timing(new)
 }
 
+/// Свойства копии участника, которые он меняет сам (RFC 6638 §3.2.2.1): отметки времени записи, `TRANSP`,
+/// `SEQUENCE`, исключённые вхождения (`EXDATE` — отказ от вхождения), категории, цвет и нестандартные свойства
+/// клиентов (`X-`).
+fn personal(p: &ICalendarProperty) -> bool {
+    insignificant(p)
+        || matches!(
+            p,
+            ICalendarProperty::Sequence
+                | ICalendarProperty::Exdate
+                | ICalendarProperty::Categories
+                | ICalendarProperty::Color
+                | ICalendarProperty::Other(_)
+        )
+}
+
+/// Время и повторы компонента: переопределение вхождения отличается ими от основного компонента.
+fn instance_timing(p: &ICalendarProperty) -> bool {
+    matches!(
+        p,
+        ICalendarProperty::RecurrenceId
+            | ICalendarProperty::Dtstart
+            | ICalendarProperty::Dtend
+            | ICalendarProperty::Due
+            | ICalendarProperty::Duration
+            | ICalendarProperty::Rrule
+            | ICalendarProperty::Rdate
+    )
+}
+
+/// Содержимое компонента без того, что участник `mine` меняет сам: личных свойств ([`personal`]), своих `PARTSTAT` и
+/// `RSVP`, служебных параметров планирования; `instance` — и без времени и повторов ([`instance_timing`]).
+fn attendee_view(c: &ICalendarComponent, mine: &str, instance: bool) -> BTreeSet<String> {
+    c.entries
+        .iter()
+        .filter(|e| !personal(&e.name) && !(instance && instance_timing(&e.name)))
+        .map(|e| match e.name {
+            ICalendarProperty::Attendee | ICalendarProperty::Organizer => {
+                let mut e = clean(e.clone());
+                if e.name == ICalendarProperty::Attendee
+                    && entry_address(&e).as_deref() == Some(mine)
+                {
+                    e.params.retain(|p| {
+                        !matches!(
+                            p.name,
+                            ICalendarParameterName::Partstat | ICalendarParameterName::Rsvp
+                        )
+                    });
+                }
+                line(&e)
+            }
+            _ => line(e),
+        })
+        .collect()
+}
+
+/// Правка объекта планирования участником допустима (RFC 6638 §3.2.2.1, `allowed-attendee-scheduling-object-change`;
+/// DAV-31): участник с адресом из `me` меняет только своё участие (`PARTSTAT`, `RSVP` своего `ATTENDEE`), личные
+/// свойства и напоминания, исключает вхождения (`EXDATE`) и добавляет переопределения вхождений, отличные от
+/// основного компонента только этим и временем вхождения. Удалить компонент, изменить время, участников или описание
+/// встречи — нельзя. Прежний объект не планирования, вошедший — его организатор или не участник: допустимо всё.
+pub fn attendee_change_allowed(old: &ICalendar, new: &ICalendar, me: &[String]) -> bool {
+    let Some(om) = meeting(old).filter(Meeting::is_scheduling) else {
+        return true;
+    };
+    if om.organizer.as_ref().is_some_and(|o| me.contains(o)) {
+        return true;
+    }
+    let Some(mine) = om
+        .attendees
+        .iter()
+        .find(|a| me.contains(&a.address))
+        .map(|a| a.address.clone())
+    else {
+        return true;
+    };
+    let olds: Vec<(Option<String>, &ICalendarComponent)> =
+        sched(old).map(|c| (recurrence_id(c), c)).collect();
+    let master = olds.iter().find(|(rid, _)| rid.is_none()).map(|(_, c)| *c);
+    let mut seen = BTreeSet::new();
+    for c in sched(new) {
+        let rid = recurrence_id(c);
+        let allowed = match olds.iter().find(|(r, _)| *r == rid) {
+            Some((_, o)) => attendee_view(o, &mine, false) == attendee_view(c, &mine, false),
+            None => {
+                rid.is_some()
+                    && master.is_some_and(|m| {
+                        attendee_view(m, &mine, true) == attendee_view(c, &mine, true)
+                    })
+            }
+        };
+        if !allowed {
+            return false;
+        }
+        seen.insert(rid);
+    }
+    olds.iter().all(|(rid, _)| seen.contains(rid))
+}
+
 /// Статусы участия адреса `addr` по компонентам: (`RECURRENCE-ID`, `PARTSTAT`).
 fn partstats(ical: &ICalendar, addr: &str) -> BTreeSet<(Option<String>, String)> {
     sched(ical)

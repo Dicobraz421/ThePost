@@ -165,6 +165,6 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
     Ok(multistatus(ms))
 }
 
-fn invalid_token() -> Response {
+pub(crate) fn invalid_token() -> Response {
     precondition(StatusCode::FORBIDDEN, "<d:valid-sync-token/>")
 }

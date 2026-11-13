@@ -823,7 +823,7 @@ pub(crate) fn want_of(root: &Element) -> Want {
     }
 }
 
-fn filter_error(e: FilterError) -> Response {
+pub(crate) fn filter_error(e: FilterError) -> Response {
     let inner = match e {
         FilterError::Invalid => "<c:valid-filter/>",
         FilterError::Collation => "<c:supported-collation/>",
