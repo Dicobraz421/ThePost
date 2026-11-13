@@ -634,8 +634,23 @@ async fn reindex_cards_written_before_migration() {
     };
     let meta = PgMeta::new(pool.clone(), cfg);
     let tenant = common::tenant(&pool).await;
-    let domain = common::domain(&pool, tenant).await;
-    let scope = account_in(&meta, tenant, (domain.0, &domain.1)).await;
+    let (domain, _) = common::domain(&pool, tenant).await;
+    // Учётная запись — строкой схемы до миграции: `upsert` пишет столбцы последней схемы.
+    let scope = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let mut tx = schema::begin(&pool, tenant).await.expect("begin");
+    sqlx::query(
+        "INSERT INTO accounts (tenant_id, account_id, domain_id, login) VALUES ($1, $2, $3, 'old')",
+    )
+    .bind(tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(domain.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect("account");
+    tx.commit().await.expect("commit");
     let book = Collection::new(CollectionKind::AddressBook, "contacts");
     meta.create_collection(scope, book.clone())
         .await
