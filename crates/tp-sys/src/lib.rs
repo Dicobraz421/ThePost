@@ -8,6 +8,8 @@ pub mod resources;
 pub mod sandbox;
 pub mod signals;
 pub mod socket;
+#[cfg(test)]
+mod test_logs;
 
 pub use confine::{
     ConfineConfig, ConfineError, ConfineReport, Confinement, LandlockOutcome, Profile, RolePaths,

@@ -4,7 +4,8 @@
 //! [`NodeResources::detect`] читает синхронно (procfs/sysfs) — при старте или через `spawn_blocking`.
 //! [`watch_resources`] перечитывает лимиты и использование (`memory.current`, `cpu.stat`) с интервалом
 //! из [`ResourcesConfig`] и рассылает снимки через `tokio::sync::watch`: изменение лимитов cgroups
-//! (VPA, горячее добавление памяти и CPU) доходит до подписчиков без перезапуска (SRS 2.7, 6.3).
+//! (VPA, горячее добавление памяти и CPU) доходит до подписчиков без перезапуска (SRS 2.7, 6.3). В журнал
+//! пишется только смена лимитов (CPU, предел памяти): доступная память меняется постоянно и лимитом не является.
 //! Опрос, а не inotify: файлы cgroup v2 `memory.max`, `cpu.max` не порождают событий inotify.
 
 use std::fs;
@@ -26,7 +27,8 @@ pub struct NodeResources {
     pub cpus: f64,
     /// Предел памяти процесса, байт: минимум из `MemTotal` и `memory.max` cgroup.
     pub memory_total: u64,
-    /// Доступная сейчас память, байт: минимум из `MemAvailable` и остатка до `memory.max`.
+    /// Доступная сейчас память, байт: минимум из `MemAvailable` и остатка до `memory.max`. Не лимит:
+    /// меняется с каждым чтением и в [`NodeResources::same_limits`] не входит.
     pub memory_available: u64,
 }
 
@@ -72,6 +74,11 @@ impl NodeResources {
         }
         res.memory_available = res.memory_available.min(res.memory_total);
         res
+    }
+
+    /// Совпадают ли лимиты: CPU (квота cgroup и маска привязки) и предел памяти. Доступная память не сравнивается.
+    pub fn same_limits(&self, other: &Self) -> bool {
+        self.cpus == other.cpus && self.memory_total == other.memory_total
     }
 
     /// Число CPU для размера пулов: округление вверх, не меньше 1.
@@ -181,7 +188,7 @@ pub async fn watch_resources_in(
             snap.cpu_used = cpu_rate(prev, (now, snap.cpu_usage_usec));
             prev = (now, snap.cpu_usage_usec);
             let old = tx.borrow().resources;
-            if old != snap.resources {
+            if !old.same_limits(&snap.resources) {
                 tracing::info!(
                     cpus = snap.resources.cpus,
                     memory_total = snap.resources.memory_total,
@@ -283,6 +290,7 @@ fn parse_meminfo(s: &str) -> (Option<u64>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::Logs;
 
     const GIB: u64 = 1 << 30;
     const MEMINFO: &str = "MemTotal:       16777216 kB\nMemFree:         1048576 kB\n\
@@ -443,6 +451,73 @@ mod tests {
         .expect("канал закрыт");
         assert_eq!(snap.resources.memory_available, GIB - (512 << 20));
         assert_eq!(snap.memory_current, Some(512 << 20));
+    }
+
+    /// Первый снимок подписки, удовлетворяющий `ok`, не позже 10 с.
+    async fn wait(
+        rx: &mut watch::Receiver<ResourceSnapshot>,
+        ok: impl FnMut(&ResourceSnapshot) -> bool,
+    ) -> ResourceSnapshot {
+        *tokio::time::timeout(Duration::from_secs(10), rx.wait_for(ok))
+            .await
+            .expect("снимок не дошёл за 10 с")
+            .expect("канал закрыт")
+    }
+
+    /// Смена доступной памяти при прежних лимитах в журнал не пишется, смена `memory.max` — пишется (SYS-15).
+    #[tokio::test]
+    async fn only_limit_change_is_logged() {
+        const CHANGED: &str = "лимиты ресурсов узла изменились";
+        // Однопоточный рантайм теста: подписчик потока видит события задачи перечитывания.
+        let (logs, _guard) = Logs::capture();
+        let f = Fixture::new(
+            "watch-log",
+            &[
+                ("proc/meminfo", MEMINFO),
+                ("proc/self/cgroup", "0::/pod1/c1\n"),
+                ("sys/fs/cgroup/pod1/c1/cpu.max", "200000 100000\n"),
+                ("sys/fs/cgroup/pod1/c1/memory.max", "2147483648\n"),
+                ("sys/fs/cgroup/pod1/c1/memory.current", "536870912\n"),
+            ],
+        );
+        let cfg = ResourcesConfig {
+            poll_interval_ms: 10,
+        };
+        let mut rx = watch_resources_in(f.0.clone(), Some(8), &cfg).await;
+        let c1 = f.0.join("sys/fs/cgroup/pod1/c1");
+        for current in [1u64 << 30, 768 << 20, 256 << 20] {
+            fs::write(c1.join("memory.current"), format!("{current}\n")).expect("write");
+            let snap = wait(&mut rx, |s| s.memory_current == Some(current)).await;
+            assert_eq!(snap.resources.memory_available, 2 * GIB - current);
+        }
+        assert!(!logs.text().contains(CHANGED), "{}", logs.text());
+
+        // Через переименование: чтение недописанного файла дало бы лишнюю промежуточную смену лимита.
+        fs::write(c1.join("memory.max.new"), "1073741824\n").expect("write");
+        fs::rename(c1.join("memory.max.new"), c1.join("memory.max")).expect("rename");
+        wait(&mut rx, |s| s.resources.memory_total == GIB).await;
+        let text = logs.text();
+        assert_eq!(text.matches(CHANGED).count(), 1, "{text}");
+        assert!(text.contains("memory_total=1073741824"), "{text}");
+    }
+
+    #[test]
+    fn same_limits_ignores_available_memory() {
+        let a = NodeResources {
+            cpus: 2.0,
+            memory_total: 2 * GIB,
+            memory_available: GIB,
+        };
+        let b = NodeResources {
+            memory_available: GIB / 2,
+            ..a
+        };
+        assert!(a.same_limits(&b));
+        assert!(!a.same_limits(&NodeResources { cpus: 1.5, ..a }));
+        assert!(!a.same_limits(&NodeResources {
+            memory_total: GIB,
+            ..a
+        }));
     }
 
     #[tokio::test]
