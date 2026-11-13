@@ -1,7 +1,7 @@
-// Журнал аудита (SRS 5.2): операции администраторов. Узел ищет по интервалу; администратор и действие —
-// отбор среди записей загруженной страницы (таких условий у операции Admin API нет).
+// Журнал аудита (SRS 5.2): операции администраторов. Отбор по интервалу, администратору, методу и началу маршрута —
+// в хранилище (ADM-30); продолжение — `next` ответа.
 import { List } from "@refinedev/antd";
-import { DatePicker, Form, Input, Table, Tag, Typography } from "antd";
+import { Button, DatePicker, Form, Input, Select, Table, Tag } from "antd";
 import type { Dayjs } from "dayjs";
 import { useState } from "react";
 
@@ -10,6 +10,7 @@ import { useCursorPages } from "../components/cursor-pages";
 import { interval, moment } from "../components/format";
 
 type Entry = Schemas["AuditEntry"];
+type Filters = { actor?: string; method?: string; route?: string; range?: [Dayjs | null, Dayjs | null] | null };
 
 // В записи журнала роли — строки (роль, которой уже нет, показывается как есть); подписи — у всех ролей схемы.
 const ROLES: Partial<Record<string, string>> = {
@@ -18,32 +19,36 @@ const ROLES: Partial<Record<string, string>> = {
   operator: "оператор",
   auditor: "аудитор",
 } satisfies Record<Schemas["AdminRole"], string>;
-const has = (text: string, part: string) => text.toLowerCase().includes(part.trim().toLowerCase());
+const METHODS = ["PUT", "POST", "PATCH", "DELETE"].map((m) => ({ value: m, label: m }));
 
 export function AuditPage() {
-  const [range, setRange] = useState<[Dayjs | null, Dayjs | null] | null>(null);
-  const [actor, setActor] = useState("");
-  const [action, setAction] = useState("");
-  const { page, loading, pager } = useCursorPages<Schemas["AuditPage"]>("/api/v1/orgs/{org}/audit", interval(range));
-  const all = page?.entries ?? [];
-  const entries = all.filter((e) => has(e.actor_login, actor) && has(`${e.method} ${e.route} ${e.path}`, action));
+  const [filters, setFilters] = useState<Filters>({});
+  const { page, loading, pager } = useCursorPages<Schemas["AuditPage"]>("/api/v1/orgs/{org}/audit", {
+    actor: filters.actor?.trim(),
+    method: filters.method,
+    route: filters.route?.trim(),
+    ...interval(filters.range),
+  });
   return (
     <List title="Журнал аудита" breadcrumb={false} headerButtons={() => null}>
-      <Form layout="inline" style={{ marginBottom: 8, rowGap: 8 }}>
-        <Form.Item label="Интервал">
-          <DatePicker.RangePicker showTime allowEmpty={[true, true]} value={range} onChange={setRange} />
+      <Form<Filters> layout="inline" onFinish={setFilters} style={{ marginBottom: 16, rowGap: 8 }}>
+        <Form.Item name="actor" label="Администратор">
+          <Input allowClear placeholder="имя входа или UUID" />
         </Form.Item>
-        <Form.Item label="Администратор" htmlFor="audit-actor">
-          <Input id="audit-actor" allowClear placeholder="имя входа" value={actor} onChange={(e) => setActor(e.target.value)} />
+        <Form.Item name="method" label="Метод">
+          <Select allowClear options={METHODS} style={{ width: 140 }} />
         </Form.Item>
-        <Form.Item label="Действие" htmlFor="audit-action">
-          <Input id="audit-action" allowClear placeholder="метод или путь" value={action} onChange={(e) => setAction(e.target.value)} />
+        <Form.Item name="route" label="Маршрут">
+          <Input allowClear placeholder="/api/v1/orgs/{org}/transport" style={{ width: 300 }} />
         </Form.Item>
+        <Form.Item name="range" label="Интервал">
+          <DatePicker.RangePicker showTime allowEmpty={[true, true]} />
+        </Form.Item>
+        <Button type="primary" htmlType="submit">
+          Найти
+        </Button>
       </Form>
-      <Typography.Paragraph type="secondary">
-        Администратор и действие отбираются среди записей показанной страницы: показано {entries.length} из {all.length}.
-      </Typography.Paragraph>
-      <Table<Entry> dataSource={entries} loading={loading} rowKey="seq" pagination={false}>
+      <Table<Entry> dataSource={page?.entries} loading={loading} rowKey="seq" pagination={false}>
         <Table.Column dataIndex="seq" title="№" />
         <Table.Column<Entry> title="Время" render={(_, e) => moment(e.at)} />
         <Table.Column dataIndex="actor_login" title="Администратор" />
