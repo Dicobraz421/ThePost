@@ -195,21 +195,16 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
     steps:
       - uses: actions/checkout@v7.0.1
       - id: build
         uses: ./.github/actions/release-build
         with:
-          target: ${{ matrix.target }}
+          target: x86_64-unknown-linux-gnu
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-      - run: ldd ${{ steps.build.outputs.binary }} || readelf -d ${{ steps.build.outputs.binary }} | grep NEEDED
       - uses: actions/upload-artifact@v7.0.2
         with:
-          name: thepost-linux-${{ matrix.target }}
+          name: thepost-linux-x86_64
           path: ${{ steps.build.outputs.binary }}
           if-no-files-found: error
 
