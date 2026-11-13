@@ -105,7 +105,12 @@ impl AdminRole {
     ) -> bool {
         let read = *method == Method::GET || *method == Method::HEAD;
         let own_scope = tenant.is_none_or(|t| t == own);
-        let audit = route == AUDIT_ROUTE || route == crate::mailboxes::MAILBOX_AUDIT_ROUTE;
+        let audit = [
+            AUDIT_ROUTE,
+            crate::mailboxes::MAILBOX_AUDIT_ROUTE,
+            crate::mailboxes::MAILBOX_AUDIT_POLICY_ROUTE,
+        ]
+        .contains(&route);
         let cluster = route.starts_with(crate::transport::CLUSTER_PREFIX);
         match self {
             AdminRole::InstallationAdmin => true,

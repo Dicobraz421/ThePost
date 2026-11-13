@@ -329,6 +329,7 @@ impl Admin {
                         enabled: true,
                         aliases: Vec::new(),
                         kind: AccountKind::User,
+                        hidden_from_gal: false,
                     },
                 )
                 .await?
@@ -473,6 +474,7 @@ fn enabled(a: Account) -> AccountUpsert {
         enabled: true,
         aliases: a.aliases,
         kind: a.kind,
+        hidden_from_gal: a.hidden_from_gal,
     }
 }
 

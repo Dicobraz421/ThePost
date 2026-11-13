@@ -476,6 +476,7 @@ async fn create_account(
                     enabled: true,
                     aliases: Vec::new(),
                     kind: AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await?;
@@ -574,6 +575,7 @@ async fn patch_account(
                     enabled: p.enabled.unwrap_or(acc.enabled),
                     aliases: acc.aliases,
                     kind: acc.kind,
+                    hidden_from_gal: acc.hidden_from_gal,
                 },
             )
             .await?;
@@ -1238,6 +1240,7 @@ mod tests {
                     enabled: true,
                     aliases: Vec::new(),
                     kind: tp_contracts::meta::AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await

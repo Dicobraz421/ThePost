@@ -256,40 +256,7 @@ fn single(cfg: &AbuseConfig) -> (AbuseGuard, MemAbuseBlocks) {
     (node(cfg, Arc::new(store.clone()), &clock), store)
 }
 
-/// `::ffff:10.0.1.5` (слушатель на `[::]`) и `10.0.1.5` — один адрес: общий счётчик и общая блокировка.
-#[tokio::test]
-async fn mapped_ipv4_is_same_address() {
-    let cfg = AbuseConfig {
-        ip_failures: 3,
-        net_failures: 0,
-        ..AbuseConfig::default()
-    };
-    let (g, store) = single(&cfg);
-    let tenant = TenantId::new();
-    let (mapped, plain) = (from_ip("::ffff:10.0.1.5"), from_ip("10.0.1.5"));
-    assert_eq!(g.failure(tenant, &mapped).await.expect("fail"), None);
-    assert_eq!(g.failure(tenant, &plain).await.expect("fail"), None);
-    assert!(g.failure(tenant, &mapped).await.expect("fail").is_some());
-    for a in [&mapped, &plain] {
-        assert!(g.check(tenant, a).await.expect("check").is_some());
-    }
-    let subject = BlockSubject::Ip(ip("10.0.1.5"));
-    assert!(
-        store
-            .blocked(tenant, &subject)
-            .await
-            .expect("blocked")
-            .is_some()
-    );
-    assert_eq!(
-        g.check(tenant, &from_ip("::ffff:10.0.1.6"))
-            .await
-            .expect("check"),
-        None
-    );
-}
-
-/// Адреса IPv4 из разных `/24`, в том числе в форме `::ffff:`, не складываются в одну подсеть.
+/// Адреса IPv4 из разных `/24` не складываются в одну подсеть.
 #[tokio::test]
 async fn ipv4_from_different_nets_not_summed() {
     let cfg = AbuseConfig {
@@ -300,12 +267,12 @@ async fn ipv4_from_different_nets_not_summed() {
     let (g, _) = single(&cfg);
     let tenant = TenantId::new();
     for n in 0..10 {
-        let a = from_ip(&format!("::ffff:10.{n}.0.1"));
+        let a = from_ip(&format!("10.{n}.0.1"));
         assert_eq!(g.failure(tenant, &a).await.expect("fail"), None);
         let a = from_ip(&format!("172.16.{n}.1"));
         assert_eq!(g.failure(tenant, &a).await.expect("fail"), None);
     }
-    for a in ["10.200.0.1", "::ffff:192.0.2.1", "::ffff:10.0.0.2"] {
+    for a in ["10.200.0.1", "192.0.2.1", "10.0.0.2"] {
         assert_eq!(g.check(tenant, &from_ip(a)).await.expect("check"), None);
     }
 }
@@ -319,26 +286,17 @@ async fn hundred_failures_block_only_their_net() {
     let tenant = TenantId::new();
     let mut blocked = None;
     for last in 1..=100 {
-        let a = if last % 2 == 0 {
-            format!("::ffff:10.0.1.{last}")
-        } else {
-            format!("10.0.1.{last}")
-        };
+        let a = format!("10.0.1.{last}");
         blocked = g.failure(tenant, &from_ip(&a)).await.expect("fail");
         if last < 100 {
             assert_eq!(blocked, None, "{a}");
         }
     }
     assert!(blocked.is_some());
-    for a in ["10.0.1.200", "::ffff:10.0.1.201"] {
+    for a in ["10.0.1.200", "10.0.1.201"] {
         assert!(g.check(tenant, &from_ip(a)).await.expect("check").is_some());
     }
-    for a in [
-        "10.0.2.1",
-        "::ffff:10.0.0.1",
-        "192.0.2.1",
-        "::ffff:198.51.100.1",
-    ] {
+    for a in ["10.0.2.1", "10.0.0.1", "192.0.2.1", "198.51.100.1"] {
         assert_eq!(g.check(tenant, &from_ip(a)).await.expect("check"), None);
     }
     let net = BlockSubject::net(ip("10.0.1.0"), 24).expect("net");

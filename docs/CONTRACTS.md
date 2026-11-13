@@ -99,6 +99,8 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   Отдельного метода хранилища нет. Потребитель — DAV-23 (`calendar-user-address-set`).
   Вид учётной записи (CTR-48) — поле `Account::kind: AccountKind::{User, Resource}` (ресурс — переговорная, оборудование), задаётся
   `AccountUpsert::kind` и заменяется при обновлении; правила бронирования ресурса — раздел Sharing.
+  Скрыта из книги «Организация» (CTR-83) — поле `Account::hidden_from_gal: bool`, задаётся `AccountUpsert::hidden_from_gal` и
+  заменяется при обновлении: нет в GAL, вход и приём почты — как обычно. Синхронизация каталога переносит `DirAccount::hidden_from_gal`.
   Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
   отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
@@ -339,6 +341,8 @@ CTR-35: `DirAccount::org: DirOrg { department (external_id подразделе�
 отключения). PostgreSQL — `PgMeta` (`sync_holds`), in-memory — `MemSyncGate`; набор `suite::sync_gate`.
 CTR-58 (решение 79): `DirAccount::hidden_from_gal: bool` (`#[serde(default)]`, как у групп и почтовых контактов) — запись не попадает
 в адресную книгу (GAL), вход и приём почты не меняются. Заполняет каталог (LDAP — AUTH-16), учитывает построение GAL (DAV-27).
+Каталог PostgreSQL (узел без LDAP, `impl Directory for PgMeta`, META-65) отдаёт признак учётной записи `Account::hidden_from_gal`
+(CTR-83): запись остаётся в `accounts_since` с признаком, как из LDAP.
 
 ## AddressBook
 SRS 4.5, 5.1, решение 2026-11-04-exchange-parity (CTR-35; код — `addressbook.rs`). Ids — `ContactId`, `OrgUnitId`. Состояние учётной записи
@@ -380,7 +384,8 @@ Delete, Send, SendAs, SendOnBehalf, ChangeRights, ChangeRules, ChangeForwarding}
 `AuditPolicy { non_owner (по умолчанию true), owner: BTreeSet<AuditAction> (по умолчанию пусто; только `AuditAction::OWNER`) }`,
 `records(kind, action)` — вход, чтение и поиск владельцем не записываются никогда. `MailboxAudit`:
 `record_audit(entry) -> bool` — протоколы вызывают для каждого действия, политику применяет хранилище; `audit_policy(scope)` (ящик → организация
-→ по умолчанию), `set_audit_policy(tenant, account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
+→ по умолчанию), `tenant_audit_policy(tenant) -> Option<AuditPolicy>` (заданная политика организации, ADM-40), `set_audit_policy(tenant,
+account?, policy?)`, `search_audit(tenant, &AuditQuery { account, actor, actor_kind, action, since,
 until, limit, after })` -> `AuditPage` (как `DeliveryLog::search`), `purge_audit(before)` (maintenance, можно сутками). In-memory —
 `MemMailboxAudit` (`entries`, `fail_next`); набор `suite::mailbox_audit`. Запись — IMAP-15, JMAP-18; PostgreSQL (только добавление) — META-33;
 выгрузка в SIEM и выборка — ADM-10.
@@ -1101,3 +1106,12 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   сигнатура `Outbound`, новые поля `Policy`, варианты `AccountState` и `EventKind`. По сравнению с карточками: у `next_due` нет
   параметра вида — очередь одна (исходящая почта), вид темы — `outbound`; `owner` получает и `submit` (по умолчанию вызывает
   `enqueue`); `begin_removal` принимает `now` (проверка срока на часах вызывающего).
+- 2026-11-13 — CTR-83 (волна contracts-55): `Account::hidden_from_gal`, `AccountUpsert::hidden_from_gal` — учётная запись скрыта из
+  книги «Организация» без LDAP (раньше скрыть можно было только группу). Без значения по умолчанию: все места записи задают признак,
+  обновление через Admin API (`PATCH` имени и блокировки) и `init` сохраняют прежний, синхронизация каталога переносит
+  `DirAccount::hidden_from_gal`. `tp-meta` — миграция 0038 (`accounts.hidden_from_gal`), `impl Directory for PgMeta` отдаёт признак в
+  `DirAccount::hidden_from_gal`; `MemMetadata`. Наборы: `suite::account_external_id` — признак хранится и заменяется записью;
+  `pg_directory` — признак в каталоге, новая версия выгрузки. Несовместимо: новое обязательное поле `Account`, `AccountUpsert`.
+  По сравнению с карточкой: реализации в той же волне (правило владельца «старое рядом с новым не оставлять»); скрытая учётная запись
+  остаётся в `accounts_since` с признаком, а не пропадает из выгрузки — как у LDAP (AUTH-16): из книги её убирает построение GAL
+  (DAV-27), ссылки `DirOrg::manager` на неё остаются. `PATCH` признака в Admin API и консоль — отдельные волны.

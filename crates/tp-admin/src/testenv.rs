@@ -1,8 +1,9 @@
 //! Окружение тестов: Admin API поверх in-memory реализаций tp-testkit; запросы — `tower::ServiceExt::oneshot`.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -16,7 +17,8 @@ use tp_contracts::ext::AdminRoutes;
 use tp_contracts::ext::DecisionHooks;
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{
-    AccountKind, AccountScope, AccountStore, AccountUpsert, Flags, SpecialUse,
+    Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
+    DisabledAccount, ExistingContent, Flags, QuotaUsage, SpecialUse,
 };
 use tp_contracts::{AccountId, DomainId, MessageId, Result, TenantId};
 use tp_testkit::{
@@ -45,9 +47,143 @@ impl MemAudit {
 /// Решения модерации — [`MemModeration`] tp-testkit (CTR-31).
 pub use tp_testkit::{MemModeration, ModerationDecision as Decision};
 
+/// Вызовы `AccountStore` Admin API (имена методов по порядку) — проверка числа запросов к хранилищу.
+#[derive(Debug, Clone, Default)]
+pub struct AccountCalls(Arc<Mutex<Vec<&'static str>>>);
+
+impl AccountCalls {
+    /// Вызовы с прошлого `take` (и очищает список).
+    pub fn take(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.0.lock().expect("calls"))
+    }
+
+    fn push(&self, method: &'static str) {
+        self.0.lock().expect("calls").push(method);
+    }
+}
+
+/// [`MemMetadata`] как `AccountStore` Admin API со счётом вызовов ([`AccountCalls`]).
+struct CountedAccounts {
+    inner: MemMetadata,
+    calls: AccountCalls,
+}
+
+#[async_trait]
+impl AccountStore for CountedAccounts {
+    async fn get(&self, tenant: TenantId, id: AccountId) -> Result<Option<Account>> {
+        self.calls.push("get");
+        self.inner.get(tenant, id).await
+    }
+
+    async fn by_ids(&self, tenant: TenantId, ids: &[AccountId]) -> Result<Vec<Account>> {
+        self.calls.push("by_ids");
+        self.inner.by_ids(tenant, ids).await
+    }
+
+    async fn by_login(&self, tenant: TenantId, login: &str) -> Result<Option<Account>> {
+        self.calls.push("by_login");
+        self.inner.by_login(tenant, login).await
+    }
+
+    async fn by_address(&self, tenant: TenantId, address: &str) -> Result<Option<AddressTarget>> {
+        self.calls.push("by_address");
+        self.inner.by_address(tenant, address).await
+    }
+
+    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
+        self.calls.push("by_external_id");
+        self.inner.by_external_id(tenant, external_id).await
+    }
+
+    async fn list(
+        &self,
+        tenant: TenantId,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Account>> {
+        self.calls.push("list");
+        self.inner.list(tenant, prefix, after, limit).await
+    }
+
+    async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account> {
+        self.calls.push("upsert");
+        self.inner.upsert(tenant, data).await
+    }
+
+    async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage> {
+        self.calls.push("quota");
+        self.inner.quota(tenant, id).await
+    }
+
+    async fn account_state(&self, tenant: TenantId, id: AccountId) -> Result<AccountState> {
+        self.calls.push("account_state");
+        self.inner.account_state(tenant, id).await
+    }
+
+    async fn disable_account(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        until: OffsetDateTime,
+    ) -> Result<()> {
+        self.calls.push("disable_account");
+        self.inner.disable_account(tenant, id, until).await
+    }
+
+    async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.calls.push("restore_account");
+        self.inner.restore_account(tenant, id).await
+    }
+
+    async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>> {
+        self.calls.push("disabled_accounts");
+        self.inner.disabled_accounts(tenant).await
+    }
+
+    async fn expired_accounts(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<AccountScope>> {
+        self.calls.push("expired_accounts");
+        self.inner.expired_accounts(now, limit).await
+    }
+
+    async fn begin_removal(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        self.calls.push("begin_removal");
+        self.inner.begin_removal(tenant, id, now).await
+    }
+
+    async fn attach_account(
+        &self,
+        tenant: TenantId,
+        disabled: AccountId,
+        to: AccountId,
+        existing: Option<ExistingContent>,
+    ) -> Result<Account> {
+        self.calls.push("attach_account");
+        self.inner
+            .attach_account(tenant, disabled, to, existing)
+            .await
+    }
+
+    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
+        self.calls.push("remove_disabled");
+        self.inner.remove_disabled(tenant, id).await
+    }
+}
+
 /// Хранилища в памяти: метаданные, квоты, почтовое хранилище.
 pub struct Stores {
     pub meta: MemMetadata,
+    /// Вызовы `AccountStore` Admin API.
+    pub account_calls: AccountCalls,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
     pub passwords: MemAppPasswords,
@@ -84,6 +220,7 @@ impl Stores {
         let passwords = MemAppPasswords::new(&meta);
         Self {
             meta,
+            account_calls: AccountCalls::default(),
             quota,
             store,
             passwords,
@@ -117,7 +254,10 @@ impl Stores {
             groups: Arc::new(self.groups.clone()),
             moderation: Arc::new(self.moderation.clone()),
             modules: Vec::new(),
-            accounts: Arc::new(self.meta.clone()),
+            accounts: Arc::new(CountedAccounts {
+                inner: self.meta.clone(),
+                calls: self.account_calls.clone(),
+            }),
             quota: Arc::new(self.quota.clone()),
             policies: Arc::new(self.policies.clone()),
             resolver: Arc::new(self.policies.clone()),
@@ -150,6 +290,8 @@ pub struct Env {
     pub delivery: MemDeliveryLog,
     pub moderation: MemModeration,
     pub meta: MemMetadata,
+    /// Вызовы `AccountStore` Admin API.
+    pub account_calls: AccountCalls,
     pub quota: MemQuota,
     pub store: tp_mailstore::Store,
     pub policies: MemPolicies,
@@ -295,6 +437,7 @@ impl Env {
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,
+            account_calls,
             quota,
             store,
             groups,
@@ -314,6 +457,7 @@ impl Env {
             delivery,
             moderation,
             meta,
+            account_calls,
             quota,
             store,
             policies,
@@ -351,6 +495,7 @@ impl Env {
                     enabled: true,
                     aliases: Vec::new(),
                     kind: AccountKind::User,
+                    hidden_from_gal: false,
                 },
             )
             .await

@@ -199,7 +199,7 @@ async fn resolve_by_network() {
         .expect("source");
     assert_eq!(s.name, "mfp");
     let s = sources
-        .resolve("::ffff:192.0.2.11".parse().expect("ip"), &[])
+        .resolve("192.0.2.11".parse().expect("ip"), &[])
         .await
         .expect("source");
     assert_eq!(s.name, "edge");
@@ -225,6 +225,11 @@ fn parse_attributes() {
     assert_eq!(o.helo.as_deref(), Some("a.b"));
     let o = parse(XCommand::Forward, "XFORWARD ADDR=[TEMPUNAVAIL]").expect("parse");
     assert_eq!(o.addr, None);
+    // `::ffff:a.b.c.d` — адрес IPv4 (SMTP-46: адрес шлюза не проходит через слушатель).
+    let o = parse(XCommand::Client, "XCLIENT ADDR=IPV6:::ffff:192.0.2.1").expect("parse");
+    assert_eq!(o.addr, Some("192.0.2.1".parse().expect("ip")));
+    let o = parse(XCommand::Forward, "XFORWARD ADDR=2001:db8::1").expect("parse");
+    assert_eq!(o.addr, Some("2001:db8::1".parse().expect("ip")));
     assert!(parse(XCommand::Forward, "XFORWARD LOGIN=x").is_err());
     assert!(parse(XCommand::Client, "XCLIENT ADDR=not-an-ip").is_err());
     assert!(parse(XCommand::Client, "XCLIENT ADDR").is_err());

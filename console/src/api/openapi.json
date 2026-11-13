@@ -5417,6 +5417,44 @@
           "audit"
         ]
       },
+      "get": {
+        "operationId": "get_org_audit_policy",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditPolicyBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Политика аудита ящиков организации: заданная, иначе по умолчанию (только действия не владельца). Права — как\nу журнала аудита ящиков: администратор и аудитор организации, оператору — 403.",
+        "tags": [
+          "audit"
+        ]
+      },
       "put": {
         "operationId": "put_org_audit_policy",
         "parameters": [
@@ -5499,6 +5537,15 @@
             }
           },
           {
+            "description": "Продолжение после этого письма — `after` из ссылки `rel=\"next\"` предыдущей страницы (непрозрачная позиция).",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "`subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ\nк содержимому; размер — не больше `admin.content_page_size`.",
             "in": "query",
             "name": "include",
@@ -5517,6 +5564,14 @@
                     "$ref": "#/components/schemas/HeldInfo"
                   },
                   "type": "array"
+                }
+              }
+            },
+            "headers": {
+              "Link": {
+                "description": "Следующая страница очереди: `<ссылка>; rel=\"next\"`; нет — страница последняя",
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -5540,7 +5595,7 @@
             }
           }
         },
-        "summary": "Очередь модерации организации или группы.",
+        "summary": "Очередь модерации организации или группы по времени постановки. Есть продолжение — заголовок\n`Link: <…&after=…>; rel=\"next\"` (RFC 8288), нет заголовка — страница последняя; неразборчивый `after` — 400.",
         "tags": [
           "groups"
         ]

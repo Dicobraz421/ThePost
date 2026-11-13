@@ -573,7 +573,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Политика аудита ящиков организации: заданная, иначе по умолчанию (только действия не владельца). Права — как
+         *     у журнала аудита ящиков: администратор и аудитор организации, оператору — 403.
+         */
+        get: operations["get_org_audit_policy"];
         /** Задаёт политику аудита ящиков организации. */
         put: operations["put_org_audit_policy"];
         post?: never;
@@ -591,7 +595,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Очередь модерации организации или группы. */
+        /**
+         * Очередь модерации организации или группы по времени постановки. Есть продолжение — заголовок
+         *     `Link: <…&after=…>; rel="next"` (RFC 8288), нет заголовка — страница последняя; неразборчивый `after` — 400.
+         */
         get: operations["list_held"];
         put?: never;
         post?: never;
@@ -3855,6 +3862,36 @@ export interface operations {
             };
         };
     };
+    get_org_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPolicyBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     put_org_audit_policy: {
         parameters: {
             query?: never;
@@ -3916,6 +3953,8 @@ export interface operations {
                 group?: string;
                 /** @description Размер (по умолчанию и наибольший — из конфигурации). */
                 limit?: number;
+                /** @description Продолжение после этого письма — `after` из ссылки `rel="next"` предыдущей страницы (непрозрачная позиция). */
+                after?: string;
                 /**
                  * @description `subject` — отдать тему писем (`subject`). Только администратору; запрос пишется в журнал аудита как доступ
                  *     к содержимому; размер — не больше `admin.content_page_size`.
@@ -3933,6 +3972,8 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description Следующая страница очереди: `<ссылка>; rel="next"`; нет — страница последняя */
+                    Link?: string;
                     [name: string]: unknown;
                 };
                 content: {

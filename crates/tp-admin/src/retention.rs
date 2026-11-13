@@ -825,6 +825,18 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(ids(&v), vec![json!(a.to_string())]);
         assert_eq!(v["next_offset"], Value::Null);
+        // Без `include=subject` темы и отправителя нет, и чтение в аудит не пишется (ADM-32).
+        let item = v["items"][0].as_object().expect("item");
+        assert!(
+            !item.contains_key("subject") && !item.contains_key("from"),
+            "{item:?}"
+        );
+        assert!(
+            env.audit
+                .records()
+                .iter()
+                .all(|r| r.content_messages.is_none())
+        );
 
         let restore = format!("{hidden}/{a}/restore");
         let (s, _, v) = env.call("POST", &restore, Some("org"), None).await;

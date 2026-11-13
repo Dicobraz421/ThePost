@@ -57,7 +57,7 @@ struct StateRow {
     removing: bool,
 }
 
-const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, disabled_until, removing";
+const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, disabled_until, removing";
 
 fn state((until, removing): (Option<OffsetDateTime>, bool)) -> AccountState {
     match until {
@@ -419,7 +419,7 @@ async fn swap_catalog(
         "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6, enabled = $7,
                              aliases = $8, kind = $9, disabled_until = NULL, updated_at = now()
          WHERE tenant_id = $1 AND account_id = $2
-         RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind",
+         RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal",
     )
     .bind(tu)
     .bind(du)

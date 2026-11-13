@@ -1157,7 +1157,7 @@ impl Delivery {
             (false, true, false, false) => "ESMTP",
             (false, false, _, _) => "SMTP",
         };
-        let ip = match env.conn.client.ip().to_canonical() {
+        let ip = match env.conn.client.ip() {
             std::net::IpAddr::V4(ip) => ip.to_string(),
             std::net::IpAddr::V6(ip) => format!("IPv6:{ip}"),
         };

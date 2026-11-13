@@ -57,6 +57,7 @@ async fn accounts(meta: &PgMeta, tenant: TenantId, n: usize) -> Vec<AccountId> {
                 enabled: true,
                 aliases: Vec::new(),
                 kind: tp_contracts::meta::AccountKind::User,
+                hidden_from_gal: false,
             },
         )
         .await

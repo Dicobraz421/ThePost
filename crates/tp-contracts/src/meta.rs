@@ -78,6 +78,10 @@ pub struct Account {
     pub aliases: Vec<String>,
     /// Вид (CTR-48): пользователь или ресурс. Задаёт [`AccountUpsert::kind`].
     pub kind: AccountKind,
+    /// Скрыта из книги «Организация» (CTR-83, как [`crate::auth::DirAccount::hidden_from_gal`]): нет в GAL, вход и
+    /// приём почты — как обычно. Задаёт [`AccountUpsert::hidden_from_gal`]; каталог PostgreSQL (узел без LDAP)
+    /// передаёт его в `DirAccount::hidden_from_gal`.
+    pub hidden_from_gal: bool,
 }
 
 impl Account {
@@ -118,6 +122,9 @@ pub struct AccountUpsert {
     pub aliases: Vec<String>,
     /// Вид учётной записи (CTR-48); при обновлении заменяет прежний.
     pub kind: AccountKind,
+    /// Скрыта из книги «Организация» (CTR-83); при обновлении заменяет прежний признак. Синхронизация каталога
+    /// переносит `DirAccount::hidden_from_gal` (LDAP — `msExchHideFromAddressLists`, AUTH-16).
+    pub hidden_from_gal: bool,
 }
 
 /// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).
