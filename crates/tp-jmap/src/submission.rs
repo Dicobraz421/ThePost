@@ -1097,23 +1097,30 @@ async fn submit_one(
     match release_at {
         None => {
             record.delivery = outbound
-                .submit(p.tenant, &mail_from, &rcpts, body.clone())
+                .submit(p.tenant, Some(p.account), &mail_from, &rcpts, body.clone())
                 .await?
                 .rcpts;
             if !external.is_empty() {
                 outbound
-                    .enqueue(p.tenant, &mail_from, &external, body.clone())
+                    .enqueue(p.tenant, None, &mail_from, &external, body.clone())
                     .await?;
             }
         }
         Some(at) => {
             // Копии внешним адресам выпускаются тем же сроком, что и письмо.
             let queue = outbound
-                .schedule(p.tenant, &mail_from, &rcpts, body.clone(), at)
+                .schedule(
+                    p.tenant,
+                    Some(p.account),
+                    &mail_from,
+                    &rcpts,
+                    body.clone(),
+                    at,
+                )
                 .await?;
             if !external.is_empty() {
                 outbound
-                    .schedule(p.tenant, &mail_from, &external, body.clone(), at)
+                    .schedule(p.tenant, None, &mail_from, &external, body.clone(), at)
                     .await?;
             }
             record.send_at = at;
@@ -1551,11 +1558,26 @@ mod tests {
             async fn enqueue(
                 &self,
                 tenant: TenantId,
+                owner: Option<tp_contracts::AccountId>,
                 mail_from: &str,
                 rcpts: &[String],
                 raw: Bytes,
             ) -> Result<()> {
-                self.0.enqueue(tenant, mail_from, rcpts, raw).await
+                self.0.enqueue(tenant, owner, mail_from, rcpts, raw).await
+            }
+
+            async fn schedule(
+                &self,
+                tenant: TenantId,
+                owner: Option<tp_contracts::AccountId>,
+                mail_from: &str,
+                rcpts: &[String],
+                raw: Bytes,
+                release_at: time::OffsetDateTime,
+            ) -> Result<tp_contracts::QueueId> {
+                self.0
+                    .schedule(tenant, owner, mail_from, rcpts, raw, release_at)
+                    .await
             }
         }
         let env = Env::new().await;

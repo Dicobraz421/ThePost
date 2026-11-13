@@ -48,7 +48,9 @@ pub enum EventKind {
     /// Изменились скрипты Sieve или автоответ учётной записи ([`crate::sieve::SieveStore`]; кэш программ `tp-sieve`,
     /// JMAP push). Сигнал — [`crate::sieve::sieve_changed`].
     SieveChanged,
-    /// В очереди исходящей почты появились записи (будит smtp-out).
+    /// Очередь исходящей почты организации `tenant` пополнена или срок попытки перенесён (тема
+    /// `<tenant>/queue/outbound`, CTR-73): после фиксации `QueueStore::enqueue`, `reschedule`, `postpone`. Будит
+    /// smtp-out: он перечитывает ближайший срок (`QueueStore::next_due`). Сигнал — [`crate::queue::queue_ready`].
     QueueReady,
     /// Конфигурация перечитана.
     ConfigReloaded,
@@ -94,6 +96,14 @@ pub enum EventKind {
     /// сеансы учётной записи; по `Resync` и при запуске сверяются с хранилищем. Сигнал —
     /// [`crate::meta::account_disabled`].
     AccountDisabled {
+        /// Учётная запись.
+        account: AccountId,
+    },
+    /// Отключённый ящик `account` организации `tenant` изменился (CTR-77): отключён, срок хранения изменён,
+    /// восстановлен или подключён к другой учётной записи. Подписчик — воркер хранения отключённых ящиков роли
+    /// maintenance: пересчитывает ближайший срок; по `Resync` и при запуске сверяется с хранилищем
+    /// (`AccountStore::expired_accounts`). Сигнал — [`crate::meta::disabled_mailbox_changed`].
+    DisabledMailboxChanged {
         /// Учётная запись.
         account: AccountId,
     },
@@ -211,6 +221,9 @@ mod tests {
             },
             EventKind::ShardsChanged,
             EventKind::AccountDisabled {
+                account: AccountId::new(),
+            },
+            EventKind::DisabledMailboxChanged {
                 account: AccountId::new(),
             },
             EventKind::GalChanged {

@@ -1,0 +1,33 @@
+# Конфигурация cross для .github/actions/release-build (CROSS_CONFIG): вход по Kerberos (фича `gssapi`, решение 107,
+# CI-12). libgssapi-sys генерирует привязки bindgen'ом по заголовкам MIT Kerberos и линкуется с libgssapi_krb5.
+# Образы cross 0.2.5 — Ubuntu 16.04 (glibc 2.23): их libclang 3.8 bindgen 0.71 не понимает, берётся libclang 8 из
+# xenial-updates (новее в 16.04 нет). libkrb5-dev — архитектуры цели (multiarch, для aarch64 — с ports.ubuntu.com).
+# Пакеты закреплены выпуском 16.04 (архив не меняется): образ build и repro одинаков, сборка воспроизводима.
+[build]
+pre-build = [
+    "set -eux",
+    "dpkg --add-architecture \"$CROSS_DEB_ARCH\"",
+    "apt-get update",
+    "apt-get install --assume-yes --no-install-recommends libclang1-8 libclang-common-8-dev \"libkrb5-dev:$CROSS_DEB_ARCH\"",
+    # Префикс для libgssapi-sys (LIBGSSAPI_PREFIX): при кросс-сборке pkg-config не используется, а библиотеку
+    # он ищет только в /lib и /usr/lib, заголовки — вне sysroot кросс-компилятора (/usr/aarch64-linux-gnu).
+    "case \"$CROSS_DEB_ARCH\" in amd64) m=x86_64-linux-gnu ;; arm64) m=aarch64-linux-gnu ;; *) exit 1 ;; esac",
+    "mkdir -p /opt/gssapi/include",
+    "ln -s /usr/include/gssapi /usr/include/gssapi.h /opt/gssapi/include/",
+    "ln -s \"/usr/lib/$m\" /opt/gssapi/lib",
+    # Встроенные заголовки clang (stddef.h): каталог ресурсов libclang 8 сам не находит; имя без номера версии.
+    "ln -s /usr/lib/llvm-8/lib/clang/*/include /opt/clang-include",
+    "test -f /opt/clang-include/stddef.h",
+]
+
+[build.env]
+passthrough = ["LIBCLANG_PATH=/usr/lib/llvm-8/lib", "LIBGSSAPI_PREFIX=/opt/gssapi"]
+
+# bindgen берёт BINDGEN_EXTRA_CLANG_ARGS_<цель> вместо общей переменной: для aarch64 образ cross задаёт в ней
+# --sysroot, она повторяется здесь. MIT Kerberos 1.13 (Ubuntu 16.04) ещё не объявляет псевдоним RFC 2744
+# GSS_S_BAD_MIC = GSS_S_BAD_SIG (есть с 1.17), а libgssapi-sys его берёт: тот же #define, что в новых заголовках.
+[target.x86_64-unknown-linux-gnu.env]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu=-isystem /opt/clang-include -DGSS_S_BAD_MIC=GSS_S_BAD_SIG"]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu -isystem /opt/clang-include -DGSS_S_BAD_MIC=GSS_S_BAD_SIG"]

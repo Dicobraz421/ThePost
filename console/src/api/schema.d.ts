@@ -1147,7 +1147,7 @@ export interface components {
             at: string;
             /** @description Решение: `accept`, `reject`, `defer`, `quarantine`, `discard`, `hold`. */
             decision: string;
-            /** @description Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`. */
+            /** @description Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`, `itip`. */
             kind: string;
             /** @description Message-ID. */
             message_id?: string | null;
@@ -1350,7 +1350,7 @@ export interface components {
             at: string;
             /** @description Клиент: протокол и адрес. */
             client?: string | null;
-            /** @description Пояснение (Message-ID, адрес, право). */
+            /** @description Пояснение (Message-ID, адрес, право, строка запроса поиска). */
             detail?: string | null;
             /** @description Папка. */
             mailbox?: string | null;
@@ -1416,6 +1416,16 @@ export interface components {
         };
         /** @description Политика уровня; `null` — не задано на уровне. */
         PolicyBody: {
+            /**
+             * @description Возраст автопереноса писем в архив (`730d`); уровень папки не применяется (CTR-76).
+             * @example 730d
+             */
+            archive_after?: string | null;
+            /**
+             * Format: int64
+             * @description Квота архива ящика, байт (отдельно от основной квоты).
+             */
+            archive_quota_bytes?: number | null;
             /** @description Селектор ключа DKIM. */
             dkim_selector?: string | null;
             /**
@@ -3717,7 +3727,7 @@ export interface operations {
                 /** @description Кто относительно ящика: `owner`, `delegate`, `admin`. */
                 actor_kind: string | null;
                 /**
-                 * @description Действие (`login`, `read`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,
+                 * @description Действие (`login`, `read`, `search`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,
                  *     `change_rules`, `change_forwarding`).
                  */
                 action: string | null;

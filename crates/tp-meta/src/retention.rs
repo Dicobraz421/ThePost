@@ -131,6 +131,8 @@ struct PolicyRow {
     milter_profile: Option<String>,
     trash_purge: Option<String>,
     trash_purge_user_can_choose: Option<bool>,
+    archive_after_us: Option<i64>,
+    archive_quota_bytes: Option<i64>,
 }
 
 impl PolicyRow {
@@ -163,13 +165,15 @@ impl PolicyRow {
                     })
                 })
                 .transpose()?,
+            archive_after: self.archive_after_us.map(from_micros).transpose()?,
+            archive_quota_bytes: self.archive_quota_bytes.map(to_u64).transpose()?,
         })
     }
 }
 
 const POLICY_COLUMNS: &str = "level, quota_bytes, trash_retention_us, retention_us, send_per_hour, \
                               rcpts_per_hour, max_recipients, dkim_selector, milter_profile, \
-                              trash_purge, trash_purge_user_can_choose";
+                              trash_purge, trash_purge_user_can_choose, archive_after_us, archive_quota_bytes";
 
 /// Действующая политика в открытой транзакции организации: заданные уровни по порядку цепочки.
 async fn resolve_in(
@@ -242,14 +246,16 @@ impl PolicyStore for PgMeta {
             sqlx::query(
                 "INSERT INTO policies (tenant_id, level, object_id, quota_bytes, trash_retention_us, retention_us,
                                        send_per_hour, rcpts_per_hour, max_recipients, dkim_selector, milter_profile,
-                                       trash_purge, trash_purge_user_can_choose)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                       trash_purge, trash_purge_user_can_choose, archive_after_us, archive_quota_bytes)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                  ON CONFLICT (tenant_id, level, object_id) DO UPDATE SET
                      quota_bytes = EXCLUDED.quota_bytes, trash_retention_us = EXCLUDED.trash_retention_us,
                      retention_us = EXCLUDED.retention_us, send_per_hour = EXCLUDED.send_per_hour,
                      rcpts_per_hour = EXCLUDED.rcpts_per_hour, max_recipients = EXCLUDED.max_recipients, dkim_selector = EXCLUDED.dkim_selector,
                      milter_profile = EXCLUDED.milter_profile, trash_purge = EXCLUDED.trash_purge,
-                     trash_purge_user_can_choose = EXCLUDED.trash_purge_user_can_choose, updated_at = now()",
+                     trash_purge_user_can_choose = EXCLUDED.trash_purge_user_can_choose,
+                     archive_after_us = EXCLUDED.archive_after_us, archive_quota_bytes = EXCLUDED.archive_quota_bytes,
+                     updated_at = now()",
             )
             .bind(tenant.as_uuid())
             .bind(level(target))
@@ -264,6 +270,8 @@ impl PolicyStore for PgMeta {
             .bind(&policy.milter_profile)
             .bind(policy.trash_purge.map(|r| purge_str(r.mode)))
             .bind(policy.trash_purge.map(|r| r.user_can_choose))
+            .bind(policy.archive_after.map(micros).transpose()?)
+            .bind(policy.archive_quota_bytes.map(to_i64).transpose()?)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -872,51 +880,26 @@ impl TrashStore for PgMeta {
 
 #[async_trait]
 impl Quota for PgMeta {
-    /// Использование — сумма размеров писем учётной записи, включая корзину, без скрытых; лимит — политика
-    /// учётной записи по цепочке, иначе [`RetentionConfig::quota_bytes`].
+    /// Использование — сумма размеров писем учётной записи вне ветки архива, включая корзину, без скрытых; лимит —
+    /// политика учётной записи по цепочке, иначе [`RetentionConfig::quota_bytes`].
     async fn usage(&self, scope: AccountScope) -> Result<QuotaUsage> {
         self.idempotent(|| async move {
             let db = self.box_db(scope).await?;
-            if db.shard != ShardId::MAIN {
-                return self.usage_remote(&db, scope).await;
-            }
-            let mut tx = begin(&self.pool, scope.tenant).await?;
-            let row: Option<(Uuid, i64, i64)> = sqlx::query_as(
-                "SELECT a.domain_id, coalesce(sum(m.size), 0)::bigint, count(m.message_id)
-             FROM accounts a
-             LEFT JOIN messages m ON m.tenant_id = a.tenant_id AND m.account_id = a.account_id
-                                 AND m.hidden_at IS NULL
-             WHERE a.tenant_id = $1 AND a.account_id = $2
-             GROUP BY a.domain_id",
-            )
-            .bind(scope.tenant.as_uuid())
-            .bind(scope.account.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            let (domain, used, messages) = row.ok_or(Error::NotFound)?;
-            let policy = resolve_in(
-                &mut tx,
-                scope.tenant,
-                Some(DomainId::from_uuid(domain)),
-                Some(scope.account),
-                None,
-            )
-            .await?;
-            crate::commits::commit(tx).await?;
-            Ok(QuotaUsage {
-                used_bytes: to_u64(used)?,
-                messages: to_u64(messages)?,
-                limit_bytes: policy.quota_bytes.or(self.cfg.retention.quota_bytes),
-            })
+            self.usage_of(&db, scope, false).await
         })
         .await
     }
 }
 
 impl PgMeta {
-    /// Квота ящика на другом шарде: учётная запись и политика — в каталоге, письма — на шарде.
-    async fn usage_remote(&self, db: &BoxDb, scope: AccountScope) -> Result<QuotaUsage> {
+    /// Квота ящика (CTR-76): основная (`archive = false`, лимит `quota_bytes`, иначе конфигурация) или архива
+    /// (лимит `archive_quota_bytes`). Учётная запись и политика — в каталоге, письма — в БД ящика `db`.
+    pub(crate) async fn usage_of(
+        &self,
+        db: &BoxDb,
+        scope: AccountScope,
+        archive: bool,
+    ) -> Result<QuotaUsage> {
         let mut tx = begin(&self.pool, scope.tenant).await?;
         let domain: Uuid = sqlx::query_scalar(
             "SELECT domain_id FROM accounts WHERE tenant_id = $1 AND account_id = $2",
@@ -936,25 +919,40 @@ impl PgMeta {
         )
         .await?;
         crate::commits::commit(tx).await?;
-        let (used, messages) = box_usage(&db.pool, scope).await?;
+        let (used, messages) = box_usage(&db.pool, scope, archive).await?;
         Ok(QuotaUsage {
             used_bytes: used,
             messages,
-            limit_bytes: policy.quota_bytes.or(self.cfg.retention.quota_bytes),
+            limit_bytes: match archive {
+                true => policy.archive_quota_bytes,
+                false => policy.quota_bytes.or(self.cfg.retention.quota_bytes),
+            },
         })
     }
 }
 
-/// Размер и число писем ящика на шарде `pool`, включая корзину, без скрытых.
+/// Ветка архива ящика `$1`/`$2` (CTR-76): папка с ролью `archive` и все вложенные — CTE `arch(mailbox_id)`.
+pub(crate) const ARCHIVE_BRANCH: &str = "arch(mailbox_id) AS (
+         SELECT mailbox_id FROM mailboxes WHERE tenant_id = $1 AND account_id = $2 AND role = 'archive'
+         UNION
+         SELECT c.mailbox_id FROM mailboxes c JOIN arch ON c.parent_id = arch.mailbox_id
+         WHERE c.tenant_id = $1 AND c.account_id = $2)";
+
+/// Размер и число писем ящика на шарде `pool` без скрытых: ветки архива (`archive`) или вне её, включая корзину
+/// (CTR-76 — квоты раздельные).
 pub(crate) async fn box_usage(
     pool: &crate::pool::DbPool,
     scope: AccountScope,
+    archive: bool,
 ) -> Result<(u64, u64)> {
     let mut tx = begin(pool, scope.tenant).await?;
-    let (used, messages): (i64, i64) = sqlx::query_as(
-        "SELECT coalesce(sum(size), 0)::bigint, count(*) FROM messages
-         WHERE tenant_id = $1 AND account_id = $2 AND hidden_at IS NULL",
-    )
+    let op = if archive { "IN" } else { "NOT IN" };
+    let (used, messages): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "WITH RECURSIVE {ARCHIVE_BRANCH}
+         SELECT coalesce(sum(size), 0)::bigint, count(*) FROM messages
+         WHERE tenant_id = $1 AND account_id = $2 AND hidden_at IS NULL
+           AND mailbox_id {op} (SELECT mailbox_id FROM arch)"
+    )))
     .bind(scope.tenant.as_uuid())
     .bind(scope.account.as_uuid())
     .fetch_one(&mut *tx)
@@ -1002,6 +1000,8 @@ mod tests {
             milter_profile: None,
             trash_purge: None,
             trash_purge_user_can_choose: None,
+            archive_after_us: None,
+            archive_quota_bytes: None,
         };
         let ranks: Vec<u8> = ["tenant", "domain", "account", "mailbox"]
             .iter()

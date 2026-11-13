@@ -89,6 +89,7 @@ async fn submit_third_message_over_limit() {
         let sent = d
             .submit(
                 TenantId::DEFAULT,
+                None,
                 ALICE,
                 &batch(n),
                 Bytes::from_static(MAIL),
@@ -102,7 +103,13 @@ async fn submit_third_message_over_limit() {
     }
     let third = batch(2);
     let sent = d
-        .submit(TenantId::DEFAULT, ALICE, &third, Bytes::from_static(MAIL))
+        .submit(
+            TenantId::DEFAULT,
+            None,
+            ALICE,
+            &third,
+            Bytes::from_static(MAIL),
+        )
         .await
         .expect("submit");
     assert_eq!(sent.rcpts.len(), 900);

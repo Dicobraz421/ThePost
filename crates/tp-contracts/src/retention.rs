@@ -195,7 +195,8 @@ pub trait TrashStore: Send + Sync + 'static {
     ) -> Result<()>;
 }
 
-/// Квота учётной записи: использование (письма, включая корзину, без скрытых) и лимит из политики
+/// Основная квота учётной записи: использование (письма вне ветки архива, включая корзину, без скрытых; квота архива —
+/// [`crate::archive::ArchiveStore::archive_usage`], CTR-76) и лимит из политики
 /// ([`Policy::quota_bytes`](crate::meta::Policy); не задан — значение по умолчанию конфигурации, `None` — без лимита).
 /// Реализация — `tp-meta`; in-memory — `tp-testkit`. Проверяют `ingest`, `copy`, `APPEND`, JMAP `Email/import`.
 #[async_trait]

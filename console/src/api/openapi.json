@@ -467,7 +467,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`.",
+            "description": "Событие: `receive`, `reject`, `deliver`, `relay`, `dsn`, `itip`.",
             "type": "string"
           },
           "message_id": {
@@ -1000,7 +1000,7 @@
             ]
           },
           "detail": {
-            "description": "Пояснение (Message-ID, адрес, право).",
+            "description": "Пояснение (Message-ID, адрес, право, строка запроса поиска).",
             "type": [
               "string",
               "null"
@@ -1201,6 +1201,23 @@
         "additionalProperties": false,
         "description": "Политика уровня; `null` — не задано на уровне.",
         "properties": {
+          "archive_after": {
+            "description": "Возраст автопереноса писем в архив (`730d`); уровень папки не применяется (CTR-76).",
+            "example": "730d",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "archive_quota_bytes": {
+            "description": "Квота архива ящика, байт (отдельно от основной квоты).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "dkim_selector": {
             "description": "Селектор ключа DKIM.",
             "type": [
@@ -5068,7 +5085,7 @@
             }
           },
           {
-            "description": "Действие (`login`, `read`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,\n`change_rules`, `change_forwarding`).",
+            "description": "Действие (`login`, `read`, `search`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,\n`change_rules`, `change_forwarding`).",
             "in": "path",
             "name": "action",
             "required": true,

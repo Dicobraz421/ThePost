@@ -217,7 +217,14 @@ impl Groups {
     /// Ставит письмо в очередь модерации группы; ошибка постановки снимает ссылку на объект.
     pub(crate) async fn hold(&self, h: Hold<'_>) -> Result<HeldId> {
         let size = h.raw.len() as u64;
-        let blob = store_blob(self.blobs.as_ref(), self.index.as_ref(), h.tenant, h.raw).await?;
+        let blob = store_blob(
+            self.blobs.as_ref(),
+            self.index.as_ref(),
+            h.tenant,
+            None,
+            h.raw,
+        )
+        .await?;
         let id = HeldId::new();
         let message = HeldMessage {
             id,

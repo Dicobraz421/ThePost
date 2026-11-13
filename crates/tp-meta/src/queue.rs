@@ -13,7 +13,11 @@
 //! записи, которой нет в справочнике, — в основную БД. Вызывающий, знающий шард, может ставить и через
 //! хранилища шарда ([`PgMeta::on_shard`]). `claim` обходит шарды по очереди:
 //! каждый проход начинается со следующего шарда и добирает `limit` с остальных; операции захвата идут
-//! на шард записи.
+//! на шард записи; `next_due` — наименьший по шардам.
+//!
+//! Без опроса (CTR-73): после фиксации `enqueue`, `reschedule` и `postpone` — сигнал `QueueReady` организации
+//! записи ([`queue_ready`]); ближайший срок `next_due` — `queue.next_attempt` (наименьший срок незавершённых
+//! получателей, его поддерживает `settle`), у записи под лизой — не раньше конца лизы.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -24,7 +28,7 @@ use time::OffsetDateTime;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::queue::{
     Claimed, DsnNotify, DsnParams, DsnRet, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt,
-    RcptStatus,
+    RcptStatus, queue_ready,
 };
 use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, QueueId, Result, TenantId};
 use uuid::Uuid;
@@ -186,16 +190,17 @@ impl EntryRow {
     }
 }
 
-/// Блокирует запись захвата: номер устарел или записи нет — `Conflict`.
-async fn lock_claim(tx: &mut PgConnection, claim: &QueueClaim) -> Result<()> {
-    let found: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM queue WHERE queue_id = $1 AND fencing = $2 FOR UPDATE")
-            .bind(claim.id.as_uuid())
-            .bind(to_i64(claim.fencing)?)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-    found.map(|_| ()).ok_or(Error::Conflict)
+/// Блокирует запись захвата и возвращает её организацию: номер устарел или записи нет — `Conflict`.
+async fn lock_claim(tx: &mut PgConnection, claim: &QueueClaim) -> Result<TenantId> {
+    let found: Option<Uuid> = sqlx::query_scalar(
+        "SELECT tenant_id FROM queue WHERE queue_id = $1 AND fencing = $2 FOR UPDATE",
+    )
+    .bind(claim.id.as_uuid())
+    .bind(to_i64(claim.fencing)?)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    found.map(TenantId::from_uuid).ok_or(Error::Conflict)
 }
 
 /// Пересчитывает срок записи по незавершённым получателям; `false` — их не осталось, запись удалена.
@@ -262,7 +267,7 @@ impl QueueStore for PgMeta {
         let id = QueueId::new();
         let tenant = msg.tenant;
         let msg = std::sync::Arc::new(msg);
-        self.keyed(
+        let id = self.keyed(
             tenant,
             |tx| {
                 let msg = msg.clone();
@@ -285,6 +290,32 @@ impl QueueStore for PgMeta {
                 })
             },
         )
+        .await?;
+        self.signal(queue_ready(tenant)).await;
+        Ok(id)
+    }
+
+    async fn next_due(&self) -> Result<Option<OffsetDateTime>> {
+        if let Some(views) = self.shard_views().await? {
+            let mut best: Option<OffsetDateTime> = None;
+            for (_, view) in &views {
+                if let Some(at) = QueueStore::next_due(view).await? {
+                    best = Some(best.map_or(at, |b| b.min(at)));
+                }
+            }
+            return Ok(best);
+        }
+        self.idempotent(|| async move {
+            let mut tx = begin_system(&self.pool).await?;
+            let at: Option<OffsetDateTime> = sqlx::query_scalar(
+                "SELECT min(greatest(next_attempt, coalesce(lease_until, next_attempt))) FROM queue",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            Ok(at)
+        })
         .await
     }
 
@@ -412,10 +443,11 @@ impl QueueStore for PgMeta {
             let view = queue_view(self, &views, claim.id).await?;
             return QueueStore::reschedule(view, claim, rcpt, at, reason).await;
         }
-        self.once(async move {
-            let mut tx = begin_system(&self.pool).await?;
-            lock_claim(&mut tx, claim).await?;
-            let n = sqlx::query(
+        let tenant = self
+            .once(async move {
+                let mut tx = begin_system(&self.pool).await?;
+                let tenant = lock_claim(&mut tx, claim).await?;
+                let n = sqlx::query(
                 "UPDATE queue_rcpts SET next_attempt = $3, attempts = attempts + 1, last_error = $4
              WHERE queue_id = $1 AND address = $2 AND status = 'pending'",
             )
@@ -427,14 +459,16 @@ impl QueueStore for PgMeta {
             .await
             .map_err(db_err)?
             .rows_affected();
-            if n != 1 {
-                return Err(Error::NotFound);
-            }
-            settle(&mut tx, claim.id).await?;
-            crate::commits::commit(tx).await?;
-            Ok(())
-        })
-        .await
+                if n != 1 {
+                    return Err(Error::NotFound);
+                }
+                settle(&mut tx, claim.id).await?;
+                crate::commits::commit(tx).await?;
+                Ok(tenant)
+            })
+            .await?;
+        self.signal(queue_ready(tenant)).await;
+        Ok(())
     }
 
     async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
@@ -442,29 +476,32 @@ impl QueueStore for PgMeta {
             let view = queue_view(self, &views, claim.id).await?;
             return QueueStore::postpone(view, claim, rcpt, at).await;
         }
-        self.once(async move {
-            let mut tx = begin_system(&self.pool).await?;
-            lock_claim(&mut tx, claim).await?;
-            // Перенос планировщиком — не попытка: `attempts` и `last_error` не меняются (META-39, CTR-40).
-            let n = sqlx::query(
-                "UPDATE queue_rcpts SET next_attempt = $3
+        let tenant = self
+            .once(async move {
+                let mut tx = begin_system(&self.pool).await?;
+                let tenant = lock_claim(&mut tx, claim).await?;
+                // Перенос планировщиком — не попытка: `attempts` и `last_error` не меняются (META-39, CTR-40).
+                let n = sqlx::query(
+                    "UPDATE queue_rcpts SET next_attempt = $3
                  WHERE queue_id = $1 AND address = $2 AND status = 'pending'",
-            )
-            .bind(claim.id.as_uuid())
-            .bind(rcpt)
-            .bind(at)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-            if n != 1 {
-                return Err(Error::NotFound);
-            }
-            settle(&mut tx, claim.id).await?;
-            crate::commits::commit(tx).await?;
-            Ok(())
-        })
-        .await
+                )
+                .bind(claim.id.as_uuid())
+                .bind(rcpt)
+                .bind(at)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+                if n != 1 {
+                    return Err(Error::NotFound);
+                }
+                settle(&mut tx, claim.id).await?;
+                crate::commits::commit(tx).await?;
+                Ok(tenant)
+            })
+            .await?;
+        self.signal(queue_ready(tenant)).await;
+        Ok(())
     }
 
     /// Запись ещё не захватывали — `fencing = 0` (захват его увеличивает); удаление блокирует строку, поэтому

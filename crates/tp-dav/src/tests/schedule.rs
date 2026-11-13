@@ -18,7 +18,9 @@ use tp_contracts::schedule::{
     ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, ItipOutgoing, ItipSender, ItipSource,
 };
 use tp_contracts::{DomainId, TenantId};
-use tp_testkit::{FakeAuthenticator, ManualClock, MemDav, MemItipSender, MemMetadata, MemOutbound};
+use tp_testkit::{
+    FakeAuthenticator, ManualClock, MemDav, MemGroups, MemItipSender, MemMetadata, MemOutbound,
+};
 
 use super::{Resp, basic};
 use crate::{DavConfig, Deps, ImipSender, ItipInbox, ScheduleDeps, imip, itip, router_with};
@@ -38,6 +40,8 @@ struct Sched {
     accounts: Vec<(String, AccountScope)>,
     /// Учётные записи (псевдонимы — DAV-23).
     meta: MemMetadata,
+    /// Группы рассылки (DAV-30).
+    groups: MemGroups,
 }
 
 impl Sched {
@@ -47,7 +51,8 @@ impl Sched {
 
     async fn with_config(cfg: DavConfig) -> Self {
         let tenant = TenantId::new();
-        let meta = MemMetadata::new(ManualClock::default().shared());
+        let groups = MemGroups::new();
+        let meta = MemMetadata::new(ManualClock::default().shared()).with_groups(groups.clone());
         let auth = FakeAuthenticator::default();
         let mut accounts = Vec::new();
         for login in [IVAN, PETR, OLGA] {
@@ -90,7 +95,6 @@ impl Sched {
                 auth: Arc::new(auth),
                 store: Arc::new(store.clone()),
             },
-            None,
             Some(ScheduleDeps {
                 accounts: Arc::new(meta.clone()),
                 delivery: Arc::new(inbox.clone()),
@@ -107,6 +111,7 @@ impl Sched {
             tenant,
             accounts,
             meta,
+            groups,
         }
     }
 
@@ -1172,4 +1177,525 @@ async fn default_calendar_by_flag() {
         "{}",
         r.body
     );
+}
+
+// ---------- DAV-30: участник по псевдониму и адресу группы ----------
+
+/// Псевдоним коллеги — его учётная запись (приглашение не уходит внешним письмом, приёмка 0.2.0); адрес группы
+/// рассылки — её учётные записи участниками с `MEMBER`, сама группа сообщений не получает.
+#[tokio::test]
+async fn invite_alias_and_group() {
+    use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
+
+    let env = Sched::new().await;
+    let alias = "p.petrov@example.org";
+    env.meta
+        .upsert(
+            env.tenant,
+            AccountUpsert {
+                domain: DomainId::new(),
+                login: PETR.to_owned(),
+                display_name: PETR.to_owned(),
+                external_id: None,
+                enabled: true,
+                aliases: vec![alias.to_owned()],
+                kind: AccountKind::User,
+            },
+        )
+        .await
+        .expect("псевдоним");
+    let team = "team@example.org";
+    env.groups
+        .put(DistributionGroup {
+            id: tp_contracts::GroupId::new(),
+            tenant: env.tenant,
+            name: "Команда".to_owned(),
+            address: Some(team.to_owned()),
+            external_id: None,
+            members: vec![
+                GroupMember::Account(env.scope(OLGA).account),
+                GroupMember::Account(env.scope(IVAN).account),
+            ],
+            senders: SenderRestriction::Anyone,
+            moderators: Vec::new(),
+            hidden_from_gal: false,
+        })
+        .await
+        .expect("группа");
+
+    let body = meeting(
+        "m-30",
+        IVAN,
+        T10,
+        0,
+        &format!(
+            "{}ATTENDEE;CN=Команда:mailto:{team}\r\n",
+            attendee(alias, "NEEDS-ACTION")
+        ),
+    );
+    let r = env.put(IVAN, "g.ics", &[], &body).await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    assert!(env.sender.sent().is_empty(), "внешних писем нет");
+
+    // Псевдоним — событие в календаре владельца.
+    let petr = env
+        .by_uid(PETR, "m-30")
+        .await
+        .expect("у владельца псевдонима");
+    assert!(
+        petr.body
+            .contains(&format!("PARTSTAT=NEEDS-ACTION:mailto:{alias}")),
+        "{}",
+        petr.body
+    );
+    // Группа — у каждого её участника, кроме самого организатора.
+    let olga = env.by_uid(OLGA, "m-30").await.expect("у участника группы");
+    assert!(
+        olga.body.contains("MEMBER=") && olga.body.contains(&format!("mailto:{OLGA}")),
+        "{}",
+        olga.body
+    );
+    let org = env.by_uid(IVAN, "m-30").await.expect("у организатора");
+    assert!(org.body.contains("CUTYPE=GROUP"), "{}", org.body);
+    assert_eq!(
+        org.body.matches("SCHEDULE-STATUS=1.2").count(),
+        2,
+        "псевдоним и участник группы; группе не отправляется: {}",
+        org.body
+    );
+    assert_eq!(
+        org.body.matches(&format!("mailto:{IVAN}")).count(),
+        1,
+        "организатор участником не добавлен: {}",
+        org.body
+    );
+    assert_eq!(
+        r.header("schedule-tag"),
+        Some(format!("\"{}\"", tag(&org)).as_str()),
+        "тег — объекта с раскрытой группой"
+    );
+
+    // Ответ с псевдонима доходит организатору; повторная запись группу заново не раскрывает.
+    let accepted = petr.body.replace(
+        &format!("PARTSTAT=NEEDS-ACTION:mailto:{alias}"),
+        &format!("PARTSTAT=ACCEPTED:mailto:{alias}"),
+    );
+    let r = env
+        .send(PETR, "PUT", &object(PETR, &petr.name), &[], &accepted)
+        .await;
+    assert_eq!(r.status, 204, "{}", r.body);
+    let org = env.by_uid(IVAN, "m-30").await.expect("у организатора");
+    assert!(
+        org.body.contains(&format!(
+            "PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:{alias}"
+        )),
+        "{}",
+        org.body
+    );
+    assert_eq!(org.body.matches(&format!("mailto:{OLGA}")).count(), 1);
+    assert!(env.sender.sent().is_empty());
+}
+
+// ---------- DAV-31: частные случаи RFC 6638 ----------
+
+/// Удаление календаря целиком: организатор — `CANCEL` участникам, участник — отказ организатору.
+#[tokio::test]
+async fn delete_calendar_cancels_and_declines() {
+    let env = Sched::new().await;
+    let v = meeting("m-31", IVAN, T10, 0, &two("NEEDS-ACTION"));
+    assert_eq!(env.put(IVAN, "m.ics", &[], &v).await.status, 201);
+    // Ольга удаляет свой календарь с приглашением — отказ.
+    let r = env
+        .send(OLGA, "DELETE", &format!("{}calendar/", home(OLGA)), &[], "")
+        .await;
+    assert_eq!(r.status, 204);
+    let org = env.body(IVAN, "m-31").await;
+    assert!(
+        org.contains(&format!(
+            "PARTSTAT=DECLINED;SCHEDULE-STATUS=2.0:mailto:{OLGA}"
+        )),
+        "{org}"
+    );
+    // Иван удаляет календарь со встречей — отмена.
+    let r = env
+        .send(IVAN, "DELETE", &format!("{}calendar/", home(IVAN)), &[], "")
+        .await;
+    assert_eq!(r.status, 204);
+    assert!(env.body(PETR, "m-31").await.contains("STATUS:CANCELLED"));
+}
+
+/// Участник меняет в своей копии только своё участие и личные свойства, иначе — 403.
+#[tokio::test]
+async fn attendee_changes_only_own_participation() {
+    let env = Sched::new().await;
+    let v = meeting("m-32", IVAN, T10, 0, &two("NEEDS-ACTION"));
+    assert_eq!(env.put(IVAN, "m.ics", &[], &v).await.status, 201);
+    let mine = env.by_uid(PETR, "m-32").await.expect("копия");
+    let path = object(PETR, &mine.name);
+    let olga_needs = format!("PARTSTAT=NEEDS-ACTION:mailto:{OLGA}");
+    for (what, body) in [
+        ("описание", mine.body.replace("Планёрка", "Другое")),
+        ("время", mine.body.replace(T10, T14)),
+        (
+            "чужой PARTSTAT",
+            mine.body
+                .replace(&olga_needs, &format!("PARTSTAT=ACCEPTED:mailto:{OLGA}")),
+        ),
+    ] {
+        let r = env.send(PETR, "PUT", &path, &[], &body).await;
+        assert_eq!(r.status, 403, "{what}");
+        assert!(
+            r.body.contains("allowed-attendee-scheduling-object-change"),
+            "{what}: {}",
+            r.body
+        );
+    }
+    assert_eq!(env.by_uid(PETR, "m-32").await.expect("o").etag, mine.etag);
+    // Свой ответ, прозрачность, напоминание и свойство клиента — можно.
+    let own = mine
+        .body
+        .replace(
+            &format!("PARTSTAT=NEEDS-ACTION:mailto:{PETR}"),
+            &format!("PARTSTAT=ACCEPTED:mailto:{PETR}"),
+        )
+        .replace(
+            "END:VEVENT",
+            "TRANSP:TRANSPARENT\r\nX-MOZ-LASTACK:20260101T000000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\n\
+             TRIGGER:-PT15M\r\nDESCRIPTION:Скоро\r\nEND:VALARM\r\nEND:VEVENT",
+        );
+    let r = env.send(PETR, "PUT", &path, &[], &own).await;
+    assert_eq!(r.status, 204, "{}", r.body);
+    let org = env.body(IVAN, "m-32").await;
+    assert!(
+        org.contains(&format!(
+            "PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:{PETR}"
+        )),
+        "{org}"
+    );
+    // Организатор меняет что угодно.
+    let v2 = meeting("m-32", IVAN, T14, 1, &two("NEEDS-ACTION"));
+    assert_eq!(env.put(IVAN, "m.ics", &[], &v2).await.status, 204);
+}
+
+/// Ответ на отдельное вхождение ряда — переопределение у организатора; `ADD` — новое вхождение; VTODO — в список
+/// задач.
+#[tokio::test]
+async fn instance_reply_add_and_todo() {
+    let env = Sched::new().await;
+    let series = meeting(
+        "m-33",
+        IVAN,
+        T10,
+        0,
+        &format!(
+            "RRULE:FREQ=DAILY;COUNT=3\r\n{}",
+            attendee(PETR, "NEEDS-ACTION")
+        ),
+    );
+    assert_eq!(env.put(IVAN, "s.ics", &[], &series).await.status, 201);
+    let one = itip_msg(
+        "REPLY",
+        &meeting(
+            "m-33",
+            IVAN,
+            "20260106T100000Z",
+            0,
+            &format!(
+                "RECURRENCE-ID:20260106T100000Z\r\n{}",
+                attendee(PETR, "DECLINED")
+            ),
+        ),
+    );
+    assert_eq!(
+        env.deliver(IVAN, PETR, ItipMethod::Reply, &one).await,
+        ItipOutcome::Applied
+    );
+    let org = env.by_uid(IVAN, "m-33").await.expect("o");
+    assert_eq!(org.body.matches("BEGIN:VEVENT").count(), 2, "{}", org.body);
+    assert!(
+        org.body.contains("RECURRENCE-ID:20260106T100000Z")
+            && org.body.contains(&format!(
+                "PARTSTAT=DECLINED;SCHEDULE-STATUS=2.0:mailto:{PETR}"
+            )),
+        "{}",
+        org.body
+    );
+    assert_eq!(
+        env.inbox_len(IVAN).await,
+        0,
+        "ответ применён, не во входящих"
+    );
+    // Повтор — без изменений.
+    assert_eq!(
+        env.deliver(IVAN, PETR, ItipMethod::Reply, &one).await,
+        ItipOutcome::Applied
+    );
+    assert_eq!(env.by_uid(IVAN, "m-33").await.expect("o").etag, org.etag);
+
+    // ADD: новое вхождение ряда внешнего организатора (у Ольги других встреч нет).
+    let theirs = meeting(
+        "m-34",
+        ANNA,
+        T10,
+        0,
+        &format!(
+            "RRULE:FREQ=DAILY;COUNT=2\r\n{}",
+            attendee(OLGA, "NEEDS-ACTION")
+        ),
+    );
+    assert_eq!(
+        env.deliver(
+            OLGA,
+            ANNA,
+            ItipMethod::Request,
+            &itip_msg("REQUEST", &theirs)
+        )
+        .await,
+        ItipOutcome::Applied
+    );
+    let add = itip_msg(
+        "ADD",
+        &meeting(
+            "m-34",
+            ANNA,
+            "20260110T100000Z",
+            0,
+            &attendee(OLGA, "NEEDS-ACTION"),
+        ),
+    );
+    assert_eq!(
+        env.deliver(OLGA, ANNA, ItipMethod::Add, &add).await,
+        ItipOutcome::Applied
+    );
+    let o = env.by_uid(OLGA, "m-34").await.expect("o");
+    assert!(
+        o.body.contains("RDATE:20260110T100000Z")
+            && o.body.contains("RECURRENCE-ID:20260110T100000Z"),
+        "{}",
+        o.body
+    );
+    assert_eq!(env.busy_in_january(OLGA).await, 3);
+    assert_eq!(
+        env.deliver(OLGA, ANNA, ItipMethod::Add, &add).await,
+        ItipOutcome::Applied
+    );
+    assert_eq!(env.by_uid(OLGA, "m-34").await.expect("o").etag, o.etag);
+    assert_eq!(env.inbox_len(OLGA).await, 0);
+    // ADD без ряда — во входящие клиенту; чужой организатор — отказ.
+    let orphan = add.replace("m-34", "m-35");
+    assert_eq!(
+        env.deliver(OLGA, ANNA, ItipMethod::Add, &orphan).await,
+        ItipOutcome::Applied
+    );
+    assert_eq!(env.inbox_len(OLGA).await, 1);
+    let forged = add.replace(&format!("mailto:{ANNA}"), "mailto:eve@evil.example");
+    let out = env
+        .deliver(OLGA, "eve@evil.example", ItipMethod::Add, &forged)
+        .await;
+    assert!(matches!(out, ItipOutcome::Ignored(_)), "{out:?}");
+
+    // VTODO — в список задач по умолчанию.
+    let todo = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nPRODID:-//test//RU\r\nBEGIN:VTODO\r\nUID:t-36\r\n\
+         DTSTAMP:20260101T000000Z\r\nDUE:20260110T100000Z\r\nSUMMARY:Отчёт\r\nORGANIZER:mailto:{ANNA}\r\n{}\
+         END:VTODO\r\nEND:VCALENDAR\r\n",
+        attendee(PETR, "NEEDS-ACTION")
+    );
+    assert_eq!(
+        env.deliver(PETR, ANNA, ItipMethod::Request, &todo).await,
+        ItipOutcome::Applied
+    );
+    let task = env.by_uid(PETR, "t-36").await.expect("задача");
+    assert_eq!(task.index.component, tp_contracts::dav::Component::Todo);
+    let coll = env
+        .store
+        .get_collection(env.scope(PETR), task.collection)
+        .await
+        .expect("хранилище")
+        .expect("коллекция");
+    assert!(
+        coll.components
+            .contains(&tp_contracts::dav::Component::Todo),
+        "{coll:?}"
+    );
+}
+
+/// `REPORT` во входящих: `calendar-query` и `sync-collection` по журналу входящих.
+#[tokio::test]
+async fn inbox_reports() {
+    let env = Sched::new().await;
+    let mine = meeting("m-37", PETR, T10, 0, &attendee(ANNA, "NEEDS-ACTION"));
+    assert_eq!(env.put(PETR, "mine.ics", &[], &mine).await.status, 201);
+    let counter = |seq: u32| {
+        itip_msg(
+            "COUNTER",
+            &meeting("m-37", PETR, T14, seq, &attendee(ANNA, "NEEDS-ACTION")),
+        )
+    };
+    assert_eq!(
+        env.deliver(PETR, ANNA, ItipMethod::Counter, &counter(0))
+            .await,
+        ItipOutcome::Applied
+    );
+    let inbox = format!("{}inbox/", home(PETR));
+    let query = |comp: &str| {
+        format!(
+            "<c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">\
+             <d:prop><d:getetag/><c:calendar-data/></d:prop>\
+             <c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"{comp}\"/></c:comp-filter>\
+             </c:filter></c:calendar-query>"
+        )
+    };
+    let r = env
+        .send(PETR, "REPORT", &inbox, &[("depth", "1")], &query("VEVENT"))
+        .await;
+    assert_eq!(r.status, 207, "{}", r.body);
+    assert!(r.body.contains("METHOD:COUNTER"), "{}", r.body);
+    let r = env
+        .send(PETR, "REPORT", &inbox, &[("depth", "1")], &query("VTODO"))
+        .await;
+    assert_eq!(r.status, 207);
+    assert!(!r.body.contains("<d:response>"), "{}", r.body);
+
+    let sync = |token: &str| {
+        format!(
+            "<d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{token}</d:sync-token>\
+             <d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>"
+        )
+    };
+    let token_of = |r: &Resp| {
+        r.body
+            .split("<d:sync-token>")
+            .nth(1)
+            .and_then(|s| s.split("</d:sync-token>").next())
+            .expect("токен")
+            .to_owned()
+    };
+    let r = env.send(PETR, "REPORT", &inbox, &[], &sync("")).await;
+    assert_eq!(r.status, 207, "{}", r.body);
+    assert_eq!(r.body.matches("<d:response>").count(), 1, "{}", r.body);
+    let first = token_of(&r);
+    assert_eq!(
+        env.deliver(PETR, ANNA, ItipMethod::Counter, &counter(1))
+            .await,
+        ItipOutcome::Applied
+    );
+    let r = env.send(PETR, "REPORT", &inbox, &[], &sync(&first)).await;
+    assert_eq!(r.status, 207, "{}", r.body);
+    assert_eq!(
+        r.body.matches("<d:response>").count(),
+        1,
+        "только новое: {}",
+        r.body
+    );
+    let second = token_of(&r);
+    let r = env.send(PETR, "REPORT", &inbox, &[], &sync(&second)).await;
+    assert_eq!(r.body.matches("<d:response>").count(), 0, "{}", r.body);
+    // Удалённое сообщение: прежний токен недействителен, клиент синхронизируется заново.
+    let name = env
+        .store
+        .inbox_list(env.scope(PETR))
+        .await
+        .expect("входящие")
+        .items[0]
+        .name
+        .clone();
+    let r = env
+        .send(PETR, "DELETE", &format!("{inbox}{name}"), &[], "")
+        .await;
+    assert_eq!(r.status, 204);
+    let r = env.send(PETR, "REPORT", &inbox, &[], &sync(&second)).await;
+    assert_eq!(r.status, 403);
+    assert!(r.body.contains("valid-sync-token"), "{}", r.body);
+    let r = env.send(PETR, "REPORT", &inbox, &[], &sync("")).await;
+    assert_eq!(r.body.matches("<d:response>").count(), 1, "{}", r.body);
+}
+
+// ---------- DAV-32: индекс для записи; срок обработанных ----------
+
+/// Индекс `index::for_write` совпадает с индексом объекта, записанного по CalDAV; применённые сообщения при
+/// `schedule_keep_processed` не видны в CalDAV и удаляются по сроку.
+#[tokio::test]
+async fn for_write_and_processed_ttl() {
+    let cfg = DavConfig {
+        schedule_keep_processed: true,
+        ..DavConfig::default()
+    };
+    let env = Sched::with_config(cfg.clone()).await;
+    let v = meeting("m-38", IVAN, T10, 0, &attendee(PETR, "NEEDS-ACTION"));
+    assert_eq!(env.put(IVAN, "m.ics", &[], &v).await.status, 201);
+    let org = env.by_uid(IVAN, "m-38").await.expect("o");
+    let ical = ICalendar::parse(&org.body).expect("ical");
+    let idx = crate::index::for_write(&ical, &cfg.index_options(OffsetDateTime::now_utc()))
+        .expect("индекс");
+    assert_eq!(idx.schedule_tag, org.index.schedule_tag);
+    assert_eq!((idx.span, &idx.busy), (org.index.span, &org.index.busy));
+    assert!(idx.schedule_tag.is_some() && idx.busy.len() == 1);
+
+    // Применённое приглашение хранится для JMAP, но в CalDAV не видно; необработанное — видно.
+    assert_eq!(env.inbox_len(PETR).await, 1);
+    let mine = meeting("m-39", PETR, T10, 0, &attendee(ANNA, "NEEDS-ACTION"));
+    assert_eq!(env.put(PETR, "mine.ics", &[], &mine).await.status, 201);
+    let counter = itip_msg(
+        "COUNTER",
+        &meeting("m-39", PETR, T14, 0, &attendee(ANNA, "NEEDS-ACTION")),
+    );
+    assert_eq!(
+        env.deliver(PETR, ANNA, ItipMethod::Counter, &counter).await,
+        ItipOutcome::Applied
+    );
+    let items = env
+        .store
+        .inbox_list(env.scope(PETR))
+        .await
+        .expect("входящие")
+        .items;
+    assert_eq!(items.len(), 2);
+    let inbox = format!("{}inbox/", home(PETR));
+    let r = env
+        .send(
+            PETR,
+            "PROPFIND",
+            &inbox,
+            &[("depth", "1")],
+            "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:getetag/></d:prop></d:propfind>",
+        )
+        .await;
+    for i in &items {
+        let href = format!("{inbox}{}", i.name);
+        let shown = r.body.contains(&href);
+        assert_eq!(
+            shown,
+            !crate::deliver::processed(&i.name),
+            "{}: {}",
+            i.name,
+            r.body
+        );
+        let got = env.send(PETR, "GET", &href, &[], "").await;
+        assert_eq!(got.status == 200, shown);
+    }
+
+    // Очистка: обработанные старше срока удаляются, необработанные остаются.
+    let now = OffsetDateTime::now_utc();
+    let purged = env
+        .inbox
+        .purge_processed(env.scope(PETR), now)
+        .await
+        .expect("очистка");
+    assert_eq!(purged, 0, "срок не вышел");
+    let later = now + time::Duration::days(31);
+    let purged = env
+        .inbox
+        .purge_processed(env.scope(PETR), later)
+        .await
+        .expect("очистка");
+    assert_eq!(purged, 1);
+    let left = env
+        .store
+        .inbox_list(env.scope(PETR))
+        .await
+        .expect("входящие")
+        .items;
+    assert_eq!(left.len(), 1);
+    assert!(!crate::deliver::processed(&left[0].name));
 }

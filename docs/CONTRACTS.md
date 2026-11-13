@@ -34,6 +34,9 @@ SRS 3.8. Все операции хранилищ выполняются в ко
 `policy(tenant, target) -> Policy` (уровень без наложения, не задан — `Policy::default()`), `set_policy(tenant, target, &Policy)` (уровень
 целиком, `Policy::default()` удаляет уровень); существование объекта уровня проверяет вызывающий, запись сразу видна `PolicyResolver`.
 In-memory — `MemPolicies` (`PolicyStore` + `PolicyResolver`); набор `suite::policy_store`. PostgreSQL — META-70, Admin API — ADM-34.
+Архив (CTR-76, #Archive): `archive_after` — возраст автопереноса писем в архив (уровень учётной записи: организация → домен → ящик,
+уровень папки не применяется; не задано — автопереноса нет), `archive_quota_bytes` — квота архива (не задано — без ограничения);
+потребитель — `tp-mailstore` (MS-16), Admin API — поля `PolicyBody`.
 
 ## BlobStore
 SRS 3.2. Объекты неизменяемы, запись идемпотентна.
@@ -86,7 +89,7 @@ SRS 3.1, 3.6. Все операции ящика принимают `AccountScop
 CTR-25: раздел журнала событий — `Partition { shard, index }`; разделы перечисляются по всем шардам справочника.
 `ModSeq` выдаётся из одного счётчика учётной записи: монотонен в папке (CONDSTORE) и в учётной записи (состояние JMAP).
 - `AccountStore`: `get`, `by_login`, `by_external_id` (идентификатор каталога, точное совпадение; CTR-32 — синхронизация каталога
-  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; по умолчанию — `Internal`),
+  сопоставляет по нему, переименование входа не меняет `AccountId` и членство в группах; обязателен — CTR-72),
   `list(tenant, prefix, after, limit)` (CTR-44, список Admin API: по возрастанию `lower(login)` в порядке сравнения строк хранилища,
   префикс и курсор `after` — в нижнем регистре, строго больше; по умолчанию — `Internal`), `upsert` (из LDAP), `quota`.
   Псевдонимы (CTR-53) — поле `Account::aliases` (нижний регистр, без повторов, основного адреса и catch-all `@domain`; хранится с
@@ -108,9 +111,17 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   занятое у родителя имя — с суффиксом « 1», « 2»…; корзина и скрытые — со своими сроками), `Delete` — в корзину подключаемого ящика
   со сроком по политике, папки не переносятся; `MessageId` сохраняются, UID новые, ссылки BLOB не меняются; без режима и с письмами
   в `to` — `Invalid` с подсказкой выбрать режим. Перенос — часть операции; долгую операцию Admin API ведёт фоновой задачей (ADM-10).
-  `remove_disabled` — после удаления писем вызывающим (действующий —
-  `Invalid`, остались письма — `Conflict`). Методы, кроме `account_state`, по умолчанию — `Internal`. In-memory — `MemMetadata`; набор
-  `suite::account_state`. PostgreSQL — META-33.
+  `remove_disabled` — после удаления писем вызывающим (только удаляемый, иначе — `Invalid`; остались письма — `Conflict`). Методы,
+  кроме `account_state`, обязательны. In-memory — `MemMetadata`; набор `suite::account_state`. PostgreSQL — META-33.
+  Удаление (CTR-78): `AccountState::Removing { until }` — окончательное удаление начато; `begin_removal(tenant, id, now)` одной
+  операцией с проверкой состояния переводит отключённый ящик со сроком `until ≤ now` в `Removing` (удаляемый — без изменений:
+  продолжение прерванного удаления; действующий или с будущим сроком — `Conflict`, нет — `NotFound`). Удаляемый не восстанавливается,
+  не подключается и срок не переносится (`restore_account`, `attach_account`, `disable_account` — `Conflict`), остаётся в
+  `expired_accounts` и `disabled_accounts`; параллельные `begin_removal` и `restore_account` — успешен ровно один. `tp-mailstore`
+  отмечает ящик после разрешения `before_final_delete` и до удаления писем. Набор `suite::lifecycle::account_removal`.
+  Сигнал (CTR-77): `EventKind::DisabledMailboxChanged { account }` (системный, `meta::disabled_mailbox_changed(scope)`) — после
+  `disable_account` (отключение и смена срока), `restore_account` отключённого и `attach_account`; подписчик — воркер хранения
+  отключённых ящиков (MS-17). `MemMetadata::with_bus`; набор `suite::lifecycle::disabled_mailbox_signals`.
   CTR-63: `by_ids(tenant, &[AccountId]) -> Vec<Account>` — в порядке запроса, не найденные и чужой организации пропускаются, повтор —
   одна запись (первое вхождение); обязателен (без реализации по умолчанию; PostgreSQL одним запросом — META-66); набор
   `suite::account_by_ids`.
@@ -171,7 +182,7 @@ CTR-25: раздел журнала событий — `Partition { shard, index
 SRS 2.1, 2.8 (решение 2026-11-01). Сигналы «изменилось X»: `publish(Event)`, `subscribe(AccountScope) -> EventStream`, `subscribe_system()`.
 `Event { tenant, account: Option, kind }`, `kind: MailboxChanged { mailbox, modseq } | MailboxListChanged | QueueReady | ConfigReloaded |
 LogAppended { partition } | MembersChanged | Blocked { subject } | Unblocked { subject } | TransportChanged { tenant } | TrashChanged { account } |
-ShardsChanged | AccountDisabled { account } | GalChanged { collection, modseq } | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
+ShardsChanged | AccountDisabled { account } | DisabledMailboxChanged { account } | GalChanged { collection, modseq } | DavChanged { kind, collection, modseq } | ScheduleInboxChanged { modseq } | SieveChanged | Resync`. Виды учётной записи (`account = Some`) — `MailboxChanged`,
 `MailboxListChanged`, `DavChanged`, `ScheduleInboxChanged`, `SieveChanged`; остальные — системные (`EventKind::is_system`, `account = None`, приходят в `subscribe_system()`; `LogAppended`,
 `MembersChanged`, `ShardsChanged` — с `TenantId::DEFAULT`, `Blocked`, `Unblocked` — с организацией блокировки, `TransportChanged` — с организацией или `TenantId::DEFAULT`, `TrashChanged` — с организацией учётной записи). `Resync` вставляет шина в поток подписки (её `tenant`/`account`)
 при переполнении буфера подписчика или переподключении слушателя — подписчик сверяется с хранилищем; `publish(Resync)` — `Invalid`.
@@ -183,6 +194,8 @@ ShardsChanged | AccountDisabled { account } | GalChanged { collection, modseq } 
 `AccountDisabled` (CTR-64) — `AccountStore` после запрета входа (`enabled = false`, `disable_account`), с организацией учётной записи;
 протоколы с долгими сеансами (IMAP-22, JMAP-41) закрывают сеансы учётной записи.
 `GalChanged` (CTR-60) — `DavStore::sync_gal`, изменивший книгу GAL, с организацией книги (`dav::gal_changed`).
+`QueueReady` (CTR-73, тема `<tenant>/queue/outbound`) — `QueueStore` после `enqueue`, `reschedule`, `postpone`, с организацией записи
+(`queue::queue_ready`). `DisabledMailboxChanged` (CTR-77) — `AccountStore`, раздел Metadata.
 Набор `suite::signals`.
 Шина Valkey удаляется (CLU-09).
 
@@ -534,7 +547,7 @@ moderators } }, envelope, message: Option<BlobRef>, route: Option<String>, match
 SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организаций; время передаёт вызывающий):
 `enqueue(owner: Option<AccountId>, OutMessage { tenant, blob, size, from, dsn: DsnParams { envid, ret }, rcpts: Vec<OutRcpt { address, notify, orcpt }>, next_attempt }) -> QueueId`
 (пусто или повтор адреса — `Invalid`; CTR-49, решение 46: `owner` — учётная запись отправителя, хранилище с шардами ставит запись на шард её ящика (`tp-meta`: неизвестная или `None` — основная
-БД), без шардов не используется; `Outbound` учётную запись не передаёт — `tp_smtp::queue::Queue` ставит с `None`); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
+БД), без шардов не используется; её передаёт `Outbound`, CTR-74); `claim(now, limit, lease) -> Vec<Claimed { claim: QueueClaim { id, fencing }, until, queued_at, .., rcpts: Vec<QueuedRcpt { rcpt, attempts, last_error }> }>`
 — записи с наступившим сроком попытки без действующей лизы; `renew(&claim, until)`, `reschedule(&claim, rcpt, at, reason)` (`attempts` + 1),
 `postpone(&claim, rcpt, at)` (перенос планировщиком без попытки — лимиты домена или узла: `attempts`, `last_error` не меняются; по
 умолчанию — `Internal`; набор `suite::queue_postpone`),
@@ -543,15 +556,22 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 срока выпуска (от него считается срок доставки). `cancel_queued(tenant, id) -> BlobKey` — отмена до первого захвата (запись удаляется,
 ссылку освобождает вызывающий; захвачена — `Conflict` = `cannotUnsend`, нет — `NotFound`; атомарна с `claim`; по умолчанию — `Internal`);
 набор `suite::queue_release`. Выпуск по таймеру ближайшего срока — SMTP-24, PostgreSQL — META-33.
+Без опроса (CTR-73, SRS 2.8): `next_due() -> Option<OffsetDateTime>` — ближайший момент, когда `claim` выдаст запись (наименьший срок
+попытки незавершённых получателей, у записи под лизой — не раньше конца лизы; все организации; пусто — `None`); после фиксации
+`enqueue`, `reschedule`, `postpone` — сигнал `QueueReady` организации записи (`queue::queue_ready`). smtp-out ждёт сигнала или срока
+`next_due` (SMTP-42). Обязателен; `MemQueue::with_bus`; набор `suite::lifecycle::queue_next_due`.
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
-Постановка письма протоколами — `Outbound` (CTR-28): `enqueue(tenant, mail_from, rcpts, raw: Bytes)`;
+Постановка письма протоколами — `Outbound` (CTR-28): `enqueue(tenant, owner: Option<AccountId>, mail_from, rcpts, raw: Bytes)`;
 `submit(..) -> Submitted { rcpts: Vec<(String, SubmitStatus::{ Delivered, Queued, Failed(reply) })> }` — статус по получателю в порядке
 запроса (по умолчанию — `enqueue`, все `Queued`). Реализации — `tp_smtp::queue::Queue` (тело в BLOB, ссылка, подпись DKIM `with_dkim`),
 `tp_smtp::Delivery` (локальные — сразу в ящики); потребители — submission SMTP, пересылки модулей, JMAP `EmailSubmission/set`.
 Маршрут правила потока (`FlowOutcome::route`) не передаётся — политика по домену назначения. In-memory — `MemOutbound`;
-набор `suite::outbound_submit`.
+набор `suite::outbound_submit`. `owner` (CTR-74, решение 46) — учётная запись отправителя у `enqueue`, `submit`, `schedule`: реализация
+передаёт её в `BlobIndex::acquire` и `QueueStore::enqueue` (шард её ящика); `None` — DSN, пересылка, письмо модуля. Submission SMTP —
+вошедшая учётная запись, JMAP и iTIP — учётная запись отправки, `tp_smtp::Delivery` для локальной отправки — владелец адреса отправителя
+конверта. `schedule` обязателен.
 
 ## Identity и EmailSubmission
 CTR-30, RFC 8621 §6–7. Адреса отправителя (код — `identity.rs`): `Identity { id, name, email, reply_to, bcc: Vec<IdentityAddress { name?,
@@ -569,10 +589,10 @@ queue) -> state` (`Final` со статусами; отменённая — `Con
 Нет записи — `NotFound`. In-memory — `MemIdentities`, `MemSubmissions`; наборы `suite::{identity_store, submission_store}`. PostgreSQL — `tp-meta`
 (карточка meta), переход `tp-jmap` — волна полосы.
 Отложенная отправка и отмена (CTR-42, решение владельца #195): письмо с `sendAt` в будущем (предел — `maxDelayedSend` конфигурации
-`tp-jmap`) ставится в очередь сразу со сроком выпуска — `Outbound::schedule(tenant, mail_from, rcpts, raw, release_at) -> QueueId` (все
+`tp-jmap`) ставится в очередь сразу со сроком выпуска — `Outbound::schedule(tenant, owner, mail_from, rcpts, raw, release_at) -> QueueId` (все
 получатели, локальные — при выпуске), отправка — `Pending` с `queue`; отмена — `Outbound::cancel_scheduled(tenant, queue)` (`QueueStore::cancel_queued`
 и освобождение тела; выпущено — `Conflict` = `cannotUnsend`, нет — `NotFound`), затем `SubmissionStore::cancel`; наступившие (`due`) — `finalize`;
-статусы — `DeliveryLog::by_queue`. Оба метода `Outbound` по умолчанию — `Internal`; in-memory — `MemOutbound` (`scheduled`, `release`), набор
+статусы — `DeliveryLog::by_queue`. `schedule` обязателен (CTR-74), `cancel_scheduled` по умолчанию — `Internal`; in-memory — `MemOutbound` (`scheduled`, `release`), набор
 `suite::outbound_schedule`. `SubmissionStore` (CTR-42): `query_submissions(scope, &SubmissionFilter { identity_ids, email_ids, undo_status, before,
 after })` (RFC 8621 §7.3; `threadIds` вызывающий переводит в `email_ids`; по `send_at`, `id`; по умолчанию — `list` с фильтром),
 `submission_changes(scope, since, limit) -> SubmissionChanges { created, updated, destroyed, new_state, has_more }` (созданные и удалённые после
@@ -605,8 +625,19 @@ received_at, deleted_at, expires_at }>`, `restore(scope, object) -> Restored::Me
 и `purge`, если что-то перенесено, скрыто или стёрто; maintenance пересчитывает по нему ближайший срок (`expired`), по `Resync` и при запуске — тоже.
 Истечение: `expired` → `DecisionHooks::before_final_delete` (`FinalDelete::mailbox` = `origin`) → `MessageStore::expunge_final`; `Deny` — `defer`.
 `expunge_final` удаляет только письма, которые всё ещё в корзине; восстановленные между `expired` и `expunge_final` и прочие — пропуск, не ошибка.
-`Quota`: `usage(scope) -> QuotaUsage` (письма, включая корзину, без скрытых; лимит — `PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded`
-(по умолчанию через `usage` и `QuotaUsage::allows`).
+`Quota`: `usage(scope) -> QuotaUsage` (основная квота: письма вне ветки архива, включая корзину, без скрытых; лимит —
+`PolicyResolver::quota_bytes`), `check(scope, bytes)` → `QuotaExceeded` (по умолчанию через `usage` и `QuotaUsage::allows`).
+`AccountStore::quota` — то же использование без лимита.
+
+### Archive
+CTR-76, SRS 4.7. Код — `archive.rs`. Архив — ветка папок учётной записи: папка с ролью `SpecialUse::Archive` (RFC 6154) и вложенные.
+Квоты раздельные: письма ветки — в квоте архива, остальные — в основной (`Quota`), перенос в архив освобождает основную квоту.
+`ArchiveStore`: `archive_due(now, limit) -> Vec<ArchiveItem { scope, message, mailbox, due }>` — письма всех организаций вне ветки архива
+и корзины, без скрытых, у действующих ящиков с заданным `Policy::archive_after`, со сроком `due = received_at + archive_after` (политика
+на момент запроса) не позже `now`, по (`due`, `message`); ближайший срок — первый элемент выборки с моментом в далёком будущем и
+`limit = 1` (один таймер, без опроса); `archive_usage(scope) -> QuotaUsage` — письма ветки архива, лимит — `Policy::archive_quota_bytes`
+(нет учётной записи — `NotFound`). Перенос — `MessageStore::move_to`, квоту архива проверяет вызывающий. Реализации — `PgMeta`
+(миграция 0036), in-memory — `MemArchive` (`MemMetadata` + `MemPolicies`); набор `suite::lifecycle::archive`. Потребитель — MS-16.
 Политики хранения и Legal Hold — модуль «Соответствие требованиям» через `DecisionHook::before_final_delete`.
 
 ## Dav
@@ -1052,3 +1083,19 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   обязательные методы `AccountStore`, `DavStore`, поле `InboxItem::received_at`, вариант `DeliveryEventKind`. По сравнению с карточками:
   методы без реализаций по умолчанию (правило владельца); итог iTIP — в `decision` и `reason`, а не полями варианта (событие — строка в
   хранилище и Admin API).
+- 2026-11-13 — CTR-72 (волна contracts-48): `AccountStore::by_external_id` — без реализации по умолчанию (было `Internal`: реализация
+  могла «забыть» метод). Реализации — `PgMeta`, `MemMetadata` (уже были), обёртка `Limited` в тестах `tp-imap`. Несовместимо: новый
+  обязательный метод `AccountStore`.
+- 2026-11-13 — CTR-73, CTR-74, CTR-76, CTR-77, CTR-78 (волна contracts-50). Очередь без опроса: `QueueStore::next_due()` и сигнал
+  `QueueReady` (`queue::queue_ready`, тема `<tenant>/queue/outbound`) после `enqueue`, `reschedule`, `postpone`; `MemQueue::with_bus`.
+  `Outbound::enqueue`, `submit`, `schedule` получают `owner: Option<AccountId>` (решение 46), `schedule` обязателен; места вызова
+  (`tp-smtp`, `tp-jmap`, `tp-dav`) переведены, `tp_smtp::queue::Queue` передаёт учётную запись в `BlobIndex::acquire` и
+  `QueueStore::enqueue`. Архив: `Policy::archive_after`, `archive_quota_bytes`, модуль `archive` (`ArchiveStore::archive_due`,
+  `archive_usage`), основная квота — без ветки архива; `MemArchive`. Отключённые ящики: `EventKind::DisabledMailboxChanged` и
+  `meta::disabled_mailbox_changed`, `AccountState::Removing`, `AccountStore::begin_removal`; `remove_disabled` — только удаляемого;
+  `disable_account`, `expired_accounts`, `remove_disabled` — без реализаций по умолчанию; `MemMetadata::with_bus`. `tp-meta` —
+  миграция 0036 (`policies.archive_after_us`, `archive_quota_bytes`, `accounts.removing`). Наборы `suite::lifecycle::{queue_next_due,
+  archive, disabled_mailbox_signals, account_removal}`. Несовместимо: новые обязательные методы `QueueStore`, `AccountStore`, новая
+  сигнатура `Outbound`, новые поля `Policy`, варианты `AccountState` и `EventKind`. По сравнению с карточками: у `next_due` нет
+  параметра вида — очередь одна (исходящая почта), вид темы — `outbound`; `owner` получает и `submit` (по умолчанию вызывает
+  `enqueue`); `begin_removal` принимает `now` (проверка срока на часах вызывающего).

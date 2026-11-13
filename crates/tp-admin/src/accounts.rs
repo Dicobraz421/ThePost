@@ -69,6 +69,13 @@ pub struct PolicyBody {
     /// Правило «очистить корзину» в клиенте (`trash.purge`, решение 2026-11-01-trash-purge).
     #[serde(default)]
     pub trash_purge: Option<TrashPurgeRuleBody>,
+    /// Возраст автопереноса писем в архив (`730d`); уровень папки не применяется (CTR-76).
+    #[serde(default, with = "duration::option")]
+    #[schema(value_type = Option<String>, example = "730d")]
+    pub archive_after: Option<Duration>,
+    /// Квота архива ящика, байт (отдельно от основной квоты).
+    #[serde(default)]
+    pub archive_quota_bytes: Option<u64>,
 }
 
 impl From<Policy> for PolicyBody {
@@ -83,6 +90,8 @@ impl From<Policy> for PolicyBody {
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
             trash_purge: p.trash_purge.map(TrashPurgeRuleBody::from),
+            archive_after: p.archive_after,
+            archive_quota_bytes: p.archive_quota_bytes,
         }
     }
 }
@@ -99,6 +108,8 @@ impl From<PolicyBody> for Policy {
             dkim_selector: p.dkim_selector,
             milter_profile: p.milter_profile,
             trash_purge: p.trash_purge.map(TrashPurgeRule::from),
+            archive_after: p.archive_after,
+            archive_quota_bytes: p.archive_quota_bytes,
         }
     }
 }

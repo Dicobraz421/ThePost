@@ -1,8 +1,8 @@
 //! Сервисы ролей ядра (SRS 2.1): maintenance — GC и «сироты» BLOB под лизой лидера, истечение срока корзины
 //! (`tp-mailstore`: таймер на ближайший срок → точка принятия решений → окончательное удаление), подписчики
 //! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV, журнала автоответов,
-//! журнала доставки и токенов `admin init`
-//! ([`Purge`], решение 2026-11-11 п. 65), проверка целостности BLOB по расписанию под лизой лидера
+//! журнала доставки, токенов `admin init` и применённых сообщений входящих планирования
+//! ([`Purge`], решение 2026-11-11 п. 65, APP-53), проверка целостности BLOB по расписанию под лизой лидера
 //! ([`ScheduledVerify`], APP-44), однократный пересчёт поисковых строк старых контактов в фоне (APP-63); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -16,13 +16,14 @@ use tp_blob::{
     GcConfig, GcWorker, Now, OrphanConfig, OrphanMetrics, OrphanSweeper, Verifier, VerifyReport,
     system_now,
 };
-use tp_contracts::Result;
 use tp_contracts::admin_token::LocalAdminTokens;
 use tp_contracts::blob::{BlobIndex, BlobStore};
 use tp_contracts::dav::CardSearch;
 use tp_contracts::events::EventSink;
 use tp_contracts::lease::LeaseStore;
+use tp_contracts::meta::{AccountScope, AccountStore};
 use tp_contracts::role::{CancellationToken, Role, RoleCtx, RoleService};
+use tp_contracts::{Result, TenantId};
 use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 
@@ -305,7 +306,8 @@ impl ScheduledVerify {
 /// Очистка по сроку в роли maintenance (APP-32, APP-39): надгробия DAV старше `meta.dav.tombstone_ttl`, записи
 /// журнала автоответов старше `meta.sieve.vacation_log_ttl`, журнал доставки старше `meta.delivery.retention`,
 /// завершённые и отменённые отправки JMAP старше `meta.submissions.retention`, аудит ящиков старше
-/// `meta.mailbox_audit.retention` — сроки знает [`PgMeta`]; токены `admin init`, истёкшие раньше `maintenance.admin_token_retention` назад.
+/// `meta.mailbox_audit.retention` — сроки знает [`PgMeta`]; токены `admin init`, истёкшие раньше `maintenance.admin_token_retention` назад;
+/// применённые сервером сообщения входящих планирования старше `dav.schedule_processed_ttl` ([`ItipPurge`], APP-53).
 /// Удаление по сроку идемпотентно, повтор удаляет только оставшееся: как и истечение корзины, работает на каждом
 /// узле с ролью без лизы.
 #[derive(Clone)]
@@ -319,6 +321,65 @@ pub struct Purge {
     pub admin_token_retention: Duration,
     /// Показатели шагов для `/metrics` (`crate::metrics::register_purge`, APP-52).
     pub probe: PurgeProbe,
+    /// Очистка входящих планирования (DAV-32, APP-53); `None` — шага нет (`dav.schedule_keep_processed: false`:
+    /// применённые сообщения во входящих не хранятся).
+    pub itip: Option<ItipPurge>,
+}
+
+/// Шаг очистки входящих планирования (APP-53): у каждой учётной записи организации удаляет применённые сервером
+/// сообщения iTIP, полученные раньше `dav.schedule_processed_ttl` назад (`tp_dav::ItipInbox::purge_processed`).
+#[derive(Debug, Clone)]
+pub struct ItipPurge {
+    /// Организация узла.
+    pub tenant: TenantId,
+    /// Приём iTIP узла: тот же, что у CalDAV, JMAP и доставки (`Services::itip`).
+    pub inbox: Arc<tp_dav::ItipInbox>,
+}
+
+/// Учётных записей в одной странице обхода [`ItipPurge`].
+const ITIP_PURGE_PAGE: usize = 500;
+
+impl ItipPurge {
+    /// Обходит учётные записи организации страницами `AccountStore::list`; ошибка одной учётной записи — в журнал,
+    /// обход продолжается, итог шага — первая ошибка (повтор — в следующий проход).
+    async fn step(&self, accounts: &dyn AccountStore) -> Result<u64> {
+        let now = (system_now())();
+        let mut removed = 0u64;
+        let mut failed = None;
+        let mut after: Option<String> = None;
+        loop {
+            let page = accounts
+                .list(self.tenant, "", after.as_deref(), ITIP_PURGE_PAGE)
+                .await?;
+            for account in &page {
+                let scope = AccountScope {
+                    tenant: self.tenant,
+                    account: account.id,
+                };
+                match self.inbox.purge_processed(scope, now).await {
+                    Ok(n) => removed += n as u64,
+                    Err(e) => {
+                        tracing::warn!(
+                            account = %account.id,
+                            error = %e,
+                            "входящие планирования: применённые сообщения не удалены"
+                        );
+                        failed.get_or_insert(e);
+                    }
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() == ITIP_PURGE_PAGE => {
+                    after = Some(last.login.to_lowercase());
+                }
+                _ => break,
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(removed),
+        }
+    }
 }
 
 /// Итог шага очистки: число удалённых записей (`None` — журнал удаляется секциями по суткам, числа нет) или ошибка.
@@ -339,36 +400,41 @@ pub struct Purged {
     pub mailbox_audit: Result<()>,
     /// Токены `admin init`.
     pub admin_tokens: Result<u64>,
+    /// Применённые сообщения входящих планирования ([`ItipPurge`]); `None` — шага нет.
+    pub itip_processed: Option<Result<u64>>,
 }
 
 impl Purged {
     /// Шаги прохода — значения метки `step` показателей [`PurgeProbe`], в порядке [`Purged::steps`].
-    pub const STEPS: [&'static str; 6] = [
+    pub const STEPS: [&'static str; 7] = [
         "purge_dav_tombstones",
         "purge_vacation_log",
         "purge_expired_delivery",
         "expire_old_submissions",
         "purge_expired_mailbox_audit",
         "prune_admin_tokens",
+        "purge_processed_itip",
     ];
 
-    /// Итог каждого шага прохода с его именем.
-    pub fn steps(&self) -> [(&'static str, PurgeOutcome<'_>); 6] {
+    /// Итог каждого выполненного шага прохода с его именем (шага без зависимостей — нет).
+    pub fn steps(&self) -> Vec<(&'static str, PurgeOutcome<'_>)> {
         fn counted(r: &Result<u64>) -> PurgeOutcome<'_> {
             r.as_ref().map(|n| Some(*n))
         }
         fn sections(r: &Result<()>) -> PurgeOutcome<'_> {
             r.as_ref().map(|()| None)
         }
-        let [dav, vacation, delivery, submissions, audit, tokens] = Self::STEPS;
-        [
+        let [dav, vacation, delivery, submissions, audit, tokens, itip] = Self::STEPS;
+        let mut steps = vec![
             (dav, counted(&self.dav_tombstones)),
             (vacation, counted(&self.vacation_log)),
             (delivery, sections(&self.delivery_log)),
             (submissions, counted(&self.submissions)),
             (audit, sections(&self.mailbox_audit)),
             (tokens, counted(&self.admin_tokens)),
-        ]
+        ];
+        steps.extend(self.itip_processed.as_ref().map(|r| (itip, counted(r))));
+        steps
     }
 }
 
@@ -422,6 +488,7 @@ impl std::fmt::Debug for Purge {
         f.debug_struct("Purge")
             .field("interval", &self.interval)
             .field("admin_token_retention", &self.admin_token_retention)
+            .field("itip", &self.itip.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -436,6 +503,10 @@ impl Purge {
             submissions: self.meta.expire_old_submissions().await,
             mailbox_audit: self.meta.purge_expired_mailbox_audit().await,
             admin_tokens: self.prune_admin_tokens().await,
+            itip_processed: match &self.itip {
+                Some(itip) => Some(itip.step(&self.meta).await),
+                None => None,
+            },
         };
         let at = (system_now())().unix_timestamp();
         for (step, outcome) in done.steps() {
@@ -1119,6 +1190,7 @@ mod tests {
             interval: Duration::from_secs(3600),
             admin_token_retention: 30 * day,
             probe: PurgeProbe::new(),
+            itip: None,
         };
         let done = purge.step().await;
         // APP-52: успешный шаг — удалённые записи и момент прохода в показателях.

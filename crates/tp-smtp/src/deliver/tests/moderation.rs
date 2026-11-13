@@ -193,7 +193,7 @@ async fn moderation_suite() {
 
 /// Письмо правила потока `n` (объект — в хранилище, одна ссылка): bob и внешний получатель, модератор carol.
 async fn rule_held(env: &Env, raw: &Bytes, n: u8) -> HeldMessage {
-    let blob = crate::queue::store_blob(&env.blobs, &env.index, T, raw.clone())
+    let blob = crate::queue::store_blob(&env.blobs, &env.index, T, None, raw.clone())
         .await
         .expect("blob");
     HeldMessage {

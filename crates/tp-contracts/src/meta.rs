@@ -134,6 +134,13 @@ pub enum AccountState {
         /// Срок хранения отключённого ящика (по умолчанию — 30 дней от отключения, политика синхронизации).
         until: OffsetDateTime,
     },
+    /// Удаляется (CTR-78): срок хранения истёк и окончательное удаление начато ([`AccountStore::begin_removal`]).
+    /// Как [`AccountState::Disabled`], но восстановить, подключить и перенести срок нельзя — `Error::Conflict`;
+    /// прерванное удаление продолжается (ящик остаётся в [`AccountStore::expired_accounts`]).
+    Removing {
+        /// Истёкший срок хранения отключённого ящика.
+        until: OffsetDateTime,
+    },
 }
 
 /// Что сделать с содержимым ящика учётной записи при подключении к ней отключённого ящика
@@ -161,14 +168,17 @@ pub struct DisabledAccount {
     pub until: OffsetDateTime,
 }
 
-/// Использование квоты учётной записи.
+/// Использование квоты учётной записи: основной (письма вне ветки архива) или архива
+/// ([`crate::archive::ArchiveStore::archive_usage`]; CTR-76 — учёт раздельный).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct QuotaUsage {
-    /// Занято байт (сумма размеров писем, включая корзину, без скрытых — `TrashStore::purge`).
+    /// Занято байт: основная квота — сумма размеров писем вне ветки архива, включая корзину, без скрытых
+    /// (`TrashStore::purge`); квота архива — писем ветки архива.
     pub used_bytes: u64,
     /// Число писем.
     pub messages: u64,
-    /// Лимит из [`PolicyResolver`]; `None` — без ограничения.
+    /// Лимит из [`PolicyResolver`] ([`Policy::quota_bytes`] или [`Policy::archive_quota_bytes`]); `None` — без
+    /// ограничения.
     pub limit_bytes: Option<u64>,
 }
 
@@ -217,6 +227,20 @@ pub fn account_disabled(scope: AccountScope) -> Event {
     }
 }
 
+/// Сигнал «отключённый ящик изменился» (системный, `account = None`, [`EventKind::DisabledMailboxChanged`];
+/// CTR-77). Публикует реализация [`AccountStore`] после фиксации [`AccountStore::disable_account`] (отключение и
+/// смена срока), [`AccountStore::restore_account`] отключённого ящика и [`AccountStore::attach_account`]; воркер
+/// хранения отключённых ящиков (роль maintenance) пересчитывает по нему ближайший срок.
+pub fn disabled_mailbox_changed(scope: AccountScope) -> Event {
+    Event {
+        tenant: scope.tenant,
+        account: None,
+        kind: EventKind::DisabledMailboxChanged {
+            account: scope.account,
+        },
+    }
+}
+
 /// Учётные записи организации.
 #[async_trait]
 pub trait AccountStore: Send + Sync + 'static {
@@ -240,13 +264,8 @@ pub trait AccountStore: Send + Sync + 'static {
 
     /// Учётная запись по идентификатору в каталоге (`Account::external_id`, точное совпадение; CTR-32). Синхронизация
     /// каталога сопоставляет по нему участников групп и учётные записи: переименование входа не меняет `AccountId`.
-    /// По умолчанию — `Error::Internal` (реализации — `tp-meta`, `tp-testkit`).
-    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>> {
-        let _ = (tenant, external_id);
-        Err(Error::Internal(
-            "AccountStore::by_external_id не реализован".to_owned(),
-        ))
-    }
+    /// Обязателен (CTR-72); реализации — `tp-meta`, `tp-testkit`.
+    async fn by_external_id(&self, tenant: TenantId, external_id: &str) -> Result<Option<Account>>;
 
     /// Учётные записи организации постранично (CTR-44, список Admin API): по возрастанию имени входа в нижнем
     /// регистре (порядок сравнения строк хранилища), имя входа в нижнем регистре начинается с `prefix` (нижний
@@ -269,7 +288,8 @@ pub trait AccountStore: Send + Sync + 'static {
     /// Создаёт или обновляет учётную запись (из LDAP); при создании — системные папки.
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account>;
 
-    /// Использование квоты.
+    /// Использование основной квоты: письма вне ветки архива ([`QuotaUsage`]; CTR-76), `limit_bytes` — `None`
+    /// (лимит разрешает [`PolicyResolver`]).
     async fn quota(&self, tenant: TenantId, id: AccountId) -> Result<QuotaUsage>;
 
     /// Состояние ящика (CTR-35); нет учётной записи — `Error::NotFound`. По умолчанию — через [`AccountStore::get`],
@@ -282,38 +302,43 @@ pub trait AccountStore: Send + Sync + 'static {
     }
 
     /// Отключает ящик до `until` (повторно — срок заменяется); `upsert` состояние не меняет. Нет учётной записи —
-    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
+    /// `Error::NotFound`; ящик удаляется ([`AccountState::Removing`]) — `Error::Conflict`. После фиксации — сигналы
+    /// [`account_disabled`] и [`disabled_mailbox_changed`].
     async fn disable_account(
         &self,
         tenant: TenantId,
         id: AccountId,
         until: OffsetDateTime,
-    ) -> Result<()> {
-        let _ = (tenant, id, until);
-        Err(Error::internal(
-            "AccountStore::disable_account не реализован",
-        ))
-    }
+    ) -> Result<()>;
 
     /// Восстанавливает отключённый ящик ([`AccountState::Active`]; действующий — без изменений). Нет учётной записи —
-    /// `Error::NotFound`.
+    /// `Error::NotFound`; ящик удаляется ([`AccountState::Removing`]) — `Error::Conflict` (CTR-78: восстановление и
+    /// окончательное удаление атомарны между собой). Отключённый восстановлен — после фиксации сигнал
+    /// [`disabled_mailbox_changed`].
     async fn restore_account(&self, tenant: TenantId, id: AccountId) -> Result<()>;
 
     /// Отключённые ящики организации по (`until`, `id`) — список Admin API.
     async fn disabled_accounts(&self, tenant: TenantId) -> Result<Vec<DisabledAccount>>;
 
-    /// Отключённые ящики всех организаций со сроком хранения не позже `now`, по (`until`, `id`), не более `limit` —
-    /// окончательное удаление (роль maintenance). По умолчанию — `Error::Internal`.
+    /// Отключённые ящики всех организаций со сроком хранения не позже `now`, включая удаляемые
+    /// ([`AccountState::Removing`]), по (`until`, `id`), не более `limit` — окончательное удаление (роль maintenance).
     async fn expired_accounts(
         &self,
         now: OffsetDateTime,
         limit: usize,
-    ) -> Result<Vec<AccountScope>> {
-        let _ = (now, limit);
-        Err(Error::internal(
-            "AccountStore::expired_accounts не реализован",
-        ))
-    }
+    ) -> Result<Vec<AccountScope>>;
+
+    /// Начинает окончательное удаление (CTR-78): одной операцией с проверкой состояния переводит отключённый ящик со
+    /// сроком хранения не позже `now` в [`AccountState::Removing`]; удаляемый — без изменений (продолжение
+    /// прерванного удаления). Ящик действует или его срок позже `now` (восстановлен, подключён, срок перенесён) —
+    /// `Error::Conflict`: удаление не начинать; нет учётной записи — `Error::NotFound`. Параллельные
+    /// `begin_removal` и [`AccountStore::restore_account`] — успешен ровно один.
+    async fn begin_removal(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<()>;
 
     /// Подключает отключённый ящик `disabled` к учётной записи `to` (Connect-Mailbox Exchange): `disabled` получает
     /// домен, вход, имя, `external_id` и `enabled` учётной записи `to` и становится действующим (папки, письма, права —
@@ -321,8 +346,9 @@ pub trait AccountStore: Send + Sync + 'static {
     /// ([`ExistingContent`]; CTR-50, решение 44): переносятся в подключаемый ящик или в его корзину; перенос — часть
     /// операции (ссылки на объекты BLOB организации не меняются), долгую операцию над большим ящиком Admin API ведёт
     /// фоновой задачей (ADM-10). Без режима (`None`) ящик `to` должен быть пуст, иначе — `Error::Invalid` с подсказкой
-    /// выбрать режим. `disabled` действует — `Error::Invalid`; `to` отключена — `Error::Conflict`; нет любой из
-    /// записей — `Error::NotFound`.
+    /// выбрать режим. `disabled` действует — `Error::Invalid`; `disabled` удаляется ([`AccountState::Removing`]) или
+    /// `to` отключена — `Error::Conflict`; нет любой из записей — `Error::NotFound`. После фиксации — сигнал
+    /// [`disabled_mailbox_changed`] ящика `disabled`.
     async fn attach_account(
         &self,
         tenant: TenantId,
@@ -331,15 +357,11 @@ pub trait AccountStore: Send + Sync + 'static {
         existing: Option<ExistingContent>,
     ) -> Result<Account>;
 
-    /// Окончательно удаляет отключённый ящик (учётную запись и папки) после удаления писем вызывающим (`MailStore`,
-    /// освобождение ссылок BLOB). Действующий — `Error::Invalid`; остались письма — `Error::Conflict`; нет —
-    /// `Error::NotFound`. По умолчанию — `Error::Internal`.
-    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()> {
-        let _ = (tenant, id);
-        Err(Error::internal(
-            "AccountStore::remove_disabled не реализован",
-        ))
-    }
+    /// Окончательно удаляет удаляемый ящик ([`AccountState::Removing`], [`AccountStore::begin_removal`]): учётную
+    /// запись и папки — после удаления писем вызывающим (`MailStore`, освобождение ссылок BLOB). Действующий или
+    /// отключённый без отметки удаления — `Error::Invalid`; остались письма — `Error::Conflict`; нет —
+    /// `Error::NotFound`.
+    async fn remove_disabled(&self, tenant: TenantId, id: AccountId) -> Result<()>;
 }
 
 // ---------- Папки ----------
@@ -811,6 +833,14 @@ pub struct Policy {
     /// Правило администратора `trash.purge` (решение 2026-11-01-trash-purge); вычисление с выбором пользователя —
     /// [`PolicyResolver::trash_purge`].
     pub trash_purge: Option<TrashPurgeRule>,
+    /// Возраст автопереноса в архив (CTR-76, SRS 4.7): письмо вне ветки архива и корзины переносится в архив, когда
+    /// с `received_at` прошёл этот срок. Действует уровень учётной записи (организация → домен → ящик; уровень папки
+    /// не применяется). Потребитель — `tp-mailstore` (MS-16) через [`crate::archive::ArchiveStore::archive_due`];
+    /// не задано — автопереноса нет.
+    pub archive_after: Option<Duration>,
+    /// Квота архива ящика, байт (CTR-76): письма ветки архива учитываются отдельно от [`Policy::quota_bytes`]
+    /// ([`crate::archive::ArchiveStore::archive_usage`]). Не задано — без ограничения.
+    pub archive_quota_bytes: Option<u64>,
 }
 
 impl Policy {
@@ -848,6 +878,8 @@ impl Policy {
             dkim_selector: over.dkim_selector.or(self.dkim_selector),
             milter_profile: over.milter_profile.or(self.milter_profile),
             trash_purge: over.trash_purge.or(self.trash_purge),
+            archive_after: over.archive_after.or(self.archive_after),
+            archive_quota_bytes: over.archive_quota_bytes.or(self.archive_quota_bytes),
         }
     }
 }

@@ -4,8 +4,9 @@
 # Нативная сборка на ubuntu-latest (ubuntu-26.04: система собрана под x86-64-v3) дала C-код aws-lc-sys и ring
 # под x86-64-v3, бинарь падал на стенде без AVX2; образ cross собирает под базовый x86-64.
 # RUSTFLAGS сборки пустые в любом workflow (в ci.yml — `-D warnings`): бинарь CI совпадает с бинарём беты.
+# Фича `gssapi` (решение 107, CI-12) — всегда: libkrb5 и libclang для bindgen ставит pre-build из Cross.toml рядом.
 name: release-build
-description: cross build --release thepost и запуск на старом процессоре
+description: cross build --release thepost (с gssapi) и запуск на старом процессоре
 
 inputs:
   target:
@@ -17,11 +18,17 @@ inputs:
   save-cache:
     description: Сохранять rust-cache
     default: 'true'
+  console-archive:
+    description: Имя архива console/dist (без .tar.gz; пусто — архива нет)
+    default: ''
 
 outputs:
   binary:
     description: Путь к бинарю
     value: target/${{ inputs.target }}/release/thepost
+  console-archive:
+    description: Путь к архиву консоли (.tar.gz, рядом .tar.gz.sha256); пусто — архива нет
+    value: ${{ steps.archive.outputs.path }}
 
 runs:
   using: composite
@@ -43,9 +50,11 @@ runs:
         TARGET: ${{ inputs.target }}
         ARGS: ${{ steps.console.outputs.cargo-args }}
         RUSTFLAGS: ''
-      run: cross build --release --locked -p thepost --target "$TARGET" $ARGS
+        CROSS_CONFIG: ${{ github.action_path }}/Cross.toml
+      run: cross build --release --locked -p thepost --target "$TARGET" --features gssapi $ARGS
     # qemu-user и гостевая система — из Debian 12 (glibc под базовый x86-64), в контейнере: на раннере ubuntu-26.04
     # загрузчик и libc собраны под x86-64-v3 и под Nehalem падают сами, ещё до бинаря (qemu -L не спасает).
+    # libgssapi-krb5-2 — библиотека фичи gssapi, нужна узлу при запуске.
     - name: Запуск на старом процессоре (qemu Nehalem, без AVX)
       if: inputs.target == 'x86_64-unknown-linux-gnu'
       shell: bash
@@ -54,5 +63,22 @@ runs:
         GUEST: debian:12-slim
       run: |
         docker run --rm -v "$PWD/$BIN:/thepost:ro" "$GUEST" sh -c 'apt-get update -qq &&
-          apt-get install -y -qq --no-install-recommends qemu-user >/dev/null &&
+          apt-get install -y -qq --no-install-recommends qemu-user libgssapi-krb5-2 >/dev/null &&
           qemu-x86_64 -cpu Nehalem /thepost --version'
+    # Архив console/dist (решение 68, CI-10) для раздачи веб-сервером — те же файлы, что вшиты в бинарь этой сборки.
+    # Детерминированный: порядок имён, время — коммита, владелец 0:0, права нормализованы, gzip без имени и времени;
+    # repro сверяет его sha256. Каталог в архиве — имя архива.
+    - id: archive
+      name: Архив консоли
+      if: inputs.console-archive != '' && steps.console.outputs.cargo-args != ''
+      shell: bash
+      env:
+        NAME: ${{ inputs.console-archive }}
+        OUT: ${{ runner.temp }}/console-archive
+      run: |
+        mkdir -p "$OUT"
+        tar -C console --format=gnu --sort=name --mtime="@$(git log -1 --format=%ct)" \
+          --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX' --transform "s|^dist|$NAME|" \
+          -cf - dist | gzip -9n > "$OUT/$NAME.tar.gz"
+        (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" && cat "$NAME.tar.gz.sha256")
+        echo "path=$OUT/$NAME.tar.gz" >> "$GITHUB_OUTPUT"

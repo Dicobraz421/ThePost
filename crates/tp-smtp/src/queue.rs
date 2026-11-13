@@ -1,7 +1,8 @@
 //! Очередь исходящей почты (SRS 4.1, CONTRACTS.md#Queue (Ф1)): постановка и роль smtp-out.
 //!
 //! - [`Queue`] — [`Outbound`] поверх [`QueueStore`]: письмо — один объект BLOB (протокол записи SRS 3.4,
-//!   одна ссылка на запись очереди), затем `QueueStore::enqueue`; ошибка постановки снимает ссылку.
+//!   одна ссылка на запись очереди), затем `QueueStore::enqueue`; ошибка постановки снимает ссылку. Учётная
+//!   запись отправителя (CTR-74) — одна и та же в `BlobIndex::acquire` и `QueueStore::enqueue` (шард её ящика).
 //! - [`QueueWorker`] — обработка: `claim` записей со сроком попытки под лизу, доставка получателям по доменам
 //!   через [`Transport`] (по умолчанию — [`send::MxTransport`] на `mail-send`), затем по каждому получателю:
 //!   2xx — `complete(Delivered)`, 5xx или истёк `queue.expire` — `complete(Failed)`, 4xx и сбой соединения —
@@ -35,7 +36,7 @@ use tp_contracts::queue::{
     Claimed, DsnNotify, DsnRet, OutMessage, OutRcpt, Outbound, QueueStore, QueuedRcpt, RcptStatus,
 };
 use tp_contracts::role::{RoleCtx, RoleService};
-use tp_contracts::{BlobKey, Error, QueueId, Result, TenantId};
+use tp_contracts::{AccountId, BlobKey, Error, QueueId, Result, TenantId};
 
 use crate::config::{QueueConfig, SmtpConfig};
 use crate::dkim_sign::DkimSign;
@@ -78,15 +79,17 @@ impl fmt::Debug for QueueDeps {
     }
 }
 
-/// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3): очередь, очередь модерации.
+/// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3): очередь, очередь модерации. `owner` —
+/// учётная запись, для отправки которой берётся ссылка (`BlobIndex::acquire`, CTR-49); `None` — владельца нет.
 pub(crate) async fn store_blob(
     blobs: &dyn BlobStore,
     index: &dyn BlobIndex,
     tenant: TenantId,
+    owner: Option<AccountId>,
     data: Bytes,
 ) -> Result<BlobKey> {
     let hash = tp_mailstore::split::hash(&data);
-    let mut generation = match index.acquire(tenant, None, &hash, 1).await? {
+    let mut generation = match index.acquire(tenant, owner, &hash, 1).await? {
         Acquire::Existing { generation } => {
             return Ok(BlobKey {
                 tenant,
@@ -131,8 +134,20 @@ pub(crate) async fn release_blob(index: &dyn BlobIndex, key: &BlobKey) {
 
 impl QueueDeps {
     /// Загружает письмо одним объектом с одной ссылкой (SRS 3.4, шаги 2–3).
-    async fn store_blob(&self, tenant: TenantId, data: Bytes) -> Result<BlobKey> {
-        store_blob(self.blobs.as_ref(), self.index.as_ref(), tenant, data).await
+    async fn store_blob(
+        &self,
+        tenant: TenantId,
+        owner: Option<AccountId>,
+        data: Bytes,
+    ) -> Result<BlobKey> {
+        store_blob(
+            self.blobs.as_ref(),
+            self.index.as_ref(),
+            tenant,
+            owner,
+            data,
+        )
+        .await
     }
 
     /// Снимает ссылку записи очереди на объект.
@@ -141,17 +156,19 @@ impl QueueDeps {
     }
 
     /// Ставит письмо `raw` в очередь получателям `rcpts` со сроком выпуска `release_at` (первая попытка — не
-    /// раньше него) и возвращает запись очереди.
+    /// раньше него) и возвращает запись очереди. `owner` — учётная запись отправителя (CTR-74): тело и запись — на
+    /// шарде её ящика; `None` — отправителя-учётной записи нет.
     pub async fn put(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         from: &str,
         rcpts: Vec<OutRcpt>,
         raw: Bytes,
         release_at: OffsetDateTime,
     ) -> Result<QueueId> {
         let size = raw.len() as u64;
-        let blob = self.store_blob(tenant, raw).await?;
+        let blob = self.store_blob(tenant, owner, raw).await?;
         let msg = OutMessage {
             tenant,
             blob,
@@ -161,7 +178,7 @@ impl QueueDeps {
             rcpts,
             next_attempt: release_at,
         };
-        match self.store.enqueue(None, msg).await {
+        match self.store.enqueue(owner, msg).await {
             Ok(id) => Ok(id),
             Err(e) => {
                 self.release(&blob).await;
@@ -219,7 +236,7 @@ impl DsnSink for Queue {
         let raw = self.signed(raw).await?;
         let now = (self.deps.now)();
         self.deps
-            .put(tenant, "", vec![OutRcpt::new(to)], raw, now)
+            .put(tenant, None, "", vec![OutRcpt::new(to)], raw, now)
             .await
             .map(drop)
     }
@@ -230,12 +247,13 @@ impl Outbound for Queue {
     async fn enqueue(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
         let now = (self.deps.now)();
-        self.schedule(tenant, mail_from, rcpts, raw, now)
+        self.schedule(tenant, owner, mail_from, rcpts, raw, now)
             .await
             .map(drop)
     }
@@ -244,6 +262,7 @@ impl Outbound for Queue {
     async fn schedule(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -258,7 +277,7 @@ impl Outbound for Queue {
             .collect();
         let raw = self.signed(raw).await?;
         self.deps
-            .put(tenant, mail_from, rcpts, raw, release_at)
+            .put(tenant, owner, mail_from, rcpts, raw, release_at)
             .await
     }
 

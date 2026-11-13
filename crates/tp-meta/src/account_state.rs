@@ -2,7 +2,9 @@
 //! 2026-11-04-exchange-parity «Удалённые ящики», 44): отключение со сроком хранения, восстановление, подключение
 //! отключённого ящика к учётной записи каталога, окончательное удаление.
 //!
-//! Состояние — колонка `accounts.disabled_until` каталога (`NULL` — действует). Данные ящика — на шарде учётной
+//! Состояние — колонки `accounts.disabled_until` (`NULL` — действует) и `accounts.removing` (CTR-78: окончательное
+//! удаление начато, `begin_removal`; восстановление, подключение и перенос срока — `Conflict`, строка каталога
+//! блокируется — отметка и восстановление атомарны между собой). Данные ящика — на шарде учётной
 //! записи ([`BOX_TABLES`]), каталог — в основной БД. Когда ящик в основной БД, операция — одна транзакция; ящик на
 //! другом шарде — сначала транзакция ящика, затем каталога (сеть внутри открытой транзакции не используется):
 //! изменение состояния между ними оставляет ящик без папок, их дополняет первое открытие (`MailboxStore::list`).
@@ -52,16 +54,21 @@ struct StateRow {
     #[sqlx(flatten)]
     account: AccountRow,
     disabled_until: Option<OffsetDateTime>,
+    removing: bool,
 }
 
-const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, disabled_until";
+const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, disabled_until, removing";
 
-fn state(until: Option<OffsetDateTime>) -> AccountState {
+fn state((until, removing): (Option<OffsetDateTime>, bool)) -> AccountState {
     match until {
+        Some(until) if removing => AccountState::Removing { until },
         Some(until) => AccountState::Disabled { until },
         None => AccountState::Active,
     }
 }
+
+/// `remove_disabled` ящика без отметки удаления.
+const NOT_REMOVING: &str = "remove_disabled: ящик не удаляется — сначала begin_removal";
 
 fn scope(tenant: TenantId, account: AccountId) -> AccountScope {
     AccountScope { tenant, account }
@@ -383,7 +390,7 @@ async fn swap_catalog(
     if d.disabled_until.is_none() {
         return Err(Error::invalid("attach: ящик не отключён"));
     }
-    if t.disabled_until.is_some() {
+    if d.removing || t.disabled_until.is_some() {
         return Err(Error::Conflict);
     }
     let (tu, du, tou) = (tenant.as_uuid(), disabled.as_uuid(), to.as_uuid());
@@ -437,8 +444,8 @@ impl PgMeta {
     ) -> Result<AccountState> {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
-            let row: Option<Option<OffsetDateTime>> = sqlx::query_scalar(
-                "SELECT disabled_until FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+            let row: Option<(Option<OffsetDateTime>, bool)> = sqlx::query_as(
+                "SELECT disabled_until, removing FROM accounts WHERE tenant_id = $1 AND account_id = $2",
             )
             .bind(tenant.as_uuid())
             .bind(id.as_uuid())
@@ -451,16 +458,30 @@ impl PgMeta {
         .await
     }
 
-    /// Задаёт срок хранения (`Some` — отключить, `None` — восстановить); запись по значению — повторяется.
+    /// Задаёт срок хранения (`Some` — отключить, `None` — восстановить) под блокировкой строки каталога; запись по
+    /// значению — повторяется. Удаляемый ящик — `Conflict`. Возвращает, был ли ящик отключён до записи.
     pub(crate) async fn set_disabled(
         &self,
         tenant: TenantId,
         id: AccountId,
         until: Option<OffsetDateTime>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.rewrite(|| async move {
             let mut tx = begin(&self.pool, tenant).await?;
-            let n = sqlx::query(
+            let row: Option<(Option<OffsetDateTime>, bool)> = sqlx::query_as(
+                "SELECT disabled_until, removing FROM accounts WHERE tenant_id = $1 AND account_id = $2
+                 FOR UPDATE",
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let (was, removing) = row.ok_or(Error::NotFound)?;
+            if removing {
+                return Err(Error::Conflict);
+            }
+            sqlx::query(
                 "UPDATE accounts SET disabled_until = $3, updated_at = now()
                  WHERE tenant_id = $1 AND account_id = $2",
             )
@@ -469,13 +490,53 @@ impl PgMeta {
             .bind(until)
             .execute(&mut *tx)
             .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            Ok(was.is_some())
+        })
+        .await
+    }
+
+    /// Отметка «удаляется» (CTR-78) одним `UPDATE` с условием на состояние: отключённый со сроком не позже `now`
+    /// или уже удаляемый.
+    pub(crate) async fn mark_removing(
+        &self,
+        tenant: TenantId,
+        id: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        self.rewrite(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let n = sqlx::query(
+                "UPDATE accounts SET removing = true, updated_at = now()
+                 WHERE tenant_id = $1 AND account_id = $2
+                   AND (removing OR (disabled_until IS NOT NULL AND disabled_until <= $3))",
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .bind(now)
+            .execute(&mut *tx)
+            .await
             .map_err(db_err)?
             .rows_affected();
-            crate::commits::commit(tx).await?;
-            if n == 0 {
-                return Err(Error::NotFound);
+            if n == 1 {
+                crate::commits::commit(tx).await?;
+                return Ok(());
             }
-            Ok(())
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM accounts WHERE tenant_id = $1 AND account_id = $2)",
+            )
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            Err(if exists {
+                Error::Conflict
+            } else {
+                Error::NotFound
+            })
         })
         .await
     }
@@ -533,15 +594,11 @@ impl PgMeta {
         .await
     }
 
-    /// Состояние учётной записи в каталоге: `None` — нет записи, иначе срок хранения (`None` — действует).
-    async fn catalog_state(
-        &self,
-        tenant: TenantId,
-        id: AccountId,
-    ) -> Result<Option<Option<OffsetDateTime>>> {
+    /// Состояние учётной записи в каталоге: `None` — нет записи.
+    async fn catalog_state(&self, tenant: TenantId, id: AccountId) -> Result<Option<AccountState>> {
         let mut tx = begin(&self.pool, tenant).await?;
-        let row = sqlx::query_scalar(
-            "SELECT disabled_until FROM accounts WHERE tenant_id = $1 AND account_id = $2",
+        let row: Option<(Option<OffsetDateTime>, bool)> = sqlx::query_as(
+            "SELECT disabled_until, removing FROM accounts WHERE tenant_id = $1 AND account_id = $2",
         )
         .bind(tenant.as_uuid())
         .bind(id.as_uuid())
@@ -549,15 +606,15 @@ impl PgMeta {
         .await
         .map_err(db_err)?;
         crate::commits::commit(tx).await?;
-        Ok(row)
+        Ok(row.map(state))
     }
 
     pub(crate) async fn remove_disabled_box(&self, tenant: TenantId, id: AccountId) -> Result<()> {
         self.once(async move {
             match self.catalog_state(tenant, id).await? {
                 None => return Err(Error::NotFound),
-                Some(None) => return Err(Error::invalid("remove_disabled: ящик действует")),
-                Some(Some(_)) => {}
+                Some(AccountState::Removing { .. }) => {}
+                Some(_) => return Err(Error::invalid(NOT_REMOVING)),
             }
             let s = scope(tenant, id);
             let db = self.box_db(s).await?;
@@ -573,9 +630,7 @@ impl PgMeta {
             let rows = lock_rows(&mut tx, tenant, &[id]).await?;
             match rows.get(&id) {
                 None => return Err(Error::NotFound),
-                Some(r) if r.disabled_until.is_none() => {
-                    return Err(Error::invalid("remove_disabled: ящик действует"));
-                }
+                Some(r) if !r.removing => return Err(Error::invalid(NOT_REMOVING)),
                 Some(_) => {}
             }
             drop_catalog(&mut tx, s, &folders).await?;
@@ -603,10 +658,12 @@ impl PgMeta {
             let (Some(d_state), Some(t_state)) = (d_state, t_state) else {
                 return Err(Error::NotFound);
             };
-            if d_state.is_none() {
-                return Err(Error::invalid("attach: ящик не отключён"));
+            match d_state {
+                AccountState::Active => return Err(Error::invalid("attach: ящик не отключён")),
+                AccountState::Removing { .. } => return Err(Error::Conflict),
+                AccountState::Disabled { .. } => {}
             }
-            if t_state.is_some() {
+            if t_state != AccountState::Active {
                 return Err(Error::Conflict);
             }
             let (sd, st) = (scope(tenant, disabled), scope(tenant, to));

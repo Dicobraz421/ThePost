@@ -17,7 +17,7 @@
 //! - submission: до доставки и очереди — `DecisionHooks::on_submission` (`Deny` — `550 5.7.1`; дополнения:
 //!   заголовки в начало письма, копии в папки и внешним адресам);
 //! - журнал доставки ([`Delivery::with_tracking`], [`crate::tracking`]): приём, отказы, доставка, модерация,
-//!   уведомления;
+//!   уведомления, приём iTIP;
 //! - адреса пересылки модулей (`Ingested::forward`, решение 2026-10-31-ingest-envelope; `CopyTo::Address`):
 //!   локальные — сразу в ящики тем же `ingest` (SMTP-28), внешние — в очередь [`Outbound`] с отправителем SRS и
 //!   ARC-подписью ([`Delivery::with_forwarding`], [`crate::forward`]); уведомление на адрес SRS — обратно
@@ -40,7 +40,7 @@
 //! - приглашения iTIP в письмах ([`Delivery::with_itip`], [`crate::itip`]): письмо с частью `text/calendar;
 //!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя — smtp-in как iMIP (SMTP-33),
 //!   submission и [`Delivery::submit`] как внутреннее планирование (решение 78, SMTP-36); письмо остаётся в ящике,
-//!   отказ и сбой iTIP — только запись в журнал.
+//!   итог приёма — событие `Itip` журнала доставки (SMTP-37), сбой — только запись в журнал узла.
 //! - личные списки отправителей ящика ([`Delivery::with_sender_lists`], `SenderLists`, SMTP-25) — при каждой
 //!   доставке в ящик (smtp-in, submission, [`Delivery::submit`], пересылки и перенаправления): письмо
 //!   заблокированного отправителя — в «Спам», надёжного — во «Входящие» поверх карантина фильтра Milter; сверяется
@@ -86,7 +86,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
-use tp_contracts::schedule::{ItipDelivery, ItipMessage, ItipOutcome, ItipSource};
+use tp_contracts::schedule::{ItipDelivery, ItipMessage, ItipSource};
 use tp_contracts::senders::{SenderLists, SenderVerdict};
 use tp_contracts::sieve::{AutoReply, DeliveryRules, MailboxRef, RulesInput, RulesOutcome};
 use tp_contracts::transport::{
@@ -111,7 +111,7 @@ use crate::sieve::{self, Hop, Sieved, VacationRate};
 use crate::sources;
 use crate::srs::SrsError;
 use crate::tracking::{self, Mail, Step, Tracking, Trail};
-use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek};
+use tp_contracts::delivery::{DeliveryDecision as Dd, DeliveryEventKind as Ek, itip_record};
 
 /// Зависимости доставки, выбранные приложением.
 #[derive(Clone)]
@@ -385,7 +385,8 @@ impl Delivery {
     ///   (`Account::addresses`) или право Send As / Send on Behalf ([`Delivery::with_authz`]); источник
     ///   `ItipSource::Internal`. Иначе — только письмо.
     ///
-    /// Письмо в любом случае остаётся в ящике; отказ и сбой iTIP — запись в журнал.
+    /// Письмо в любом случае остаётся в ящике. Итог `itip` (применено или пропущено с причиной) — событие `Itip`
+    /// журнала доставки на получателя (SMTP-37, `delivery::itip_record`), сбой — только запись в журнал узла.
     pub fn with_itip(mut self, itip: Arc<dyn ItipDelivery>) -> Self {
         self.itip = Some(itip);
         self
@@ -400,7 +401,8 @@ impl Delivery {
     }
 
     /// Передаёт сообщение iTIP письма `raw` учётным записям `targets` (получатель конверта и учётная запись), кроме
-    /// получателей из `failed`; доверие к `From` — по `origin`.
+    /// получателей из `failed`; доверие к `From` — по `origin`. Возвращает события `Itip` журнала доставки — итог
+    /// [`ItipDelivery::deliver`] для каждого получателя (SMTP-37).
     async fn apply_itip(
         &self,
         id: &str,
@@ -408,15 +410,16 @@ impl Delivery {
         origin: ItipOrigin<'_>,
         targets: &[(String, AccountId)],
         failed: &[dsn::Recipient],
-    ) {
+    ) -> Vec<Step> {
+        let mut steps = Vec::new();
         let Some(delivery) = &self.itip else {
-            return;
+            return steps;
         };
         let msg = match itip::extract(raw) {
-            None => return,
+            None => return steps,
             Some(Err(reason)) => {
                 tracing::info!(%id, reason, "smtp: сообщение iTIP не применено");
-                return;
+                return steps;
             }
             Some(Ok(m)) => m,
         };
@@ -424,18 +427,18 @@ impl Delivery {
             ItipOrigin::Imip { dmarc_pass: true } => ItipSource::Imip,
             ItipOrigin::Imip { dmarc_pass: false } => {
                 tracing::info!(%id, reason = "отправитель не прошёл DMARC", "smtp: сообщение iTIP не применено");
-                return;
+                return steps;
             }
             ItipOrigin::Internal { account, principal } => {
                 match self.sender_right(account, principal, &msg.from).await {
                     Ok(Some(_)) => ItipSource::Internal,
                     Ok(None) => {
                         tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
-                        return;
+                        return steps;
                     }
                     Err(e) => {
                         tracing::warn!(%id, %account, error = %e, "smtp: сбой проверки отправителя приглашения");
-                        return;
+                        return steps;
                     }
                 }
             }
@@ -463,17 +466,16 @@ impl Delivery {
                 source,
             };
             match delivery.deliver(&message).await {
-                Ok(ItipOutcome::Applied) => {
-                    tracing::debug!(%id, %account, method = %msg.method, "smtp: сообщение iTIP применено");
-                }
-                Ok(ItipOutcome::Ignored(reason)) => {
-                    tracing::info!(%id, %account, %reason, "smtp: сообщение iTIP не применено");
+                Ok(outcome) => {
+                    let (decision, reason) = itip_record(msg.method, &outcome);
+                    steps.push(Step::new(Ek::Itip, decision, vec![rcpt.clone()]).reason(reason));
                 }
                 Err(e) => {
                     tracing::warn!(%id, %account, error = %e, "smtp: сбой приёма iTIP");
                 }
             }
         }
+        steps
     }
 
     /// Право учётной записи `account` организации узла на адрес отправителя `from` (решение 78, SMTP-45): её адрес
@@ -1244,10 +1246,12 @@ impl Delivery {
         Ok(out)
     }
 
-    /// Ставит в очередь исходящей почты внешних получателей и пересылки.
+    /// Ставит в очередь исходящей почты внешних получателей и пересылки; `owner` — учётная запись отправителя
+    /// (CTR-74: шард её ящика), `None` — пересылка, уведомление, письмо без отправителя-учётной записи.
     async fn queue_out(
         &self,
         id: &str,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: Vec<String>,
         raw: Bytes,
@@ -1256,7 +1260,10 @@ impl Delivery {
             return Ok(());
         }
         match &self.deps.outbound {
-            Some(q) => q.enqueue(self.deps.tenant, mail_from, &rcpts, raw).await,
+            Some(q) => {
+                q.enqueue(self.deps.tenant, owner, mail_from, &rcpts, raw)
+                    .await
+            }
             None => {
                 // Узел без очереди: внешних получателей submission не принимает (RCPT — 451, `submit` —
                 // `SubmitStatus::Failed`), здесь остаются только внешние пересылки и копии модулей.
@@ -1366,7 +1373,7 @@ impl Delivery {
             return Ok(());
         }
         let Some(fwd) = &self.forwarding else {
-            return self.queue_out(id, mail_from, rcpts, raw).await;
+            return self.queue_out(id, None, mail_from, rcpts, raw).await;
         };
         let mut sender = mail_from.to_owned();
         if let Some((_, domain)) = mail_from.rsplit_once('@')
@@ -1384,7 +1391,7 @@ impl Delivery {
             m.extend_from_slice(&raw);
             raw = Bytes::from(m);
         }
-        self.queue_out(id, &sender, rcpts, raw).await
+        self.queue_out(id, None, &sender, rcpts, raw).await
     }
 
     /// Правила потока почты (SMTP-22): тело — объектом BLOB на время вызова; изменённое тело — прочитано, ссылка на
@@ -1401,6 +1408,7 @@ impl Delivery {
             f.blobs.as_ref(),
             f.index.as_ref(),
             input.tenant,
+            None,
             raw.clone(),
         )
         .await?;
@@ -1689,10 +1697,13 @@ impl Delivery {
                 .await?;
             push_unique(&mut forward, ingested.forward);
         }
-        if let Some(origin) = origin.filter(|_| !itip_to.is_empty()) {
-            self.apply_itip(&env.id, &full, origin, &itip_to, &failed)
-                .await;
-        }
+        let itip_steps = match origin.filter(|_| !itip_to.is_empty()) {
+            Some(origin) => {
+                self.apply_itip(&env.id, &full, origin, &itip_to, &failed)
+                    .await
+            }
+            None => Vec::new(),
+        };
         let external = self
             .forward(
                 &env.id,
@@ -1717,7 +1728,7 @@ impl Delivery {
             .await?;
         sieve::merge_replies(&mut replies, relayed.replies);
         sieve_steps.extend(relayed.steps);
-        self.queue_out(&env.id, &env.mail_from, rcpts, full.clone())
+        self.queue_out(&env.id, sender, &env.mail_from, rcpts, full.clone())
             .await?;
         self.queue_forward(
             &env.id,
@@ -1728,6 +1739,7 @@ impl Delivery {
         )
         .await?;
         outcome_steps(&mut trail.steps, &prepared.held, &local, &failed, &spam);
+        trail.steps.extend(itip_steps);
         trail.steps.extend(sieve_steps);
         self.send_replies(&env.id, &env.mail_from, &full, replies, &mut trail.steps)
             .await;
@@ -1885,6 +1897,7 @@ impl Delivery {
     async fn dispatch(
         &self,
         id: &str,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -1967,13 +1980,16 @@ impl Delivery {
                 Err(e) => return Err(e),
             }
         }
-        if let Some(account) = sender.filter(|_| !itip_to.is_empty()) {
-            let origin = ItipOrigin::Internal {
-                account,
-                principal: None,
-            };
-            self.apply_itip(id, &full, origin, &itip_to, &failed).await;
-        }
+        let itip_steps = match sender.filter(|_| !itip_to.is_empty()) {
+            Some(account) => {
+                let origin = ItipOrigin::Internal {
+                    account,
+                    principal: None,
+                };
+                self.apply_itip(id, &full, origin, &itip_to, &failed).await
+            }
+            None => Vec::new(),
+        };
         let forward = self
             .forward(
                 id,
@@ -2015,11 +2031,13 @@ impl Delivery {
         if queue {
             push_unique(&mut out, prepared.relayed);
         }
-        self.queue_out(id, mail_from, out, raw.clone()).await?;
+        self.queue_out(id, owner, mail_from, out, raw.clone())
+            .await?;
         self.queue_forward(id, mail_from, forward, raw.clone(), None)
             .await?;
         let mut steps = vec![Step::new(Ek::Receive, Dd::Accept, rcpts.to_vec())];
         outcome_steps(&mut steps, &prepared.held, &local_list, &failed, &spam);
+        steps.extend(itip_steps);
         steps.extend(sieve_steps);
         self.send_replies(id, mail_from, &full, replies, &mut steps)
             .await;
@@ -2052,6 +2070,7 @@ impl Delivery {
     pub async fn submit(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -2073,7 +2092,7 @@ impl Delivery {
         if tenant != self.deps.tenant {
             let status = match &self.deps.outbound {
                 Some(q) => {
-                    q.enqueue(tenant, mail_from, rcpts, raw).await?;
+                    q.enqueue(tenant, owner, mail_from, rcpts, raw).await?;
                     SubmitStatus::Queued
                 }
                 None => {
@@ -2083,7 +2102,9 @@ impl Delivery {
             };
             return Ok(Submitted::all(requested, status));
         }
-        let statuses = self.dispatch(&id, mail_from, rcpts, raw, true).await?;
+        let statuses = self
+            .dispatch(&id, owner, mail_from, rcpts, raw, true)
+            .await?;
         // Статус — по получателям запроса: адрес, убранный правилом потока, считается обработанным.
         let statuses = requested
             .iter()
@@ -2482,11 +2503,12 @@ impl Outbound for Delivery {
     async fn enqueue(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<()> {
-        let sent = Delivery::submit(self, tenant, mail_from, rcpts, raw).await?;
+        let sent = Delivery::submit(self, tenant, owner, mail_from, rcpts, raw).await?;
         // Узел без очереди и ни одной доставки: письмо никуда не попало — ошибка, повтор безопасен.
         // Иначе внешним получателям — только `Failed` в журнале (повтор задвоил бы локальную доставку).
         let lost = |s: &SubmitStatus| matches!(s, SubmitStatus::Failed(r) if r == NO_OUTBOUND);
@@ -2499,22 +2521,24 @@ impl Outbound for Delivery {
     async fn submit(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
     ) -> Result<Submitted> {
-        Delivery::submit(self, tenant, mail_from, rcpts, raw).await
+        Delivery::submit(self, tenant, owner, mail_from, rcpts, raw).await
     }
 
     async fn schedule(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
         release_at: OffsetDateTime,
     ) -> Result<QueueId> {
-        Delivery::schedule(self, tenant, mail_from, rcpts, raw, release_at).await
+        Delivery::schedule(self, tenant, owner, mail_from, rcpts, raw, release_at).await
     }
 
     async fn cancel_scheduled(&self, tenant: TenantId, queue: QueueId) -> Result<()> {
@@ -2580,7 +2604,7 @@ impl DsnSink for Delivery {
                     .map(|_| ())
             }
             Resolved::External => match &self.deps.outbound {
-                Some(q) => q.enqueue(tenant, "", &[to.to_owned()], raw).await,
+                Some(q) => q.enqueue(tenant, None, "", &[to.to_owned()], raw).await,
                 None => {
                     tracing::warn!(
                         "smtp: уведомление внешнему адресу без очереди исходящей почты не отправлено"

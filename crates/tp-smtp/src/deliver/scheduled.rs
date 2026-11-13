@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tp_contracts::queue::SubmitStatus;
-use tp_contracts::{Error, QueueId, Result, TenantId};
+use tp_contracts::{AccountId, Error, QueueId, Result, TenantId};
 
 use super::{Delivery, Flowed, Pre, Resolved};
 use crate::queue::{LocalRelease, RcptResult};
@@ -25,6 +25,7 @@ impl Delivery {
     pub(super) async fn schedule(
         &self,
         tenant: TenantId,
+        owner: Option<AccountId>,
         mail_from: &str,
         rcpts: &[String],
         raw: Bytes,
@@ -59,7 +60,7 @@ impl Delivery {
             Pre::Go(m) => m,
         };
         outbound
-            .schedule(tenant, &mail_from, &rcpts, raw, release_at)
+            .schedule(tenant, owner, &mail_from, &rcpts, raw, release_at)
             .await
     }
 
@@ -99,7 +100,7 @@ impl LocalRelease for Delivery {
         }
         let id = crate::server::next_id();
         // Уведомление отправителю — по итогам записи очереди (обработчик), не здесь.
-        let statuses = self.dispatch(&id, from, &local, raw, false).await?;
+        let statuses = self.dispatch(&id, None, from, &local, raw, false).await?;
         tracing::info!(%id, count = local.len(), "smtp: запись очереди выпущена локальным получателям");
         Ok(rcpts
             .iter()

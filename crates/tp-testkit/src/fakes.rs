@@ -40,7 +40,7 @@ use tp_contracts::meta::{
     AccountScope, AccountStore, Message, MessageStore, PolicyResolver, QuotaUsage,
 };
 use tp_contracts::queue::{
-    Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus,
+    Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus, queue_ready,
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashStore, trash_changed,
@@ -956,10 +956,22 @@ impl QueueEntry {
 /// [`QueueStore`] в памяти. Время захвата передаёт вызывающий; `queued_at` — по часам [`Clock`], для отложенного
 /// письма — срок выпуска, если он позже. Отмена ([`QueueStore::cancel_queued`]) — до первого захвата.
 /// Когда все выданные захватом получатели завершены (`reschedule`/`postpone`/`complete`), лиза снимается.
-#[derive(Debug, Clone)]
+/// С шиной ([`MemQueue::with_bus`]) `enqueue`, `reschedule` и `postpone` публикуют сигнал `QueueReady` (CTR-73), как
+/// реализация `tp-meta`.
+#[derive(Clone)]
 pub struct MemQueue {
     entries: Arc<Mutex<HashMap<QueueId, QueueEntry>>>,
     clock: Arc<dyn Clock>,
+    bus: Option<Arc<dyn EventBus>>,
+}
+
+impl std::fmt::Debug for MemQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemQueue")
+            .field("entries", &self.len())
+            .field("bus", &self.bus.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemQueue {
@@ -968,6 +980,20 @@ impl MemQueue {
         Self {
             entries: Arc::default(),
             clock,
+            bus: None,
+        }
+    }
+
+    /// Публиковать `QueueReady` в `bus` после постановки и переноса (CTR-73).
+    pub fn with_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    async fn signal(&self, tenant: TenantId) {
+        if let Some(bus) = &self.bus {
+            // Сигнал после «фиксации»; потеря сигнала не отменяет постановку (at-most-once).
+            let _ = bus.publish(queue_ready(tenant)).await;
         }
     }
 
@@ -986,17 +1012,19 @@ impl MemQueue {
         lock(&self.entries).values().map(|e| e.msg.blob).collect()
     }
 
+    /// Операция захвата над получателем `rcpt`: итог `f`, все ли получатели завершены, организация записи.
     fn with_claim<R>(
         &self,
         claim: &QueueClaim,
         rcpt: &str,
         f: impl FnOnce(&mut RcptState) -> R,
-    ) -> Result<(R, bool)> {
+    ) -> Result<(R, bool, TenantId)> {
         let mut st = lock(&self.entries);
         let e = st
             .get_mut(&claim.id)
             .filter(|e| e.fencing == claim.fencing)
             .ok_or(Error::Conflict)?;
+        let tenant = e.msg.tenant;
         let r = e
             .rcpts
             .iter_mut()
@@ -1011,7 +1039,7 @@ impl MemQueue {
         if finished {
             st.remove(&claim.id);
         }
-        Ok((out, finished))
+        Ok((out, finished, tenant))
     }
 }
 
@@ -1040,6 +1068,7 @@ impl QueueStore for MemQueue {
                 claimed: false,
             })
             .collect();
+        let tenant = msg.tenant;
         let entry = QueueEntry {
             queued_at: self.clock.now().max(msg.next_attempt),
             fencing: 0,
@@ -1048,7 +1077,23 @@ impl QueueStore for MemQueue {
             msg,
         };
         lock(&self.entries).insert(id, entry);
+        self.signal(tenant).await;
         Ok(id)
+    }
+
+    async fn next_due(&self) -> Result<Option<OffsetDateTime>> {
+        Ok(lock(&self.entries)
+            .values()
+            .filter_map(|e| {
+                let at = e
+                    .rcpts
+                    .iter()
+                    .filter(|r| !r.done)
+                    .map(|r| r.next_attempt)
+                    .min()?;
+                Some(e.lease_until.map_or(at, |u| at.max(u)))
+            })
+            .min())
     }
 
     async fn claim(
@@ -1116,17 +1161,19 @@ impl QueueStore for MemQueue {
         at: OffsetDateTime,
         reason: &str,
     ) -> Result<()> {
-        self.with_claim(claim, rcpt, |r| {
+        let (_, _, tenant) = self.with_claim(claim, rcpt, |r| {
             r.next_attempt = at;
             r.attempts += 1;
             r.last_error = Some(reason.to_owned());
-        })
-        .map(|_| ())
+        })?;
+        self.signal(tenant).await;
+        Ok(())
     }
 
     async fn postpone(&self, claim: &QueueClaim, rcpt: &str, at: OffsetDateTime) -> Result<()> {
-        self.with_claim(claim, rcpt, |r| r.next_attempt = at)
-            .map(|_| ())
+        let (_, _, tenant) = self.with_claim(claim, rcpt, |r| r.next_attempt = at)?;
+        self.signal(tenant).await;
+        Ok(())
     }
 
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
@@ -1136,7 +1183,7 @@ impl QueueStore for MemQueue {
                 r.last_error = Some(reply);
             }
         })
-        .map(|(_, finished)| finished)
+        .map(|(_, finished, _)| finished)
     }
 
     async fn cancel_queued(&self, tenant: TenantId, id: QueueId) -> Result<BlobKey> {
@@ -2155,6 +2202,15 @@ mod tests {
     async fn queue_passes_release_suite() {
         let clock = ManualClock::default();
         crate::suite::queue_release(&MemQueue::new(clock.shared()), TenantId::new()).await;
+    }
+
+    /// CTR-73: ближайший срок и сигнал пополнения.
+    #[tokio::test]
+    async fn queue_passes_next_due_suite() {
+        let clock = ManualClock::default();
+        let bus = Arc::new(crate::MemEventBus::new(64));
+        let queue = MemQueue::new(clock.shared()).with_bus(bus.clone());
+        crate::suite::lifecycle::queue_next_due(&queue, bus.as_ref(), TenantId::new()).await;
     }
 
     #[tokio::test]
