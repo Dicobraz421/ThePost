@@ -312,10 +312,12 @@ async fn installation_admin_migration_on_existing_db() {
     }
     assert_eq!(roles, [true, false, false, false]);
     let mut tx = schema::begin(&pool, default).await.expect("begin");
-    let (passwords,): (i64,) = sqlx::query_as("SELECT count(*) FROM app_passwords")
-        .fetch_one(&mut *tx)
-        .await
-        .expect("count");
+    let (passwords,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM app_passwords WHERE tenant_id = $1")
+            .bind(default.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count");
     tx.commit().await.expect("commit");
     assert_eq!(passwords, 3, "пароли организации по умолчанию остаются");
     pool.close().await;
