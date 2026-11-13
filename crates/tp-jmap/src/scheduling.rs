@@ -27,7 +27,6 @@ use tp_contracts::dav::{
     CollectionId, DavObjectId, DavStore, ObjectIndex, Precondition, PutOutcome,
 };
 use tp_contracts::schedule::{InboxItem, ItipMethod};
-use tp_dav::index::IndexOptions;
 use tp_dav::itip;
 
 use crate::calendar_event::{calendar_ids, split};
@@ -46,17 +45,6 @@ pub(crate) fn addresses(ctx: &Ctx<'_>) -> Vec<String> {
     } else {
         Vec::new()
     }
-}
-
-/// Индекс объекта календаря для записи: интервал, занятость (у повторяющегося события — признак
-/// `ObjectIndex::recurring`, META-54), `Schedule-Tag` — как при записи CalDAV.
-pub(crate) fn object_index(
-    ical: &ICalendar,
-    opts: &IndexOptions,
-) -> Result<ObjectIndex, tp_dav::index::IndexError> {
-    let mut idx = tp_dav::index::of_calendar(ical, opts)?;
-    idx.schedule_tag = itip::schedule_tag(ical);
-    Ok(idx)
 }
 
 /// `isOrigin`: событие не объект планирования или вошедший — его организатор.
@@ -391,7 +379,7 @@ mod tests {
     use tp_contracts::auth::Principal;
     use tp_contracts::dav::{CollectionKind, DavObject, DavStore};
     use tp_contracts::meta::AccountScope;
-    use tp_contracts::schedule::ItipMethod;
+    use tp_contracts::schedule::{BusyKind, ItipMethod};
 
     use crate::calendars::tests::{call, create_calendar};
     use crate::testenv::Env;
@@ -643,25 +631,56 @@ mod tests {
         assert!(!mine.body.contains("SCHEDULE-STATUS"), "{}", mine.body);
     }
 
-    /// Индекс события, записанного из JMAP: `Schedule-Tag` только у встреч, занятость — до горизонта хранилища.
+    /// Приёмка JMAP-40: индекс события из JMAP — тот же, что у записи по CalDAV (`tp_dav::index::for_write`):
+    /// `Schedule-Tag` только у встреч, занятость неповторяющегося события, повторы — без индекса занятости.
     #[tokio::test]
-    async fn index_has_schedule_tag_and_clipped_busy() {
+    async fn index_matches_caldav_write() {
         let env = Env::new().await;
         create_calendar(&env, "Работа").await;
-        let mut event = meeting();
-        event["start"] = json!("2026-01-05T10:00:00");
-        event["recurrenceRule"] = json!({"@type": "RecurrenceRule", "frequency": "weekly"});
+        let mut weekly = meeting();
+        weekly["uid"] = json!("weekly-1");
+        weekly["start"] = json!("2026-01-05T10:00:00");
+        weekly["recurrenceRule"] = json!({"@type": "RecurrenceRule", "frequency": "weekly"});
+        let mut tentative = meeting();
+        tentative["uid"] = json!("tentative-1");
+        tentative["status"] = json!("tentative");
         let args = json!({"accountId": env.account(), "create": {
-            "m": event,
+            "m": meeting(),
+            "w": weekly,
+            "t": tentative,
             "p": {"uid": "plain-1", "title": "Личное", "start": "2027-01-11T10:00:00", "duration": "PT1H"},
+            "f": {"uid": "free-1", "title": "Свободно", "start": "2027-01-12T10:00:00", "duration": "PT1H",
+                  "freeBusyStatus": "free"},
         }});
         let r = call(&env, "CalendarEvent/set", args).await;
         assert!(r["notCreated"].is_null(), "{r}");
+        let opts = env
+            .jmap
+            .cfg
+            .calendars
+            .index_options(time::OffsetDateTime::now_utc());
+        for uid in ["meet-1", "weekly-1", "tentative-1", "plain-1", "free-1"] {
+            let obj = stored(&env, env.scope, uid).await.expect("событие");
+            let ical = calcard::icalendar::ICalendar::parse(&obj.body).expect("iCalendar");
+            let caldav = tp_dav::index::for_write(&ical, &opts).expect("индекс");
+            assert_eq!(obj.index, caldav, "{uid}: {}", obj.body);
+        }
+        let meet = stored(&env, env.scope, "meet-1").await.expect("встреча");
+        assert!(meet.index.schedule_tag.is_some());
+        assert_eq!(meet.index.busy.len(), 1, "{:?}", meet.index.busy);
+        assert_eq!(meet.index.busy[0].kind, BusyKind::Busy);
+        let tentative = stored(&env, env.scope, "tentative-1")
+            .await
+            .expect("встреча");
+        assert_eq!(tentative.index.busy[0].kind, BusyKind::Tentative);
         let plain = stored(&env, env.scope, "plain-1").await.expect("событие");
         assert_eq!(plain.index.schedule_tag, None);
-        let weekly = stored(&env, env.scope, "meet-1").await.expect("встреча");
-        assert!(weekly.index.schedule_tag.is_some());
+        assert_eq!(plain.index.busy.len(), 1);
+        let free = stored(&env, env.scope, "free-1").await.expect("событие");
+        assert!(free.index.busy.is_empty(), "{:?}", free.index.busy);
         // Повторы в индекс занятости не пишутся: их разворачивает хранилище при запросе (META-54).
+        let weekly = stored(&env, env.scope, "weekly-1").await.expect("встреча");
+        assert!(weekly.index.schedule_tag.is_some());
         assert!(weekly.index.recurring && weekly.index.busy.is_empty());
     }
 
