@@ -28,6 +28,9 @@
 {%- if thepost_dav_listen | length > 0 -%}
 {%-   set node = node | combine({'http': {'dav': {'listen': thepost_dav_listen}}}, recursive=true) -%}
 {%- endif -%}
+{%- if thepost_cli_oidc | length > 0 -%}
+{%-   set node = node | combine({'cli': {'oidc': thepost_cli_oidc}}, recursive=true) -%}
+{%- endif -%}
 {%- if thepost_dav | length > 0 -%}
 {%-   set node = node | combine({'dav': thepost_dav}, recursive=true) -%}
 {%- endif -%}

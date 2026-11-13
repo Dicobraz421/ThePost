@@ -60,9 +60,15 @@ thepost_admin_listen: "127.0.0.1:8443"
 # с JMAP; адрес:порт — отдельный слушатель http.dav (порт — и в thepost_firewall_ports). Лимиты — секция dav.
 thepost_dav_listen: ""
 thepost_dav: {}
-# Роль maintenance (секция maintenance): период очистки по сроку и срок токенов admin init; сроки хранения
-# надгробий DAV и журналов — thepost_config_extra.meta (dav.tombstone_ttl, sieve.vacation_log_ttl, delivery.retention).
-thepost_maintenance: { purge_interval: 1h, admin_token_retention: 30d }
+# Роль maintenance (секция maintenance) — поверх пресета: purge_interval, admin_token_retention, gal_interval,
+# verify (enabled, at, interval, lease_name, lease_ttl), например { verify: { at: "02:30" } }; пусто — умолчания
+# пресета. Сроки хранения надгробий DAV и журналов — thepost_config_extra.meta (dav.tombstone_ttl,
+# sieve.vacation_log_ttl, delivery.retention).
+thepost_maintenance: {}
+# Вход администратора `thepost admin login --oidc` (секция cli.oidc, RFC 8628) у поставщика auth.oidc
+# (thepost_config_extra.auth.oidc) — поверх пресета, например { client_id: thepost-cli }; пусто — вход с устройства
+# выключен.
+thepost_cli_oidc: {}
 # Владелец схемы для миграций (database.owner; роль postgresql, секрет thepost/db-owner в OpenBao): узел входит
 # ролью thepost (thepost_app), схему меняет только при запуске миграций (meta.migrate_on_start).
 thepost_db_owner_role: "{{ postgresql_owner_role | default('thepost_owner') }}"
