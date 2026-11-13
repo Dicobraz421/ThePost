@@ -1167,6 +1167,8 @@ mod tests {
             display_name: "Анна".into(),
             external_id: Some("ext-1".into()),
             enabled: true,
+            aliases: vec!["a.petrova@example.org".into()],
+            hidden_from_gal: false,
             quota: QuotaInfo {
                 used_bytes: 10,
                 messages: 1,
