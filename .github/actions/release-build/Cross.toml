@@ -24,9 +24,10 @@ pre-build = [
 passthrough = ["LIBCLANG_PATH=/usr/lib/llvm-8/lib", "LIBGSSAPI_PREFIX=/opt/gssapi"]
 
 # bindgen берёт BINDGEN_EXTRA_CLANG_ARGS_<цель> вместо общей переменной: для aarch64 образ cross задаёт в ней
-# --sysroot, она повторяется здесь.
+# --sysroot, она повторяется здесь. MIT Kerberos 1.13 (Ubuntu 16.04) ещё не объявляет псевдоним RFC 2744
+# GSS_S_BAD_MIC = GSS_S_BAD_SIG (есть с 1.17), а libgssapi-sys его берёт: тот же #define, что в новых заголовках.
 [target.x86_64-unknown-linux-gnu.env]
-passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu=-isystem /opt/clang-include"]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu=-isystem /opt/clang-include -DGSS_S_BAD_MIC=GSS_S_BAD_SIG"]
 
 [target.aarch64-unknown-linux-gnu.env]
-passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu -isystem /opt/clang-include"]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu -isystem /opt/clang-include -DGSS_S_BAD_MIC=GSS_S_BAD_SIG"]
