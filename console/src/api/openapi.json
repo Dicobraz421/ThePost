@@ -5196,6 +5196,44 @@
           "audit"
         ]
       },
+      "get": {
+        "operationId": "get_org_audit_policy",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditPolicyBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Политика аудита ящиков организации: заданная, иначе по умолчанию (только действия не владельца). Права — как\nу журнала аудита ящиков: администратор и аудитор организации, оператору — 403.",
+        "tags": [
+          "audit"
+        ]
+      },
       "put": {
         "operationId": "put_org_audit_policy",
         "parameters": [

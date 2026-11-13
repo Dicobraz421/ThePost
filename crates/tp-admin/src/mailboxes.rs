@@ -7,9 +7,9 @@
 //!   `existing`: `keep` или `delete`);
 //! - остановка синхронизации каталога при удалении больше порога учётных записей (`/api/v1/orgs/{org}/sync-hold`):
 //!   чтение и подтверждение администратором (`SyncGate::approve_sync`) — следующая синхронизация выполняет отключение;
-//! - аудит доступа к ящикам: политика организации (`/api/v1/orgs/{org}/mailbox-audit/policy`) и ящика
-//!   (`…/accounts/{account}/audit-policy`, чтение — действующая), выборка журнала (`/api/v1/orgs/{org}/mailbox-audit`;
-//!   доступна аудитору, недоступна оператору).
+//! - аудит доступа к ящикам: политика организации (`/api/v1/orgs/{org}/mailbox-audit/policy`; чтение — заданная или
+//!   по умолчанию, с правами журнала) и ящика (`…/accounts/{account}/audit-policy`, чтение — действующая), выборка
+//!   журнала (`/api/v1/orgs/{org}/mailbox-audit`; журнал и политику организации читает аудитор, оператор — нет).
 //!
 //! Хранилища списков, аудита и остановки — поля [`crate::Deps`] `senders`, `mailbox_audit`, `sync`.
 
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -35,6 +35,9 @@ use crate::server::{Admin, ApiResult, Problem};
 
 /// Маршрут выборки журнала аудита ящиков (доступен аудитору).
 pub const MAILBOX_AUDIT_ROUTE: &str = "/api/v1/orgs/{org}/mailbox-audit";
+
+/// Шаблон маршрута политики аудита ящиков организации: чтение — с правами журнала аудита ящиков (ADM-40).
+pub const MAILBOX_AUDIT_POLICY_ROUTE: &str = "/api/v1/orgs/{org}/mailbox-audit/policy";
 
 /// Списки отправителей ящика.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -282,8 +285,10 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
     .route("/api/v1/orgs/{org}/sync-hold/approve", post(approve_sync))
     .route(MAILBOX_AUDIT_ROUTE, get(search_mailbox_audit))
     .route(
-        "/api/v1/orgs/{org}/mailbox-audit/policy",
-        put(put_org_audit_policy).delete(delete_org_audit_policy),
+        MAILBOX_AUDIT_POLICY_ROUTE,
+        get(get_org_audit_policy)
+            .put(put_org_audit_policy)
+            .delete(delete_org_audit_policy),
     )
     .route(
         "/api/v1/orgs/{org}/accounts/{account}/audit-policy",
@@ -305,6 +310,7 @@ pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
         get_sync_hold,
         approve_sync,
         search_mailbox_audit,
+        get_org_audit_policy,
         put_org_audit_policy,
         delete_org_audit_policy,
         get_audit_policy,
@@ -470,6 +476,19 @@ async fn search_mailbox_audit(
             .collect(),
         next: page.next.map(|c| c.0),
     }))
+}
+
+/// Политика аудита ящиков организации: заданная, иначе по умолчанию (только действия не владельца). Права — как
+/// у журнала аудита ящиков: администратор и аудитор организации, оператору — 403.
+#[utoipa::path(get, path = "/api/v1/orgs/{org}/mailbox-audit/policy", tag = "audit",
+    params(("org" = String, Path, description = "Организация (UUID)")),
+    responses((status = 200, body = AuditPolicyBody), (status = 403, body = Problem)))]
+async fn get_org_audit_policy(
+    State(a): State<Arc<Admin>>,
+    Path(org): Path<TenantId>,
+) -> ApiResult<Json<AuditPolicyBody>> {
+    let p = a.d.mailbox_audit.tenant_audit_policy(org).await?;
+    Ok(Json(p.unwrap_or_default().into()))
 }
 
 /// Задаёт политику аудита ящиков организации.
@@ -737,5 +756,38 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let (s, _, _) = env.call("DELETE", &policy, Some("org"), None).await;
         assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+
+    /// Приёмка ADM-40: `GET` политики организации — заданная после `PUT`, по умолчанию после сброса; аудитор читает,
+    /// но не меняет; оператору — 403.
+    #[tokio::test]
+    async fn org_audit_policy_read() {
+        let env = Env::new();
+        let policy = format!("{}/mailbox-audit/policy", org());
+        let default = json!({"non_owner": true, "owner": []});
+        let (s, _, b) = env.call("GET", &policy, Some("auditor"), None).await;
+        assert_eq!((s, &b), (StatusCode::OK, &default));
+        let set = json!({"non_owner": false, "owner": ["delete", "send"]});
+        let (s, _, _) = env
+            .call("PUT", &policy, Some("org"), Some(set.clone()))
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        for who in ["org", "auditor"] {
+            let (s, _, b) = env.call("GET", &policy, Some(who), None).await;
+            assert_eq!((s, &b), (StatusCode::OK, &set), "{who}");
+        }
+        let (s, _, _) = env.call("GET", &policy, Some("operator"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = env
+            .call("PUT", &policy, Some("auditor"), Some(default.clone()))
+            .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "аудитор только читает");
+        let other = format!("/api/v1/orgs/{}/mailbox-audit/policy", env.other_tenant);
+        let (s, _, _) = env.call("GET", &other, Some("auditor"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "чужая организация");
+        let (s, _, _) = env.call("DELETE", &policy, Some("org"), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (_, _, b) = env.call("GET", &policy, Some("auditor"), None).await;
+        assert_eq!(b, default);
     }
 }

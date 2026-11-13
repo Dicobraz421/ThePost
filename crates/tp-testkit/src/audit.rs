@@ -102,6 +102,12 @@ impl MailboxAudit for MemMailboxAudit {
         Ok(st.policy(scope))
     }
 
+    async fn tenant_audit_policy(&self, tenant: TenantId) -> Result<Option<AuditPolicy>> {
+        let mut st = lock(&self.state);
+        fault(&mut st)?;
+        Ok(st.policies.get(&(tenant, None)).cloned())
+    }
+
     async fn set_audit_policy(
         &self,
         tenant: TenantId,

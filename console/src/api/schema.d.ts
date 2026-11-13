@@ -573,7 +573,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Политика аудита ящиков организации: заданная, иначе по умолчанию (только действия не владельца). Права — как
+         *     у журнала аудита ящиков: администратор и аудитор организации, оператору — 403.
+         */
+        get: operations["get_org_audit_policy"];
         /** Задаёт политику аудита ящиков организации. */
         put: operations["put_org_audit_policy"];
         post?: never;
@@ -3753,6 +3757,36 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_org_audit_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPolicyBody"];
+                };
+            };
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
