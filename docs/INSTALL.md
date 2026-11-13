@@ -75,7 +75,7 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
    | `thepost_tls_mode` | Сертификат |
    |---|---|
    | `acme` (по умолчанию) | Let's Encrypt встроенным клиентом The Post; порт 80 открыт, DNS имени сервера указывает на ВМ; ключ — в OpenBao |
-   | `files` | свои файлы PEM: `thepost_tls_cert_src`, `thepost_tls_key_src` |
+   | `files` | свои файлы PEM: `thepost_tls_cert_src` (цепочка), `thepost_tls_key_src` (ключ — плейбук загружает его в OpenBao) |
    | `internal` | внутренний центр сертификации — только для стенда |
 
    Закрытый ключ сертификата хранится только в OpenBao (секрет `thepost/tls`), на диске сервера его нет: плейбук
@@ -99,7 +99,9 @@ PostgreSQL 16, OpenBao, Rspamd (по желанию — антивирус ClamA
 Если PostgreSQL и OpenBao уже есть или нужна своя схема — установка бинарного файла, юнита systemd и `config.yaml`
 по шагам описана в [`deploy/README.md`](../deploy/README.md#установка-под-systemd-smb-enterprise-вм). Секреты (пароли
 СУБД, ключи, в том числе ключ TLS — `tls.key: { secret: "thepost/tls#key" }`) в `config.yaml` не пишутся — только
-ссылки на OpenBao.
+ссылки на OpenBao. Порты ниже 1024 слушают сокеты systemd (`thepost-*.socket`): у процесса нет прав открыть их самому.
+Сертификат — встроенный ACME (секция `acme`, порт 80 — `thepost-http.socket`) или свой: цепочка — файл
+`tls.cert_file`, ключ — в OpenBao (`bao kv put -mount=thepost tls key=@privkey.pem`, затем удалите файл ключа с сервера).
 
 ## Первый администратор
 
