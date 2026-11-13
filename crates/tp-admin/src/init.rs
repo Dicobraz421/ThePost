@@ -1027,6 +1027,55 @@ mod tests {
         assert_eq!(env.admin.local.as_ref().expect("local").sessions().len(), 0);
     }
 
+    /// Без OIDC роли `admin.roles` (по имени входа и группе) — через вход по паролю: оператор по имени входа читает
+    /// свою организацию и не пишет, журнал аудита ему закрыт; аудитор по группе читает журнал; учётная запись без
+    /// назначения — 403.
+    #[tokio::test]
+    async fn password_login_grants_config_roles() {
+        let mut cfg = crate::testenv::config();
+        cfg.roles.push(crate::server::RoleBinding {
+            role: AdminRole::Operator,
+            logins: vec!["Ops@Example.org".into()],
+            groups: vec![],
+        });
+        let env = Env::with(cfg, Vec::new());
+        async fn login(
+            env: &Env,
+            login: &str,
+            groups: &[&str],
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let scope = env.account(login).await;
+            add_password(env, scope, login, "s3cret", groups);
+            let body = password_body(login, "s3cret");
+            env.call("POST", SESSION_ROUTE, None, Some(body)).await
+        }
+        let org = TenantId::DEFAULT;
+        let accounts = format!("/api/v1/orgs/{org}/accounts");
+        let audit = format!("/api/v1/orgs/{org}/audit");
+
+        let (s, _, b) = login(&env, "ops@example.org", &["staff"]).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(b["roles"], json!(["operator"]));
+        let ops = b["session"].as_str().expect("session").to_owned();
+        let (s, _, b) = env.call("GET", &accounts, Some(&ops), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let new = json!({"login": "new@example.org", "display_name": "New"});
+        let (s, _, _) = env.call("POST", &accounts, Some(&ops), Some(new)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "оператор только читает");
+        let (s, _, _) = env.call("GET", &audit, Some(&ops), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "журнал аудита оператору закрыт");
+
+        let (s, _, b) = login(&env, "sec@example.org", &["security"]).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(b["roles"], json!(["auditor"]));
+        let sec = b["session"].as_str().expect("session").to_owned();
+        let (s, _, b) = env.call("GET", &audit, Some(&sec), None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+
+        let (s, _, b) = login(&env, "nobody@example.org", &["staff"]).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    }
+
     /// После `admin init` вход по паролю даёт роль администратора установки без `admin.roles`: роль — запись
     /// учётной записи, а не признак пароля, — отзыв паролей `admin init` её не снимает (вход решает проверка пароля).
     #[tokio::test]
