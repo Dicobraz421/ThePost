@@ -42,11 +42,12 @@ mod ops;
 pub mod quota;
 pub mod split;
 pub mod trash;
+mod worker;
 
 pub use disabled::{DisabledConfig, DisabledMailboxes, DisabledPass};
 pub use quota::QuotaWarnConfig;
 pub use split::MimeLimits;
-pub use trash::{TrashConfig, TrashPass};
+pub use trash::{TrashConfig, TrashPass, TrashStats};
 
 /// Конфигурация хранилища (секция config.yaml; поля необязательны, неизвестное — ошибка).
 ///
@@ -57,7 +58,6 @@ pub use trash::{TrashConfig, TrashPass};
 ///   batch: 500
 ///   defer: 1d
 /// disabled:
-///   max_wait: 1h
 ///   retry: 5m
 ///   batch: 100
 ///   page: 500
@@ -127,6 +127,8 @@ pub struct Store {
     warned: quota::Warned,
     /// Сигнал воркеру истечения корзины: помещение в корзину зафиксировано (общий для клонов).
     trash_wake: Arc<tokio::sync::Notify>,
+    /// Показатели проходов истечения корзины (общие для клонов).
+    trash_stats: Arc<trash::TrashProbe>,
 }
 
 impl fmt::Debug for Store {
@@ -163,6 +165,7 @@ impl Store {
             mailboxes: None,
             warned: quota::Warned::default(),
             trash_wake: Arc::default(),
+            trash_stats: Arc::default(),
         }
     }
 
@@ -335,8 +338,10 @@ pub(crate) mod testenv {
         ) -> Self {
             let blobs = MemBlobStore::new(clock.clone()).with_chunk_size(4096);
             let index = MemBlobIndex::new(clock.clone());
-            let meta = MemMetadata::new(clock).with_blob_index(index.clone());
             let bus = MemEventBus::default();
+            let meta = MemMetadata::new(clock)
+                .with_blob_index(index.clone())
+                .with_bus(Arc::new(bus.clone()));
             let trash = MemTrash::new(&meta);
             let quota = MemQuota::new(&meta);
             let mut store = Store::with_writer(
@@ -374,7 +379,7 @@ pub(crate) mod testenv {
         pub armed: Arc<std::sync::Mutex<Vec<OffsetDateTime>>>,
     }
 
-    impl crate::trash::Timer for TestTimer {
+    impl crate::worker::Timer for TestTimer {
         fn now(&self) -> OffsetDateTime {
             Clock::now(&self.clock)
         }

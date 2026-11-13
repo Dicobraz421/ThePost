@@ -26,13 +26,13 @@
 //! [`TrashConfig::retry`] (SRS 2.8, таймер 2).
 
 use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use time::{OffsetDateTime, PrimitiveDateTime};
-use tp_contracts::bus::{EventKind, EventStream};
+use time::OffsetDateTime;
+use tp_contracts::bus::EventKind;
 use tp_contracts::config::duration;
 use tp_contracts::ext::{Decision, FinalDelete};
 use tp_contracts::meta::{AccountScope, Inserted};
@@ -40,6 +40,7 @@ use tp_contracts::retention::{TrashItem, TrashObject, trash_changed};
 use tp_contracts::{MessageId, ModSeq, Result};
 
 use crate::Store;
+use crate::worker::{FAR, Signals, SystemTimer, Timer, after};
 
 /// Истечение срока корзины (секция `trash` конфигурации хранилища).
 ///
@@ -92,45 +93,46 @@ pub struct TrashPass {
     pub failed: usize,
 }
 
-/// Часы и таймер воркера истечения: в работе — системные ([`SystemTimer`]), в тестах — часы testkit.
-pub(crate) trait Timer: Send + Sync {
-    /// Текущий момент (UTC).
-    fn now(&self) -> OffsetDateTime;
-    /// Завершается не раньше момента `at`.
-    fn sleep_until(&self, at: OffsetDateTime) -> impl Future<Output = ()> + Send;
+/// Показатели проходов истечения корзины (`Store::expire_trash`) для `/metrics` узла — по образцу шагов очистки по
+/// сроку роли maintenance (`tp_maintenance_purge_*`). Пишет проход, читает [`Store::trash_stats`]; клоны `Store`
+/// разделяют показатели.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrashStats {
+    /// Проходов выполнено.
+    pub runs: u64,
+    /// Проходов с ошибкой: запрос хранилища не выполнен или часть элементов не обработана
+    /// ([`TrashPass::failed`]; повтор — в следующий проход). Запрет точки принятия решений — не ошибка.
+    pub errors: u64,
+    /// Писем удалено окончательно.
+    pub purged: u64,
+    /// Момент последнего прохода без ошибок, секунд от начала эпохи Unix; 0 — таких не было.
+    pub last_success: u64,
 }
 
-/// Системные часы и таймер tokio.
-pub(crate) struct SystemTimer;
+/// Держатель [`TrashStats`], общий для клонов `Store`.
+#[derive(Debug, Default)]
+pub(crate) struct TrashProbe(Mutex<TrashStats>);
 
-impl Timer for SystemTimer {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
+impl TrashProbe {
+    fn get(&self) -> TrashStats {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn sleep_until(&self, at: OffsetDateTime) -> impl Future<Output = ()> + Send {
-        let wait = Duration::try_from(at - OffsetDateTime::now_utc()).unwrap_or(Duration::ZERO);
-        tokio::time::sleep(wait)
+    fn record(&self, now: OffsetDateTime, pass: &Result<TrashPass>) {
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        s.runs += 1;
+        match pass {
+            Ok(p) => {
+                s.purged += p.purged as u64;
+                if p.failed > 0 {
+                    s.errors += 1;
+                } else {
+                    s.last_success = u64::try_from(now.unix_timestamp()).unwrap_or(0);
+                }
+            }
+            Err(_) => s.errors += 1,
+        }
     }
-}
-
-/// Следующий сигнал подписки; без подписки — никогда.
-async fn next_event(events: &mut Option<EventStream>) -> Option<tp_contracts::bus::Event> {
-    match events {
-        Some(s) => s.next().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Момент позже любого срока: `TrashStore::expired` на него — элементы по возрастанию срока.
-pub(crate) const FAR: OffsetDateTime = PrimitiveDateTime::MAX.assume_utc();
-
-/// `at + d`; вне диапазона — `FAR`.
-pub(crate) fn after(at: OffsetDateTime, d: Duration) -> OffsetDateTime {
-    time::Duration::try_from(d)
-        .ok()
-        .and_then(|d| at.checked_add(d))
-        .unwrap_or(FAR)
 }
 
 impl Store {
@@ -174,6 +176,17 @@ impl Store {
     /// Проход истечения на момент `now`: пакеты элементов с `expires_at <= now`, пока они есть и проход
     /// продвигается. Ошибка — только у запроса `expired`; ошибки отдельных элементов — в [`TrashPass::failed`].
     pub async fn expire_trash(&self, now: OffsetDateTime) -> Result<TrashPass> {
+        let pass = self.trash_pass(now).await;
+        self.trash_stats.record(now, &pass);
+        pass
+    }
+
+    /// Показатели проходов истечения корзины этого хранилища (и его клонов) для `/metrics` узла.
+    pub fn trash_stats(&self) -> TrashStats {
+        self.trash_stats.get()
+    }
+
+    async fn trash_pass(&self, now: OffsetDateTime) -> Result<TrashPass> {
         let batch = self.cfg.trash.batch.max(1);
         let mut pass = TrashPass::default();
         loop {
@@ -202,25 +215,9 @@ impl Store {
         // После ошибки хранилища — не раньше этого момента (иначе истёкший необработанный элемент
         // взводил бы таймер в прошлое).
         let mut not_before: Option<OffsetDateTime> = None;
-        // Системные сигналы шины; `None` — подписка не оформлена.
-        let mut events: Option<EventStream> = None;
-        // Момент оформления текущей подписки и следующая попытка подписаться: поток, закрывшийся быстрее
-        // `retry` после оформления, или ошибка подписки — повтор не раньше чем через `retry`.
-        let mut opened = timer.now();
-        let mut resubscribe = opened;
+        let mut signals = Signals::new(timer.now(), self.cfg.trash.retry, "корзины");
         loop {
-            // До сверки срока: сигнал между сверкой и подпиской не теряется.
-            if events.is_none() && timer.now() >= resubscribe {
-                opened = timer.now();
-                events = match self.d.bus.subscribe_system().await {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "mailstore: подписка на сигналы корзины не оформлена");
-                        resubscribe = after(opened, self.cfg.trash.retry);
-                        None
-                    }
-                };
-            }
+            signals.ensure(self.d.bus.as_ref(), timer.now()).await;
             let due = match self.next_trash_expiry().await {
                 Ok(next) => next.map(|at| not_before.map_or(at, |nb| at.max(nb))),
                 Err(e) => {
@@ -232,35 +229,20 @@ impl Store {
             };
             // Не дольше `max_wait` (без подписки — до следующей попытки): по истечении — только сверка срока.
             let mut cap = after(timer.now(), self.cfg.trash.max_wait);
-            if events.is_none() {
-                cap = cap.min(resubscribe);
+            if let Some(retry) = signals.pending() {
+                cap = cap.min(retry);
             }
             let (at, pass) = match due {
                 Some(at) if at <= cap => (at, true),
                 _ => (cap, false),
             };
-            let sleep = timer.sleep_until(at);
-            tokio::pin!(sleep);
-            let fire = loop {
-                tokio::select! {
-                    () = &mut shutdown => return,
-                    // Помещение в корзину этим узлом: сверить срок и перевзвести таймер.
-                    () = self.trash_wake.notified() => break false,
-                    ev = next_event(&mut events) => match ev.map(|e| e.kind) {
-                        // Корзина изменилась (на любом узле) или сигналы потеряны: сверить срок.
-                        Some(EventKind::TrashChanged { .. } | EventKind::Resync) => break false,
-                        Some(_) => {}
-                        // Поток завершился (потеря связи): переподписка и сверка.
-                        None => {
-                            events = None;
-                            let now = timer.now();
-                            let soon = after(opened, self.cfg.trash.retry);
-                            resubscribe = if now < soon { after(now, self.cfg.trash.retry) } else { now };
-                            break false;
-                        }
-                    },
-                    () = &mut sleep => break pass,
-                }
+            let fire = tokio::select! {
+                () = &mut shutdown => return,
+                // Помещение в корзину этим узлом: сверить срок и перевзвести таймер.
+                () = self.trash_wake.notified() => false,
+                // Корзина изменилась (на любом узле), сигналы потеряны или поток завершился: сверить срок.
+                () = signals.changed(timer, |k| matches!(k, EventKind::TrashChanged { .. })) => false,
+                () = timer.sleep_until(at) => pass,
             };
             if fire {
                 let now = timer.now();
@@ -358,7 +340,8 @@ impl Store {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tp_contracts::bus::EventBus;
+    use futures::StreamExt;
+    use tp_contracts::bus::{EventBus, EventStream};
     use tp_contracts::ext::{DecisionHook, DecisionHooks};
     use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
     use tp_contracts::meta::{Flags, MailboxStore, MessageStore, SpecialUse};
@@ -519,6 +502,43 @@ mod tests {
         // Повтор безопасен.
         let again = f.env.store.expire_trash(f.now + days(31)).await;
         assert_eq!(again, Ok(TrashPass::default()));
+    }
+
+    /// Хвост APP-52: показатели проходов истечения — удалённые письма и момент успеха; клон `Store` видит те же.
+    /// Ошибка запроса или необработанные элементы — ошибка прохода без смены момента успеха.
+    #[tokio::test]
+    async fn expiry_stats() {
+        let f = fixture(DecisionHooks::default(), 1).await;
+        assert_eq!(f.env.store.trash_stats(), TrashStats::default());
+        f.delete(&f.ids).await;
+        let at = f.now + days(31);
+        f.env.store.expire_trash(at).await.expect("expire");
+        let done = TrashStats {
+            runs: 1,
+            errors: 0,
+            purged: 1,
+            last_success: at.unix_timestamp() as u64,
+        };
+        assert_eq!(f.env.store.clone().trash_stats(), done);
+
+        let probe = TrashProbe::default();
+        probe.record(at, &Err(tp_contracts::Error::internal("СУБД недоступна")));
+        let partial = TrashPass {
+            expired: 2,
+            purged: 1,
+            failed: 1,
+            ..TrashPass::default()
+        };
+        probe.record(at, &Ok(partial));
+        assert_eq!(
+            probe.get(),
+            TrashStats {
+                runs: 2,
+                errors: 2,
+                purged: 1,
+                last_success: 0,
+            }
+        );
     }
 
     /// Legal Hold: запрещает окончательное удаление и запоминает запросы.
