@@ -1,15 +1,17 @@
 //! DAV-12, DAV-29: глобальная адресная книга «Организация» из in-memory каталога, записанная [`crate::gal::sync`] в
 //! `MemDav`: состав, скрытые из GAL (группы и учётные записи — DAV-27), запрет записи, синхронизация по токену
-//! хранилища (после изменения каталога новая версия — только у изменённой карточки).
+//! хранилища (после изменения каталога новая версия — только у изменённой карточки). DAV-37: почтовые контакты
+//! каталога, скрытые из GAL — нет.
 
 use std::collections::BTreeMap;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tp_contracts::auth::{DirAccount, DirGroup, DirOrg};
+use tp_contracts::addressbook::{ContactStore, MailContact};
+use tp_contracts::auth::{DirAccount, DirContact, DirGroup, DirOrg};
 use tp_contracts::dav::{CollectionKind, DavStore};
 use tp_contracts::groups::{DistributionGroup, GroupStore, SenderRestriction};
-use tp_contracts::ids::GroupId;
+use tp_contracts::ids::{ContactId, GroupId};
 
 use super::{BOOKS, Env, basic, vcard};
 use crate::DavConfig;
@@ -436,4 +438,102 @@ async fn hidden_account() {
     assert_eq!(names(&r.body), ["u-maria.vcf"], "{}", r.body);
     let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
     assert_eq!(names(&r.body), ["g-sales.vcf", "u-ivan.vcf", "u-maria.vcf"]);
+}
+
+fn contact(id: &str, name: &str, email: &str) -> DirContact {
+    DirContact {
+        external_id: id.to_owned(),
+        display_name: name.to_owned(),
+        email: email.to_owned(),
+        attributes: BTreeMap::from([("telephoneNumber".to_owned(), "+7 812 555-01-02".to_owned())]),
+    }
+}
+
+/// DAV-37: почтовый контакт каталога виден в книге (`addressbook-query`, `GET`); скрытый из GAL в хранилище контактов
+/// (`MailContact::hidden_from_gal`) — нет; изменение контакта — новая версия его карточки, удаление из каталога —
+/// карточки нет (`sync-collection` — 404).
+#[tokio::test]
+async fn contacts() {
+    let env = env().await;
+    let t = env.scope.tenant;
+    env.dir.upsert_contact(
+        t,
+        contact("c-partner", "Партнёр", "partner@partner.example"),
+    );
+    env.dir.upsert_contact(
+        t,
+        contact("c-hidden", "Скрытый партнёр", "hidden@partner.example"),
+    );
+    env.contacts
+        .put_contact(MailContact {
+            id: ContactId::new(),
+            tenant: t,
+            display_name: "Скрытый партнёр".to_owned(),
+            email: "hidden@partner.example".to_owned(),
+            external_id: Some("c-hidden".to_owned()),
+            attributes: BTreeMap::new(),
+            groups: Vec::new(),
+            hidden_from_gal: true,
+        })
+        .await
+        .expect("контакт");
+    env.sync_gal().await;
+    let r = env.send("REPORT", &gal(), &[], &sync_body("")).await;
+    assert_eq!(
+        sorted(&r.body),
+        ["c-partner.vcf", "g-sales.vcf", "u-ivan.vcf", "u-maria.vcf"],
+        "{}",
+        r.body
+    );
+    let first = token(&r.body);
+    let query = r#"<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+      <d:prop><d:getetag/></d:prop>
+      <card:filter><card:prop-filter name="EMAIL"><card:text-match>@partner.example</card:text-match></card:prop-filter></card:filter>
+    </card:addressbook-query>"#;
+    let r = env.send("REPORT", &gal(), &[], query).await;
+    assert_eq!(names(&r.body), ["c-partner.vcf"], "{}", r.body);
+    let r = env
+        .send("GET", &format!("{}c-partner.vcf", gal()), &[], "")
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    for line in [
+        "UID:c-partner",
+        "FN;CHARSET=UTF-8:Партнёр",
+        "partner@partner.example",
+        "+7 812 555-01-02",
+    ] {
+        assert!(r.body.contains(line), "{line}: {}", r.body);
+    }
+    let r = env
+        .send("GET", &format!("{}c-hidden.vcf", gal()), &[], "")
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    // Изменение контакта — новая версия только его карточки.
+    env.dir.upsert_contact(
+        t,
+        contact("c-partner", "Партнёр ООО", "partner@partner.example"),
+    );
+    env.sync_gal().await;
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&first)).await;
+    assert_eq!(names(&r.body), ["c-partner.vcf"], "{}", r.body);
+    assert!(!r.body.contains("404 Not Found"), "{}", r.body);
+    let second = token(&r.body);
+    let r = env
+        .send("GET", &format!("{}c-partner.vcf", gal()), &[], "")
+        .await;
+    assert!(r.body.contains("Партнёр ООО"), "{}", r.body);
+
+    // Удаление из каталога — карточки нет.
+    env.dir.remove_contact(t, "c-partner");
+    env.sync_gal().await;
+    let r = env.send("REPORT", &gal(), &[], &sync_body(&second)).await;
+    assert_eq!(names(&r.body), ["c-partner.vcf"], "{}", r.body);
+    assert_eq!(r.body.matches("404 Not Found").count(), 1, "{}", r.body);
+    let r = env.send("REPORT", &gal(), &[], query).await;
+    assert!(names(&r.body).is_empty(), "{}", r.body);
+    let r = env
+        .send("GET", &format!("{}c-partner.vcf", gal()), &[], "")
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
 }

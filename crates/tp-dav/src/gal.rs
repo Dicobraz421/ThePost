@@ -8,10 +8,12 @@
 //! Состав строит [`sync`] из каталога (`Directory`) и записывает [`DavStore::sync_gal`]: учётные записи с
 //! разрешённым входом и адресом, кроме скрытых из GAL (`DirAccount::hidden_from_gal`, CTR-58), и группы с адресом
 //! рассылки; группа, скрытая из GAL (`hidden_from_gal` в `GroupStore`, поиск по идентификатору каталога), не
-//! показывается. Карточка (calcard, vCard 3.0; по запросу клиента — 4.0): `UID` — идентификатор в
-//! каталоге, `FN`, `EMAIL` (первый — основной), телефоны из атрибутов `telephoneNumber` и `mobile`; группа —
-//! `KIND:group` (`X-ADDRESSBOOKSERVER-KIND` в 3.0). Имя ресурса — идентификатор каталога с `.vcf`. Неизменная
-//! карточка хранилищем не перезаписывается: после изменения каталога новую версию получает только изменённая.
+//! показывается. Почтовые контакты (`Directory::contacts_since`, SRS 4.5; DAV-37) — с адресом, кроме скрытых из GAL
+//! (`MailContact::hidden_from_gal` в `ContactStore`: по идентификатору каталога или контакта). Карточка (calcard,
+//! vCard 3.0; по запросу клиента — 4.0): `UID` — идентификатор в каталоге, `FN`, `EMAIL` (первый — основной),
+//! телефоны из атрибутов `telephoneNumber` и `mobile`; у контакта — так же, один `EMAIL`; группа — `KIND:group`
+//! (`X-ADDRESSBOOKSERVER-KIND` в 3.0). Имя ресурса — идентификатор каталога с `.vcf`. Неизменная карточка
+//! хранилищем не перезаписывается: после изменения каталога новую версию получает только изменённая.
 //! Оргструктура (подразделение, должность, руководитель) — DAV-22. Вызывает [`sync`] узел: при старте роли и по
 //! событию изменения каталога (APP-49). Пока [`sync`] не вызывался, книги нет.
 
@@ -24,7 +26,10 @@ use axum::response::Response;
 use calcard::vcard::{
     VCard, VCardEntry, VCardKind, VCardParameter, VCardProperty, VCardType, VCardVersion,
 };
-use tp_contracts::auth::{DirAccount, DirChange, DirCursor, DirGroup, DirPage, Directory};
+use tp_contracts::addressbook::ContactStore;
+use tp_contracts::auth::{
+    DirAccount, DirChange, DirContact, DirCursor, DirGroup, DirPage, Directory,
+};
 use tp_contracts::dav::{CollectionKind, DavStore, GAL_COLLECTION_NAME, GalCard, valid_name};
 use tp_contracts::groups::GroupStore;
 use tp_contracts::{ModSeq, Result, TenantId};
@@ -39,11 +44,14 @@ use crate::xml;
 /// Источники книги GAL ([`sync`]).
 #[derive(Clone)]
 pub struct GalDeps {
-    /// Каталог организации: учётные записи и группы.
+    /// Каталог организации: учётные записи, группы и почтовые контакты.
     pub directory: Arc<dyn Directory>,
     /// Группы рассылки: скрытые из адресной книги (`hidden_from_gal`) в неё не попадают; `None` — видны все
     /// группы каталога.
     pub groups: Option<Arc<dyn GroupStore>>,
+    /// Почтовые контакты: скрытые из адресной книги (`MailContact::hidden_from_gal`) в неё не попадают — контакт
+    /// каталога с тем же `external_id` или идентификатором контакта; `None` — видны все контакты каталога.
+    pub contacts: Option<Arc<dyn ContactStore>>,
 }
 
 impl fmt::Debug for GalDeps {
@@ -77,6 +85,13 @@ pub async fn sync(
             .await?;
         groups.apply(page);
     }
+    let mut contacts = Dump::new(|c: &DirContact| c.external_id.clone());
+    while contacts.more {
+        let page = dir
+            .contacts_since(tenant, contacts.cursor.as_ref(), limit)
+            .await?;
+        contacts.apply(page);
+    }
     let hidden: HashSet<String> = match source.groups.as_deref() {
         Some(store) => store
             .list(tenant)
@@ -87,13 +102,35 @@ pub async fn sync(
             .collect(),
         None => HashSet::new(),
     };
-    let cards = accounts.items.values().filter_map(account_card).chain(
-        groups
-            .items
-            .values()
-            .filter(|g| !hidden.contains(&g.external_id))
-            .filter_map(group_card),
-    );
+    let hidden_contacts: HashSet<String> = match source.contacts.as_deref() {
+        Some(store) => store
+            .contacts(tenant)
+            .await?
+            .into_iter()
+            .filter(|c| c.hidden_from_gal)
+            .flat_map(|c| [Some(c.id.to_string()), c.external_id])
+            .flatten()
+            .collect(),
+        None => HashSet::new(),
+    };
+    let cards = accounts
+        .items
+        .values()
+        .filter_map(account_card)
+        .chain(
+            groups
+                .items
+                .values()
+                .filter(|g| !hidden.contains(&g.external_id))
+                .filter_map(group_card),
+        )
+        .chain(
+            contacts
+                .items
+                .values()
+                .filter(|c| !hidden_contacts.contains(&c.external_id))
+                .filter_map(contact_card),
+        );
     dav.sync_gal(tenant, &cfg.gal_name, gal_cards(cards)).await
 }
 
@@ -185,15 +222,41 @@ fn account_card(a: &DirAccount) -> Option<Card> {
         }
         entries.push(e);
     }
+    phones(&a.attributes, &mut entries);
+    write(&a.external_id, entries)
+}
+
+/// Телефоны из атрибутов каталога `telephoneNumber` (рабочий) и `mobile` (мобильный).
+fn phones(attributes: &BTreeMap<String, String>, entries: &mut Vec<VCardEntry>) {
     for (attr, typ) in [
         ("telephoneNumber", VCardType::Work),
         ("mobile", VCardType::Cell),
     ] {
-        if let Some(tel) = a.attributes.get(attr).filter(|t| !t.trim().is_empty()) {
+        if let Some(tel) = attributes.get(attr).filter(|t| !t.trim().is_empty()) {
             entries.push(entry(VCardProperty::Tel, tel).with_param(VCardParameter::typ(typ)));
         }
     }
-    write(&a.external_id, entries)
+}
+
+/// Карточка почтового контакта; нет адреса — `None`. Пустое отображаемое имя — `FN` из адреса.
+fn contact_card(c: &DirContact) -> Option<Card> {
+    if c.email.trim().is_empty() {
+        return None;
+    }
+    let name = if c.display_name.trim().is_empty() {
+        &c.email
+    } else {
+        &c.display_name
+    };
+    let mut entries = vec![
+        entry(VCardProperty::Uid, &c.external_id),
+        entry(VCardProperty::Fn, name),
+        entry(VCardProperty::Email, &c.email)
+            .with_param(VCardParameter::typ(VCardType::Work))
+            .with_param(VCardParameter::pref(1u32)),
+    ];
+    phones(&c.attributes, &mut entries);
+    write(&c.external_id, entries)
 }
 
 /// Карточка группы; нет адреса рассылки — `None`.

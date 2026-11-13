@@ -268,7 +268,7 @@ mod tests {
     use tp_contracts::auth::{DirAccount, DirOrg};
     use tp_contracts::dav::{CollectionId, gal_changed};
     use tp_contracts::{AccountId, ModSeq, TenantId};
-    use tp_testkit::{FakeDirectory, MemDav, MemGroups, MemLease};
+    use tp_testkit::{FakeDirectory, MemAddressBook, MemDav, MemGroups, MemLease};
 
     use super::*;
 
@@ -338,6 +338,7 @@ mod tests {
             GalDeps {
                 directory: Arc::new(dir.clone()),
                 groups: Some(Arc::new(MemGroups::new())),
+                contacts: Some(Arc::new(MemAddressBook::new())),
             },
             Arc::new(dav.clone()),
             tenant,
