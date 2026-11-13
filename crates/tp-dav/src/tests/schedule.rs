@@ -100,6 +100,7 @@ impl Sched {
                 delivery: Arc::new(inbox.clone()),
                 sender: Some(Arc::new(sender.clone())),
                 freebusy: Arc::new(store.clone()),
+                group_store: Some(Arc::new(groups.clone())),
             }),
             cfg,
         );
@@ -1294,6 +1295,100 @@ async fn invite_alias_and_group() {
     );
     assert_eq!(org.body.matches(&format!("mailto:{OLGA}")).count(), 1);
     assert!(env.sender.sent().is_empty());
+}
+
+// ---------- DAV-35: вложенные группы участника ----------
+
+/// Группа A содержит группу B, B — снова A (цикл A→B→A): приглашение на A доходит до участников обеих групп, каждому
+/// по разу, раскрытие не зацикливается.
+#[tokio::test]
+async fn invite_nested_group_with_cycle() {
+    use tp_contracts::GroupId;
+    use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
+
+    let env = Sched::new().await;
+    let (a, b) = (GroupId::new(), GroupId::new());
+    let group = |id, name: &str, address: Option<&str>, members| DistributionGroup {
+        id,
+        tenant: env.tenant,
+        name: name.to_owned(),
+        address: address.map(str::to_owned),
+        external_id: None,
+        members,
+        senders: SenderRestriction::Anyone,
+        moderators: Vec::new(),
+        hidden_from_gal: false,
+    };
+    let team = "team@example.org";
+    env.groups
+        .put(group(
+            a,
+            "Команда",
+            Some(team),
+            vec![
+                GroupMember::Account(env.scope(PETR).account),
+                GroupMember::Group(b),
+            ],
+        ))
+        .await
+        .expect("группа A");
+    env.groups
+        .put(group(
+            b,
+            "Отдел",
+            None,
+            vec![
+                GroupMember::Account(env.scope(OLGA).account),
+                GroupMember::Group(a),
+            ],
+        ))
+        .await
+        .expect("группа B");
+
+    let body = meeting(
+        "m-35",
+        IVAN,
+        T10,
+        0,
+        &format!(
+            "ATTENDEE;CN=Команда:mailto:{team}
+"
+        ),
+    );
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        env.put(IVAN, "n.ics", &[], &body),
+    )
+    .await
+    .expect("раскрытие групп не зацикливается");
+    assert_eq!(r.status, 201, "{}", r.body);
+    assert!(env.sender.sent().is_empty(), "внешних писем нет");
+
+    for login in [PETR, OLGA] {
+        let o = env.by_uid(login, "m-35").await.expect("у участника");
+        assert!(o.body.contains(&format!("mailto:{login}")), "{}", o.body);
+    }
+    let org = env.by_uid(IVAN, "m-35").await.expect("у организатора");
+    assert_eq!(
+        org.body.matches("SCHEDULE-STATUS=1.2").count(),
+        2,
+        "участник A и участник вложенной B; группе не отправляется: {}",
+        org.body
+    );
+    for login in [PETR, OLGA] {
+        assert_eq!(
+            org.body.matches(&format!("mailto:{login}")).count(),
+            1,
+            "участник добавлен один раз: {}",
+            org.body
+        );
+    }
+    assert_eq!(
+        org.body.matches(&format!("mailto:{IVAN}")).count(),
+        1,
+        "организатор участником не добавлен: {}",
+        org.body
+    );
 }
 
 // ---------- DAV-31: частные случаи RFC 6638 ----------

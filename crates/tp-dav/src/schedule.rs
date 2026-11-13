@@ -7,7 +7,8 @@
 //! `SCHEDULE-STATUS` в объекте: `1.2` доставлено, `1.1` письмо в очереди, `3.7` недопустимый адрес, `5.1` не
 //! доставлено, `5.3` нет отправки писем. Участники с `SCHEDULE-AGENT=CLIENT` и `NONE` пропускаются. Участник с адресом
 //! группы рассылки организации у организатора раскрывается в её учётные записи ([`ScheduleDeps::groups`],
-//! [`expand_groups`]): сообщения получают участники группы, сама группа — нет. Удаление календаря целиком — как
+//! [`expand_groups`]) с раскрытием вложенных групп ([`ScheduleDeps::group_store`], DAV-35): сообщения получают
+//! участники группы, сама группа — нет. Удаление календаря целиком — как
 //! удаление каждого его объекта: организатор рассылает `CANCEL`, участник — `REPLY` с отказом
 //! (`after_delete_collection`).
 //!
@@ -32,7 +33,7 @@ use calcard::icalendar::{
 };
 use time::OffsetDateTime;
 use tp_contracts::dav::{CollectionKind, Component};
-use tp_contracts::groups::GroupMember;
+use tp_contracts::groups::{GroupMember, GroupStore};
 use tp_contracts::meta::{AccountScope, AccountStore, AddressTarget};
 use tp_contracts::queue::SubmitStatus;
 use tp_contracts::schedule::{
@@ -63,12 +64,16 @@ pub struct ScheduleDeps {
     pub sender: Option<Arc<dyn ItipSender>>,
     /// Занятость учётных записей (хранилище).
     pub freebusy: Arc<dyn FreeBusy>,
+    /// Группы рассылки: раскрытие вложенных групп участника-группы с защитой от циклов (`GroupStore::expand`,
+    /// DAV-35); `None` — участники группы только её учётные записи ([`GroupMember::Account`]).
+    pub group_store: Option<Arc<dyn GroupStore>>,
 }
 
 impl std::fmt::Debug for ScheduleDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScheduleDeps")
             .field("imip", &self.sender.is_some())
+            .field("group_store", &self.group_store.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -96,8 +101,9 @@ impl ScheduleDeps {
 
     /// Группы рассылки организации `tenant` среди участников объекта `ical` (RFC 5545 §3.2.11 `MEMBER`; DAV-30):
     /// адрес группы и адреса её включённых учётных записей (имя входа, [`itip::address`]) без адресов `me`.
-    /// Участники с `SCHEDULE-AGENT` не `SERVER` не раскрываются. Вложенные группы не раскрываются: участники группы —
-    /// её учётные записи ([`GroupMember::Account`]).
+    /// Участники с `SCHEDULE-AGENT` не `SERVER` не раскрываются. Вложенные группы ([`GroupMember::Group`]) раскрываются
+    /// через [`ScheduleDeps::group_store`] (`GroupStore::expand`: каждая группа один раз, циклы не зацикливают;
+    /// неизвестная вложенная группа пропускается); без него участники группы — только её учётные записи.
     pub async fn groups(
         &self,
         tenant: TenantId,
@@ -118,14 +124,24 @@ impl ScheduleDeps {
             else {
                 continue;
             };
-            let ids: Vec<AccountId> = g
-                .members
-                .iter()
-                .filter_map(|m| match m {
-                    GroupMember::Account(id) => Some(*id),
-                    GroupMember::Group(_) => None,
-                })
-                .collect();
+            let mut ids: Vec<AccountId> = Vec::new();
+            for m in &g.members {
+                match m {
+                    GroupMember::Account(id) => ids.push(*id),
+                    GroupMember::Group(nested) => {
+                        let Some(store) = &self.group_store else {
+                            continue;
+                        };
+                        match store.expand(tenant, *nested).await {
+                            Ok(found) => ids.extend(found),
+                            Err(Error::NotFound) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+            ids.sort_unstable();
+            ids.dedup();
             let members = if ids.is_empty() {
                 Vec::new()
             } else {

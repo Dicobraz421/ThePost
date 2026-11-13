@@ -427,6 +427,7 @@ impl Services {
             delivery: self.itip.clone(),
             sender: Some(Arc::new(tp_dav::ImipSender::new(outbound))),
             freebusy: Arc::new(self.meta.clone()),
+            group_store: None,
         }
     }
 

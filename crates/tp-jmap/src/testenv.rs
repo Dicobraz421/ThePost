@@ -289,6 +289,7 @@ impl Env {
             delivery: Arc::new(tp_dav::ItipInbox::new(Arc::new(dav.clone()), dav_cfg)),
             sender: Some(Arc::new(imip.clone())),
             freebusy: Arc::new(dav.clone()),
+            group_store: None,
         };
         let jmap = Jmap::new(
             Deps {
