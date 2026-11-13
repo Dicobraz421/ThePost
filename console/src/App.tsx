@@ -24,6 +24,7 @@ import { LoginPage } from "./pages/login";
 import { MailboxAuditPage } from "./pages/mailbox-audit";
 import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
+import { ResourceCreate, ResourceList, ResourceShow } from "./pages/resources";
 import { AccountSieve, OrgSieve } from "./pages/sieve";
 import { AccountTrash } from "./pages/trash";
 import { TransportPage } from "./pages/transport";
@@ -62,6 +63,13 @@ export function App() {
               create: "/accounts/create",
               show: "/accounts/:id",
               meta: { label: "Учётные записи" },
+            },
+            {
+              name: "resources",
+              list: "/resources",
+              create: "/resources/create",
+              show: "/resources/:id",
+              meta: { label: "Ресурсы" },
             },
             { name: "disabled-accounts", list: "/disabled-accounts", meta: { label: "Отключённые ящики" } },
             {
@@ -110,6 +118,11 @@ export function App() {
                 <Route path=":id" element={<AccountShow />} />
                 <Route path=":id/trash" element={<AccountTrash />} />
                 <Route path=":id/sieve" element={<AccountSieve />} />
+              </Route>
+              <Route path="/resources">
+                <Route index element={<ResourceList />} />
+                <Route path="create" element={<ResourceCreate />} />
+                <Route path=":id" element={<ResourceShow />} />
               </Route>
               <Route path="/groups">
                 <Route index element={<GroupList />} />
