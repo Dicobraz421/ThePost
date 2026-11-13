@@ -21,7 +21,9 @@
 //!   события `showWithoutTime` — `defaultAlertsWithoutTime`; нет — без `alerts`), собственные оповещения события
 //!   хранятся в iCalendar как есть (JMAP-36);
 //! - `utcStart`/`utcEnd` при записи, `recurrenceOverridesBefore`/`After`, `reduceParticipants` не поддерживаются;
-//! - `/copy` — между учётными записями, а доступна только своя: чужая — `fromAccountNotFound`;
+//! - в аккаунте владельца общих календарей (JMAP-32) видны события календарей с правом чтения, меняются — с правом
+//!   записи (иначе — `forbidden`); `sendSchedulingMessages` там — `forbidden`;
+//! - `/copy` между аккаунтами не поддерживается: `fromAccountNotFound`;
 //! - `VTIMEZONE` в записываемый iCalendar не добавляется: пояс — идентификатор IANA в `TZID` (RFC 7809).
 
 use std::collections::HashMap;
@@ -86,8 +88,9 @@ fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     catch_unwind(AssertUnwindSafe(f)).ok().flatten()
 }
 
-/// `Group` JSCalendar ресурса без первого события и само событие. Неразбираемое тело — `None`.
-pub(crate) fn split(body: &str) -> Option<(Map<String, Value>, Map<String, Value>)> {
+/// `Group` JSCalendar ресурса без первой записи типа `ty` (`Event`, `Task`) и сама запись. Неразбираемое тело или
+/// нет такой записи — `None`.
+pub(crate) fn split(body: &str, ty: &str) -> Option<(Map<String, Value>, Map<String, Value>)> {
     let v = guarded(|| {
         let js = ICalendar::parse(body)
             .ok()?
@@ -98,7 +101,7 @@ pub(crate) fn split(body: &str) -> Option<(Map<String, Value>, Map<String, Value
         return None;
     };
     let entries = group.get_mut("entries")?.as_array_mut()?;
-    let at = entries.iter().position(|e| e["@type"] == "Event")?;
+    let at = entries.iter().position(|e| e["@type"] == ty)?;
     let Value::Object(event) = entries.remove(at) else {
         return None;
     };
@@ -108,7 +111,9 @@ pub(crate) fn split(body: &str) -> Option<(Map<String, Value>, Map<String, Value
 /// Событие JMAP из объекта хранилища: JSCalendar из iCalendar и свойства JMAP (`id`, `calendarIds`, `isDraft`).
 /// Неразбираемое тело (хранилище его не проверяет) — событие только с `uid` из индекса.
 pub(crate) fn event_json(obj: &DavObject) -> Map<String, Value> {
-    let mut m = split(&obj.body).map(|(_, e)| e).unwrap_or_default();
+    let mut m = split(&obj.body, "Event")
+        .map(|(_, e)| e)
+        .unwrap_or_default();
     m.entry("@type").or_insert_with(|| json!("Event"));
     m.entry("uid").or_insert_with(|| json!(obj.index.uid));
     m.insert("id".into(), json!(obj.id.to_string()));
@@ -119,25 +124,22 @@ pub(crate) fn event_json(obj: &DavObject) -> Map<String, Value> {
     m
 }
 
-fn invalid(why: &str, props: &[&str]) -> Value {
+pub(crate) fn invalid(why: &str, props: &[&str]) -> Value {
     set_error("invalidProperties", Some(why), props)
 }
 
-/// iCalendar и индекс из `Group` ресурса и события JMAP (свойства JMAP отбрасываются); ошибка —
+/// iCalendar и индекс из `Group` ресурса и записи JSCalendar (`Event`, `Task`) без свойств JMAP; ошибка —
 /// `invalidProperties`.
-fn to_ical(
+pub(crate) fn entry_ical(
     mut group: Map<String, Value>,
-    mut event: Map<String, Value>,
+    entry: Map<String, Value>,
     opts: &IndexOptions,
 ) -> Result<(String, ObjectIndex), Value> {
-    for p in JMAP_PROPS {
-        event.remove(p);
-    }
     group.entry("@type").or_insert_with(|| json!("Group"));
     match group.get_mut("entries").and_then(Value::as_array_mut) {
-        Some(entries) => entries.insert(0, Value::Object(event)),
+        Some(entries) => entries.insert(0, Value::Object(entry)),
         None => {
-            group.insert("entries".into(), json!([event]));
+            group.insert("entries".into(), json!([entry]));
         }
     }
     let text = Value::Object(group).to_string();
@@ -149,11 +151,25 @@ fn to_ical(
     .ok_or_else(|| invalid("JSCalendar cannot be converted to iCalendar", &[]))?;
     let index =
         tp_dav::index::for_write(&ical, opts).map_err(|e| invalid(&e.to_string(), &["uid"]))?;
+    Ok((ical.to_string(), index))
+}
+
+/// iCalendar и индекс из `Group` ресурса и события JMAP (свойства JMAP отбрасываются); ошибка —
+/// `invalidProperties`.
+fn to_ical(
+    group: Map<String, Value>,
+    mut event: Map<String, Value>,
+    opts: &IndexOptions,
+) -> Result<(String, ObjectIndex), Value> {
+    for p in JMAP_PROPS {
+        event.remove(p);
+    }
+    let (body, index) = entry_ical(group, event, opts)?;
     if index.span.is_none() {
         let why = "invalid start, duration or recurrence";
         return Err(invalid(why, &["start", "duration", "recurrenceRule"]));
     }
-    Ok((ical.to_string(), index))
+    Ok((body, index))
 }
 
 // ---------- Время и вхождения ----------
@@ -344,26 +360,34 @@ pub(crate) async fn load_events(
     Ok(all)
 }
 
-pub(crate) async fn calendar_ids(
-    store: &dyn DavStore,
-    scope: AccountScope,
-) -> MethodResult<Vec<CollectionId>> {
-    Ok(store
-        .list_collections(scope, KIND)
+/// Календари аккаунта вызова с правом чтения.
+pub(crate) async fn calendar_ids(ctx: &Ctx<'_>) -> MethodResult<Vec<CollectionId>> {
+    Ok(ctx
+        .jmap
+        .dav_store()?
+        .list_collections(ctx.scope, KIND)
         .await?
         .into_iter()
         .map(|c| c.id)
+        .filter(|c| ctx.access.reads(*c))
         .collect())
 }
 
-/// Объект события по `id`; нет объекта или объект не событие (задача, карточка) — `None`.
-async fn find(
-    store: &dyn DavStore,
-    scope: AccountScope,
-    id: DavObjectId,
-) -> MethodResult<Option<DavObject>> {
-    let obj = store.objects_by_id(scope, &[id]).await?.into_iter().next();
-    Ok(obj.filter(|o| o.index.component == Component::Event))
+/// Объект события по `id`; нет объекта, объект не событие (задача, карточка) или календарь без права чтения —
+/// `None`.
+async fn find(ctx: &Ctx<'_>, id: DavObjectId) -> MethodResult<Option<DavObject>> {
+    let store = ctx.jmap.dav_store()?;
+    let obj = store
+        .objects_by_id(ctx.scope, &[id])
+        .await?
+        .into_iter()
+        .next();
+    Ok(obj.filter(|o| o.index.component == Component::Event && ctx.access.reads(o.collection)))
+}
+
+/// Ошибка `/set` записи в календарь без права записи.
+fn forbidden() -> Value {
+    set_error("forbidden", Some("mayWriteAll is required"), &[])
 }
 
 /// Свойства календарей событий запроса: пояс по умолчанию (время событий без пояса) и оповещения по умолчанию.
@@ -468,7 +492,7 @@ async fn get_one(
     let Some((oid, rid)) = split_id(id) else {
         return Ok(None);
     };
-    let Some(obj) = find(store.as_ref(), ctx.scope, oid).await? else {
+    let Some(obj) = find(ctx, oid).await? else {
         return Ok(None);
     };
     let mut event = event_json(&obj);
@@ -533,7 +557,7 @@ pub(crate) async fn get(
     let mut base = args;
     base.retain(|k, _| !GET_EXTRA.contains(&k.as_str()));
     let a: GetArgs = parse_args(base)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     ctx.check_get_limit(a.ids.as_ref())?;
     let unsupported = [
         extra.recurrence_overrides_before.as_ref(),
@@ -554,7 +578,7 @@ pub(crate) async fn get(
     let ids: Vec<String> = match &a.ids {
         Some(ids) => ids.iter().map(|i| ctx.resolve_id(i).to_owned()).collect(),
         None => {
-            let cals = calendar_ids(store.as_ref(), ctx.scope).await?;
+            let cals = calendar_ids(ctx).await?;
             let all = load_events(store.as_ref(), ctx.scope, &cals).await?;
             all.iter().map(|o| o.id.to_string()).collect()
         }
@@ -578,23 +602,26 @@ pub(crate) async fn get(
     })))
 }
 
-/// `CalendarEvent/changes` по журналу объектов календарей (в журнале — и задачи `VTODO`: их `id` в `/get` —
-/// `notFound`).
+/// `CalendarEvent/changes` по журналу объектов календарей: созданные и изменённые — только события календарей с
+/// правом чтения (задачи `VTODO` того же журнала — `Task/changes`); удалённые — все удалённые объекты.
 pub(crate) async fn changes(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: ChangesArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
     let since = parse_state(&a.since_state)?;
-    let c = ctx
-        .jmap
-        .dav_store()?
+    let store = ctx.jmap.dav_store()?;
+    let c = store
         .account_changes(ctx.scope, KIND, since, limit)
         .await
         .map_err(changes_error)?;
-    let c = map_changes(c, ToString::to_string);
+    let mut c = map_changes(c, ToString::to_string);
+    crate::sharing::retain_objects(ctx, store.as_ref(), &mut c, |o| {
+        o.index.component == Component::Event && ctx.access.reads(o.collection)
+    })
+    .await?;
     Ok(changes_response(&a.account_id, &a.since_state, &c))
 }
 
@@ -618,7 +645,7 @@ fn put_error(r: tp_contracts::Result<PutOutcome>) -> MethodResult<Result<Put, Va
     })
 }
 
-fn index_options(ctx: &Ctx<'_>) -> IndexOptions {
+pub(crate) fn index_options(ctx: &Ctx<'_>) -> IndexOptions {
     ctx.jmap
         .cfg
         .calendars
@@ -660,6 +687,9 @@ async fn create_one(ctx: &Ctx<'_>, v: &Value, send: bool) -> MethodResult<Result
         let why = "exactly one existing calendar is required";
         return Ok(Err(invalid(why, &["calendarIds"])));
     };
+    if !ctx.access.writes(cal) {
+        return Ok(Err(forbidden()));
+    }
     let now = utc_date(OffsetDateTime::now_utc());
     let object_id = DavObjectId::new();
     event.entry("@type").or_insert_with(|| json!("Event"));
@@ -768,15 +798,18 @@ async fn update_one(
     let Some((oid, rid)) = split_id(id) else {
         return not_found();
     };
-    let Some(obj) = find(store.as_ref(), ctx.scope, oid).await? else {
+    let Some(obj) = find(ctx, oid).await? else {
         return not_found();
     };
+    if !ctx.access.writes(obj.collection) {
+        return Ok(Err(forbidden()));
+    }
     let patch = match patch {
         Some(Value::Object(p)) => Some(p),
         Some(_) => return Ok(Err(set_error("invalidPatch", None, &[]))),
         None => None,
     };
-    let (group, _) = split(&obj.body).unwrap_or_default();
+    let (group, _) = split(&obj.body, "Event").unwrap_or_default();
     let before = event_json(&obj);
     let mut event = before.clone();
     match &rid {
@@ -879,7 +912,13 @@ pub(crate) async fn set(
         ));
     }
     let a: SetArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
+    if send && !ctx.access.is_own() {
+        return Err(MethodError::with(
+            "forbidden",
+            "sendSchedulingMessages is not allowed in a shared account",
+        ));
+    }
     a.check_limit(ctx.jmap.cfg.max_objects_in_set)?;
     let store = ctx.jmap.dav_store()?.clone();
     let old = state(store.as_ref(), ctx.scope).await?;
@@ -924,10 +963,14 @@ pub(crate) async fn set(
             }
             continue;
         }
-        let Some(obj) = find(store.as_ref(), ctx.scope, oid).await? else {
+        let Some(obj) = find(ctx, oid).await? else {
             out.not_destroyed.insert(id, not_found);
             continue;
         };
+        if !ctx.access.writes(obj.collection) {
+            out.not_destroyed.insert(id, forbidden());
+            continue;
+        }
         match store
             .delete_object(ctx.scope, obj.collection, &obj.name, Precondition::Any)
             .await
@@ -955,8 +998,7 @@ struct CopyArgs {
     account_id: String,
 }
 
-/// `CalendarEvent/copy`: копирование между учётными записями; доступна только своя, поэтому источник —
-/// `fromAccountNotFound` (общие календари — JMAP-32).
+/// `CalendarEvent/copy`: копирование между аккаунтами не поддерживается — источник `fromAccountNotFound`.
 pub(crate) async fn copy(
     ctx: &mut Ctx<'_>,
     mut args: Map<String, Value>,

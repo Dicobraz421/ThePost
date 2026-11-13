@@ -217,7 +217,10 @@ mod tests {
     #[tokio::test]
     async fn session_lists_settings() {
         let env = Env::new().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let acc = env.account();
         assert!(s["capabilities"]["urn:thepost:params:jmap:settings"].is_object());
         assert_eq!(

@@ -2019,7 +2019,7 @@ mod tests {
         let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
         let jmap_cfg = (*cfg.section::<tp_jmap::JmapConfig>(JMAP).expect("jmap")).clone();
         let jmap = services.jmap(&ext, jmap_cfg, &smtp, None).expect("jmap");
-        let session = jmap.session(&p, "https://mail.corp.example");
+        let session = jmap.session(&p, "https://mail.corp.example").await;
         let account = session["primaryAccounts"][SIEVE_CAP]
             .as_str()
             .expect("account")
@@ -2163,7 +2163,7 @@ mod tests {
         let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
         let jmap_cfg = (*cfg.section::<tp_jmap::JmapConfig>(JMAP).expect("jmap")).clone();
         let jmap = services.jmap(&ext, jmap_cfg, &smtp, None).expect("jmap");
-        let session = jmap.session(&p, "https://mail.corp.example");
+        let session = jmap.session(&p, "https://mail.corp.example").await;
         let account = session["primaryAccounts"][CALENDARS]
             .as_str()
             .unwrap_or_else(|| panic!("{session}"))

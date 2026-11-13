@@ -552,7 +552,10 @@ mod tests {
     #[tokio::test]
     async fn session_lists_capability() {
         let env = Env::new().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let acc = env.account();
         assert_eq!(s["capabilities"][USING[1]]["implementation"], "The Post");
         let caps = &s["accounts"][&acc]["accountCapabilities"][USING[1]];
@@ -719,7 +722,10 @@ mod tests {
         };
         let env = Env::with_sieve_limits(limits).await;
         let acc = env.account();
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let caps = &s["accounts"][&acc]["accountCapabilities"][USING[1]];
         assert_eq!(caps["maxSizeScript"], 200, "{caps}");
         assert_eq!(caps["maxNumberRedirects"], 2, "{caps}");

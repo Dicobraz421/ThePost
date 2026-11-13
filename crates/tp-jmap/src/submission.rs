@@ -1828,7 +1828,10 @@ mod tests {
         let mut cfg = JmapConfig::default();
         cfg.submission.max_delayed_send = std::time::Duration::from_secs(3600);
         let env = Env::with(cfg, Vec::new()).await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let caps = &s["accounts"][env.account()]["accountCapabilities"];
         assert_eq!(
             caps["urn:ietf:params:jmap:submission"]["maxDelayedSend"],
