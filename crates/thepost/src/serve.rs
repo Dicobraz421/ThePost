@@ -391,6 +391,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             meta: meta.clone(),
             interval: maintenance_cfg.purge_interval,
             admin_token_retention: maintenance_cfg.admin_token_retention,
+            probe: crate::metrics::register_purge(&metrics),
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(

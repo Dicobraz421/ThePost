@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use tp_blob::{
     GcConfig, GcWorker, Now, OrphanConfig, OrphanMetrics, OrphanSweeper, Verifier, VerifyReport,
     system_now,
@@ -314,7 +317,12 @@ pub struct Purge {
     pub interval: Duration,
     /// Срок хранения токенов `admin init` после истечения (`maintenance.admin_token_retention`).
     pub admin_token_retention: Duration,
+    /// Показатели шагов для `/metrics` (`crate::metrics::register_purge`, APP-52).
+    pub probe: PurgeProbe,
 }
+
+/// Итог шага очистки: число удалённых записей (`None` — журнал удаляется секциями по суткам, числа нет) или ошибка.
+pub type PurgeOutcome<'a> = std::result::Result<Option<u64>, &'a tp_contracts::Error>;
 
 /// Итог одного прохода [`Purge::step`]: число удалённых записей каждого шага.
 #[derive(Debug)]
@@ -331,6 +339,82 @@ pub struct Purged {
     pub mailbox_audit: Result<()>,
     /// Токены `admin init`.
     pub admin_tokens: Result<u64>,
+}
+
+impl Purged {
+    /// Шаги прохода — значения метки `step` показателей [`PurgeProbe`], в порядке [`Purged::steps`].
+    pub const STEPS: [&'static str; 6] = [
+        "purge_dav_tombstones",
+        "purge_vacation_log",
+        "purge_expired_delivery",
+        "expire_old_submissions",
+        "purge_expired_mailbox_audit",
+        "prune_admin_tokens",
+    ];
+
+    /// Итог каждого шага прохода с его именем.
+    pub fn steps(&self) -> [(&'static str, PurgeOutcome<'_>); 6] {
+        fn counted(r: &Result<u64>) -> PurgeOutcome<'_> {
+            r.as_ref().map(|n| Some(*n))
+        }
+        fn sections(r: &Result<()>) -> PurgeOutcome<'_> {
+            r.as_ref().map(|()| None)
+        }
+        let [dav, vacation, delivery, submissions, audit, tokens] = Self::STEPS;
+        [
+            (dav, counted(&self.dav_tombstones)),
+            (vacation, counted(&self.vacation_log)),
+            (delivery, sections(&self.delivery_log)),
+            (submissions, counted(&self.submissions)),
+            (audit, sections(&self.mailbox_audit)),
+            (tokens, counted(&self.admin_tokens)),
+        ]
+    }
+}
+
+/// Метка шага очистки (`step`).
+type StepLabel = [(&'static str, &'static str); 1];
+
+/// Показатели очистки по сроку для `/metrics` (APP-52): по шагу ([`Purged::STEPS`]) — выполнения, ошибки, удалённые
+/// записи (у шагов с числом) и момент последнего успешного выполнения. Пишет [`Purge::step`], регистрирует
+/// `crate::metrics::register_purge`; клон — те же показатели, перезапуск роли их не обнуляет.
+#[derive(Debug, Clone, Default)]
+pub struct PurgeProbe {
+    pub(crate) runs: Family<StepLabel, Counter>,
+    pub(crate) errors: Family<StepLabel, Counter>,
+    pub(crate) purged: Family<StepLabel, Counter>,
+    pub(crate) last_success: Family<StepLabel, Gauge>,
+}
+
+impl PurgeProbe {
+    /// Показатели с нулевыми значениями для каждого шага: ряды есть до первого прохода.
+    pub fn new() -> Self {
+        let probe = Self::default();
+        for step in Purged::STEPS {
+            let label = [("step", step)];
+            probe.runs.get_or_create(&label);
+            probe.errors.get_or_create(&label);
+            probe.last_success.get_or_create(&label);
+        }
+        probe
+    }
+
+    /// Итог шага `step`; `at` — момент прохода, секунд от начала эпохи Unix.
+    pub fn record(&self, step: &'static str, outcome: PurgeOutcome<'_>, at: i64) {
+        let label = [("step", step)];
+        self.runs.get_or_create(&label).inc();
+        match outcome {
+            Ok(deleted) => {
+                if let Some(n) = deleted {
+                    self.purged.get_or_create(&label).inc_by(n);
+                }
+                self.last_success.get_or_create(&label).set(at);
+            }
+            Err(_) => {
+                self.errors.get_or_create(&label).inc();
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Purge {
@@ -353,29 +437,20 @@ impl Purge {
             mailbox_audit: self.meta.purge_expired_mailbox_audit().await,
             admin_tokens: self.prune_admin_tokens().await,
         };
-        let failed = |step: &str, e: &tp_contracts::Error| {
-            tracing::warn!(step, error = %e, "очистка по сроку не выполнена: повтор в следующий проход");
-        };
-        for (step, result) in [
-            ("purge_dav_tombstones", &done.dav_tombstones),
-            ("purge_vacation_log", &done.vacation_log),
-            ("expire_old_submissions", &done.submissions),
-            ("prune_admin_tokens", &done.admin_tokens),
-        ] {
-            match result {
-                Ok(0) => tracing::debug!(step, "очистка по сроку: удалять нечего"),
-                Ok(deleted) => tracing::info!(step, deleted, "очистка по сроку"),
-                Err(e) => failed(step, e),
+        let at = (system_now())().unix_timestamp();
+        for (step, outcome) in done.steps() {
+            match outcome {
+                Ok(Some(0)) => tracing::debug!(step, "очистка по сроку: удалять нечего"),
+                Ok(Some(deleted)) => tracing::info!(step, deleted, "очистка по сроку"),
+                // Об удалённых секциях журналов пишет сам `tp-meta`.
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    step,
+                    error = %e,
+                    "очистка по сроку не выполнена: повтор в следующий проход"
+                ),
             }
-        }
-        // Об удалённых секциях журналов пишет сам `tp-meta`.
-        for (step, result) in [
-            ("purge_expired_delivery", &done.delivery_log),
-            ("purge_expired_mailbox_audit", &done.mailbox_audit),
-        ] {
-            if let Err(e) = result {
-                failed(step, e);
-            }
+            self.probe.record(step, outcome, at);
         }
         done
     }
@@ -1043,8 +1118,14 @@ mod tests {
             meta: meta.clone(),
             interval: Duration::from_secs(3600),
             admin_token_retention: 30 * day,
+            probe: PurgeProbe::new(),
         };
         let done = purge.step().await;
+        // APP-52: успешный шаг — удалённые записи и момент прохода в показателях.
+        let label = [("step", "purge_dav_tombstones")];
+        assert_eq!(purge.probe.purged.get_or_create(&label).get(), 1);
+        assert!(purge.probe.last_success.get_or_create(&label).get() > 0);
+        assert_eq!(purge.probe.errors.get_or_create(&label).get(), 0);
         assert_eq!(done.dav_tombstones.expect("dav"), 1);
         assert_eq!(done.vacation_log.expect("vacation"), 1);
         done.delivery_log.expect("delivery");
