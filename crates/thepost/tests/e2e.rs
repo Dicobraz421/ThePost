@@ -622,7 +622,7 @@ async fn mvp_mail_flow() {
                 display_name: "Alice".into(),
                 external_id: None,
                 enabled: true,
-                aliases: Vec::new(),
+                aliases: vec![format!("al@{domain}")],
                 kind: AccountKind::User,
             },
         )
@@ -729,6 +729,26 @@ async fn mvp_mail_flow() {
     assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
     // Дом и календарь по умолчанию (создаётся при первом обращении).
     assert!(listed.matches("<d:response>").count() >= 2, "{listed}");
+    // Адреса календарного пользователя принципала (APP-38, DAV-23): основной и псевдоним учётной записи.
+    let principal = format!("/dav/principals/{login}/");
+    let found = dav_send(
+        web,
+        "PROPFIND",
+        &principal,
+        &basic,
+        "Depth: 0\r\n",
+        "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">\
+         <d:prop><c:calendar-user-address-set/></d:prop></d:propfind>",
+    )
+    .await;
+    assert!(found.starts_with("HTTP/1.1 207"), "{found}");
+    let addrs = dav_hrefs(&found);
+    let mailto: Vec<_> = addrs.iter().filter(|h| h.starts_with("mailto:")).collect();
+    assert_eq!(
+        mailto,
+        [&format!("mailto:{login}"), &format!("mailto:al@{domain}")],
+        "{found}"
+    );
     let books = format!("/dav/addressbooks/{login}/");
     let listed = dav(web, "PROPFIND", &books, &basic, "1").await;
     assert!(listed.starts_with("HTTP/1.1 207"), "{listed}");
