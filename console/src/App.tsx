@@ -16,14 +16,18 @@ import { i18nProvider } from "./i18n";
 import type { Schemas } from "./api/client";
 import { AccountCreate, AccountList, AccountShow } from "./pages/accounts";
 import { AuditPage } from "./pages/audit";
+import { ContactCreate, ContactEdit, ContactList } from "./pages/contacts";
 import { DeliveryPage } from "./pages/delivery";
+import { DisabledPage } from "./pages/disabled";
 import { GroupCreate, GroupEdit, GroupList } from "./pages/groups";
 import { LoginPage } from "./pages/login";
+import { MailboxAuditPage } from "./pages/mailbox-audit";
 import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
 import { AccountSieve, OrgSieve } from "./pages/sieve";
 import { AccountTrash } from "./pages/trash";
 import { TransportPage } from "./pages/transport";
+import { UnitsPage } from "./pages/units";
 import { accessControlProvider, allowed } from "./providers/access";
 import { authProvider } from "./providers/auth";
 import { dataProvider } from "./providers/data";
@@ -59,6 +63,7 @@ export function App() {
               show: "/accounts/:id",
               meta: { label: "Учётные записи" },
             },
+            { name: "disabled-accounts", list: "/disabled-accounts", meta: { label: "Отключённые ящики" } },
             {
               name: "groups",
               list: "/groups",
@@ -66,11 +71,20 @@ export function App() {
               edit: "/groups/:id",
               meta: { label: "Группы рассылки" },
             },
+            {
+              name: "contacts",
+              list: "/contacts",
+              create: "/contacts/create",
+              edit: "/contacts/:id",
+              meta: { label: "Адресная книга" },
+            },
+            { name: "units", list: "/units", meta: { label: "Оргструктура" } },
             { name: "moderation", list: "/moderation", meta: { label: "Модерация" } },
             { name: "sieve", list: "/sieve", meta: { label: "Правила организации" } },
             { name: "transport", list: "/transport", meta: { label: "Транспорт" } },
             { name: "delivery", list: "/delivery", meta: { label: "Журнал доставки" } },
             { name: "audit", list: "/audit", meta: { label: "Журнал аудита" } },
+            { name: "mailbox-audit", list: "/mailbox-audit", meta: { label: "Аудит ящиков" } },
           ]}
           // Без внешних обращений (SRS 5.2): телеметрия Refine выключена.
           options={{ disableTelemetry: true, syncWithLocation: true, warnWhenUnsavedChanges: true }}
@@ -102,11 +116,19 @@ export function App() {
                 <Route path="create" element={<GroupCreate />} />
                 <Route path=":id" element={<GroupEdit />} />
               </Route>
+              <Route path="/disabled-accounts" element={<DisabledPage />} />
+              <Route path="/contacts">
+                <Route index element={<ContactList />} />
+                <Route path="create" element={<ContactCreate />} />
+                <Route path=":id" element={<ContactEdit />} />
+              </Route>
+              <Route path="/units" element={<UnitsPage />} />
               <Route path="/moderation" element={<ModerationPage />} />
               <Route path="/sieve" element={<OrgSieve />} />
               <Route path="/transport" element={<TransportPage />} />
               <Route path="/delivery" element={<DeliveryPage />} />
               <Route path="/audit" element={<AuditPage />} />
+              <Route path="/mailbox-audit" element={<MailboxAuditPage />} />
               <Route path="*" element={<ErrorComponent />} />
             </Route>
             <Route

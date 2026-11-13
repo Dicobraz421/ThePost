@@ -4,6 +4,7 @@ import { Divider, Form, Input, Select, Space, Switch, Table, Tag } from "antd";
 
 import type { Schemas } from "../api/client";
 import { AccountSelect } from "../components/account-select";
+import { DynamicFilter } from "../components/dynamic-filter";
 import { ModerationQueue } from "../components/moderation-queue";
 
 type Group = Schemas["GroupInfo"];
@@ -167,7 +168,7 @@ export function GroupCreate() {
   );
 }
 
-/** Группа: состав, ограничения отправителей, модераторы и очередь модерации группы. */
+/** Группа: состав (перечнем или фильтром), ограничения отправителей, модераторы и очередь модерации группы. */
 export function GroupEdit() {
   const { result: group, query } = useShow<Group>();
   const { mutate, mutation } = useUpdate<Group>();
@@ -198,6 +199,12 @@ export function GroupEdit() {
         >
           <GroupFields catalog={catalog} self={group.id} names={group.names} />
         </Form>
+      )}
+      {group && (
+        <>
+          <Divider orientation="left">Динамический состав</Divider>
+          <DynamicFilter group={group.id} members={group.members.length} />
+        </>
       )}
       {group && moderated(group) && (
         <>

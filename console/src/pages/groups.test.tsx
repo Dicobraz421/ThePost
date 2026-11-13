@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test } from "vitest";
 
 import type { Schemas } from "../api/client";
@@ -181,4 +181,60 @@ test("очередь модерации: тема письма — только 
   await waitFor(() => expect(read.some((c) => c.path === "/api/v1/whoami")).toBe(true));
   expect(screen.queryByRole("switch", { name: "Показать темы писем" })).toBeNull();
   expect(read.some((c) => c.path.includes("include="))).toBe(false);
+});
+
+test("динамическая группа: фильтр — PUT, состав по фильтру, снятие — DELETE; статическая с участниками — без фильтра", async () => {
+  let filter: object | null = null;
+  const g = group("g1", "Продажи", { members: [] });
+  const calls = open("/groups/g1", {
+    [`GET ${BASE}/groups/g1`]: { body: g },
+    [`GET ${BASE}/groups`]: { body: [g] },
+    [`GET ${BASE}/accounts`]: { body: [] },
+    [`GET ${BASE}/contacts`]: { body: [{ id: "c1", email: "partner@example.com" }] },
+    [`GET ${BASE}/groups/g1/filter`]: () => (filter ? { body: filter } : { status: 404, body: { status: 404, title: "Not Found" } }),
+    [`PUT ${BASE}/groups/g1/filter`]: (c) => {
+      filter = c.body as object;
+      return { body: filter };
+    },
+    [`DELETE ${BASE}/groups/g1/filter`]: () => {
+      filter = null;
+      return { status: 204 };
+    },
+    [`GET ${BASE}/groups/g1/filter/members`]: { body: { accounts: ["a1"], contacts: ["c1"] } },
+  });
+  expect(await screen.findByText("Группа статическая: состав — участники выше.")).toBeTruthy();
+  expect(screen.queryByText("Not Found")).toBeNull();
+  fireEvent.click(await screen.findByRole("button", { name: "Задать фильтр состава" }));
+  const text = await screen.findByLabelText("Фильтр состава (JSON)");
+  fireEvent.change(text, { target: { value: "[1]" } });
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить фильтр" }));
+  expect(await screen.findByText("Фильтр — объект JSON")).toBeTruthy();
+  fireEvent.change(text, { target: { value: '{"equals": {"attribute": "department", "value": "Продажи"}}' } });
+  fireEvent.click(screen.getByLabelText("Включать почтовые контакты"));
+  fireEvent.click(screen.getByRole("button", { name: "Сохранить фильтр" }));
+  await waitFor(() =>
+    expect(sent(calls, "PUT", `${BASE}/groups/g1/filter`)[0]?.body).toEqual({
+      filter: { equals: { attribute: "department", value: "Продажи" } },
+      contacts: true,
+    }),
+  );
+  expect(await screen.findByText(/Текущий состав: учётных записей — 1, контактов — 1/)).toBeTruthy();
+  expect(await screen.findByText(/partner@example.com/)).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Снять фильтр" }));
+  const confirm = await screen.findByText(/Снять фильтр\? Группа станет статической/);
+  fireEvent.click(within(confirm.closest(".ant-popover") as HTMLElement).getByRole("button", { name: "Снять" }));
+  await waitFor(() => expect(sent(calls, "DELETE", `${BASE}/groups/g1/filter`)).toHaveLength(1));
+  expect(await screen.findByText("Группа статическая: состав — участники выше.")).toBeTruthy();
+  cleanup();
+
+  const s = group("g2", "Штаб", { members: [{ account: "a1" }], names: { a1: "alice@example.org" } });
+  open("/groups/g2", {
+    [`GET ${BASE}/groups/g2`]: { body: s },
+    [`GET ${BASE}/groups`]: { body: [s] },
+    [`GET ${BASE}/accounts`]: { body: [] },
+    [`GET ${BASE}/groups/g2/filter`]: { status: 404, body: { status: 404, title: "Not Found" } },
+  });
+  expect(await screen.findByText("Чтобы задать фильтр состава, уберите статических участников.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Задать фильтр состава" })).toBeNull();
 });
