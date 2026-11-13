@@ -50,7 +50,7 @@ use crate::modules;
 use crate::protocols::{
     Bound, HttpRole, ImapRole, InProcessRole, IndexerRole, LogPause, SmtpRole, Sockets,
 };
-use crate::roles::{Maintenance, PendingRole, Purge, ScheduledVerify};
+use crate::roles::{ItipPurge, Maintenance, PendingRole, Purge, ScheduledVerify};
 use crate::secrets;
 use crate::sections::{self, BLOB, BlobSection, CLUSTER, ClusterSection, HttpSection};
 use crate::services::{Base, Services};
@@ -364,8 +364,15 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
     ));
     // Книга GAL «Организация» из каталога — LDAP или PostgreSQL (APP-49, APP-51): роль maintenance, одна запись на
     // организацию (лиза).
+    let dav_cfg = (*cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone();
+    // Применённые сообщения iTIP хранятся во входящих только при `dav.schedule_keep_processed` — тогда их удаляет
+    // по сроку шаг очистки (APP-53).
+    let itip_purge = dav_cfg.schedule_keep_processed.then(|| ItipPurge {
+        tenant: services.tenant,
+        inbox: services.itip.clone(),
+    });
     let gal = Arc::new(services.gal(
-        (*cfg.section::<tp_dav::DavConfig>(sections::DAV)?).clone(),
+        dav_cfg,
         leases.clone(),
         holder.clone(),
         maintenance_cfg.gal_interval,
@@ -392,6 +399,7 @@ pub async fn start(opts: ServeOptions) -> Result<Running> {
             interval: maintenance_cfg.purge_interval,
             admin_token_retention: maintenance_cfg.admin_token_retention,
             probe: crate::metrics::register_purge(&metrics),
+            itip: itip_purge,
         }),
         verify: maintenance_cfg.verify.enabled.then(|| ScheduledVerify {
             verifier: Arc::new(crate::verify::verifier(
