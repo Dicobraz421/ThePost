@@ -3,7 +3,9 @@
 //! журнала событий (по сигналам, [`crate::log_reader`]), очистка по сроку надгробий DAV, журнала автоответов,
 //! журнала доставки, токенов `admin init` и применённых сообщений входящих планирования
 //! ([`Purge`], решение 2026-11-11 п. 65, APP-53), проверка целостности BLOB по расписанию под лизой лидера
-//! ([`ScheduledVerify`], APP-44), однократный пересчёт поисковых строк старых контактов в фоне (APP-63); роли протоколов, ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
+//! ([`ScheduledVerify`], APP-44), однократный пересчёт поисковых строк старых контактов в фоне (APP-63),
+//! окончательное удаление отключённых ящиков по сроку под лизой лидера ([`run_disabled`], APP-67); роли протоколов,
+//! ещё не реализованные в этой сборке, — заглушки, готовые сразу (Ф0).
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -24,6 +26,7 @@ use tp_contracts::lease::LeaseStore;
 use tp_contracts::meta::{AccountScope, AccountStore};
 use tp_contracts::role::{CancellationToken, Role, RoleCtx, RoleService};
 use tp_contracts::{Result, TenantId};
+use tp_mailstore::DisabledMailboxes;
 use tp_meta::PgMeta;
 use tp_meta::events::EventConsumer;
 
@@ -95,6 +98,9 @@ pub struct Maintenance {
     /// Почтовое хранилище для истечения срока корзины (`TrashStore::expired` → `before_final_delete` →
     /// `expunge_final`, секция `mailstore.trash`); `None` — истечение не выполняется (тесты).
     pub trash: Option<tp_mailstore::Store>,
+    /// Окончательное удаление отключённых ящиков по сроку (`DisabledMailboxes::run`, секция `mailstore.disabled`,
+    /// APP-67) под лизой [`DISABLED_LEASE`]; `None` — не выполняется (тесты).
+    pub disabled: Option<DisabledMailboxes>,
     /// Очистка по сроку надгробий DAV и журнала автоответов; `None` — не выполняется (тесты без PostgreSQL).
     pub purge: Option<Purge>,
     /// Проверка целостности BLOB по расписанию; `None` — выключена (`maintenance.verify.enabled: false`).
@@ -439,7 +445,7 @@ impl Purged {
 }
 
 /// Метка шага очистки (`step`).
-type StepLabel = [(&'static str, &'static str); 1];
+pub(crate) type StepLabel = [(&'static str, &'static str); 1];
 
 /// Показатели очистки по сроку для `/metrics` (APP-52): по шагу ([`Purged::STEPS`]) — выполнения, ошибки, удалённые
 /// записи (у шагов с числом) и момент последнего успешного выполнения. Пишет [`Purge::step`], регистрирует
@@ -622,6 +628,15 @@ impl RoleService for Maintenance {
             let token = ctx.shutdown.clone();
             tokio::spawn(async move { store.run_trash_expiry(token.cancelled_owned()).await })
         });
+        // Отключённые ящики: удаление по сроку ведёт один узел кластера — держатель лизы (APP-67).
+        let disabled = self.disabled.clone().map(|disabled| {
+            tokio::spawn(run_disabled(
+                disabled,
+                self.leases.clone(),
+                self.holder.clone(),
+                ctx.shutdown.clone(),
+            ))
+        });
         let purge = self
             .purge
             .clone()
@@ -692,16 +707,23 @@ impl RoleService for Maintenance {
                 None => Ok(()),
             }
         };
+        let disabled = async move {
+            match disabled {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
         let purge = async move {
             match purge {
                 Some(task) => task.await,
                 None => Ok(()),
             }
         };
-        let (gc, orphans, trash, purge, verify, audit_export, card_reindex, gal, ()) = tokio::join!(
+        let (gc, orphans, trash, disabled, purge, verify, audit_export, card_reindex, gal, ()) = tokio::join!(
             gc,
             orphans,
             trash,
+            disabled,
             purge,
             verify,
             audit_export,
@@ -718,6 +740,7 @@ impl RoleService for Maintenance {
             ("blob-gc", gc),
             ("blob-orphans", orphans),
             ("trash-expiry", trash),
+            ("disabled-mailboxes", disabled),
             ("purge", purge),
             ("blob-verify", verify),
             ("audit-export", audit_export),
@@ -729,6 +752,85 @@ impl RoleService for Maintenance {
             }
         }
         Ok(())
+    }
+}
+
+/// Лиза окончательного удаления отключённых ящиков (APP-67): удаление ведёт один узел кластера.
+pub const DISABLED_LEASE: &str = "disabled-mailboxes";
+
+/// Срок лизы [`DISABLED_LEASE`]; держатель продлевает её каждую треть срока, без лизы узел пробует её получить с тем
+/// же шагом.
+const DISABLED_LEASE_TTL: Duration = Duration::from_secs(30);
+
+/// Окончательное удаление отключённых ящиков по сроку в роли maintenance (APP-67): воркер
+/// `DisabledMailboxes::run` работает, пока узел держит лизу [`DISABLED_LEASE`]. Потеря лизы (её получил другой узел
+/// или продлить её не удалось до истечения) останавливает воркер — идущий проход прерывается, удаление ящика продолжит
+/// следующий держатель (проход повторяем). Остановка роли останавливает воркер, после неё лиза отдаётся.
+pub async fn run_disabled(
+    disabled: DisabledMailboxes,
+    leases: Arc<dyn LeaseStore>,
+    holder: String,
+    shutdown: CancellationToken,
+) {
+    let step = DISABLED_LEASE_TTL / 3;
+    loop {
+        let acquired = leases
+            .try_acquire(DISABLED_LEASE, &holder, DISABLED_LEASE_TTL)
+            .await;
+        let mut lease = match acquired {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                tracing::debug!(
+                    lease = DISABLED_LEASE,
+                    "отключённые ящики: удаление ведёт другой узел"
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(step) => continue,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(lease = DISABLED_LEASE, error = %e, "отключённые ящики: лиза не получена");
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(step) => continue,
+                }
+            }
+        };
+        tracing::info!(
+            lease = DISABLED_LEASE,
+            "отключённые ящики: удаление по сроку ведёт этот узел"
+        );
+        let worker = disabled.run(shutdown.clone().cancelled_owned());
+        tokio::pin!(worker);
+        let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + step, step);
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let lost = loop {
+            tokio::select! {
+                () = &mut worker => break false,
+                _ = renew.tick() => match leases.renew(&lease, DISABLED_LEASE_TTL).await {
+                    Ok(Some(next)) => lease = next,
+                    Ok(None) => {
+                        tracing::warn!(lease = DISABLED_LEASE, "отключённые ящики: лиза потеряна, воркер остановлен");
+                        break true;
+                    }
+                    // Повтор на следующем такте; лиза истекла — её мог получить другой узел.
+                    Err(e) => {
+                        tracing::warn!(lease = DISABLED_LEASE, error = %e, "отключённые ящики: лиза не продлена");
+                        if (system_now())() >= lease.expires_at {
+                            break true;
+                        }
+                    }
+                },
+            }
+        };
+        if !lost {
+            // Воркер завершается только с остановкой роли: лиза отдаётся другим узлам.
+            if let Err(e) = leases.release(&lease).await {
+                tracing::warn!(lease = DISABLED_LEASE, error = %e, "отключённые ящики: лиза не отдана");
+            }
+            return;
+        }
     }
 }
 
@@ -849,6 +951,7 @@ mod tests {
             orphans: OrphanConfig::default(),
             orphan_probe: OrphanProbe::default(),
             trash: None,
+            disabled: None,
             purge: None,
             verify: None,
             audit_export: None,
@@ -982,6 +1085,7 @@ mod tests {
             orphans: OrphanConfig::default(),
             orphan_probe: OrphanProbe::default(),
             trash: None,
+            disabled: None,
             purge: None,
             verify: Some(verify),
             audit_export: None,
@@ -1255,6 +1359,7 @@ mod tests {
             orphans: OrphanConfig::default(),
             orphan_probe: OrphanProbe::default(),
             trash: None,
+            disabled: None,
             purge: Some(purge),
             verify: None,
             audit_export: None,

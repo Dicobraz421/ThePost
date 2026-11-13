@@ -30,6 +30,12 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["serve", "--config", "/etc/thepost/config.yaml"]
+          {{- if .Values.gssapi.keytabSecret }}
+          # Keytab Kerberos: MIT Kerberos читает его только из KRB5_KTNAME (auth.gssapi.keytab сверяется с ней).
+          env:
+            - name: KRB5_KTNAME
+              value: "FILE:{{ include "thepost.keytab" . }}"
+          {{- end }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           ports:
@@ -54,6 +60,9 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/thepost/config.yaml, subPath: config.yaml, readOnly: true }
             - { name: tls, mountPath: /etc/thepost/tls, readOnly: true }
+            {{- if .Values.gssapi.keytabSecret }}
+            - { name: keytab, mountPath: {{ include "thepost.keytab" . | dir }}, readOnly: true }
+            {{- end }}
             {{- if .Values.cnpg.enabled }}
             # CA сервера PostgreSQL (CloudNativePG): sslmode=verify-full.
             - { name: db-ca, mountPath: /etc/thepost/db-ca, readOnly: true }
@@ -72,6 +81,14 @@ spec:
             items:
               - { key: tls.crt, path: tls.crt }
               - { key: ca.crt, path: ca.crt }
+        {{- if .Values.gssapi.keytabSecret }}
+        - name: keytab
+          secret:
+            secretName: {{ .Values.gssapi.keytabSecret }}
+            defaultMode: 0440
+            items:
+              - { key: keytab, path: {{ include "thepost.keytab" . | base }} }
+        {{- end }}
         {{- if .Values.cnpg.enabled }}
         # Только сертификат CA (ключ CA в под не попадает).
         - name: db-ca
