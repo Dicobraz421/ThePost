@@ -8,6 +8,9 @@
 //! Протокол спрашивает [`AbuseGuard::check`] до проверки учётных данных и сообщает о результате:
 //! [`AbuseGuard::failure`] — неудача, [`AbuseGuard::success`] — успех (сбрасывает счётчик учётной записи).
 //!
+//! Адрес попытки приводится к канонической форме ([`IpAddr::to_canonical`]) на входе: адрес IPv4, отображённый
+//! в IPv6 (`::ffff:a.b.c.d`, слушатель на `[::]`), считается и блокируется как IPv4, с подсетью `net_prefix_v4`.
+//!
 //! ## Разделение с PLT-07 (решение владельца #253)
 //! Здесь — только неудачные входы и блокировки по ним (адрес, подсеть, учётная запись). Частоту запросов
 //! (соединения, команды) считает PLT-07; его счётчики сюда не попадают, и наоборот.
@@ -109,7 +112,7 @@ impl AbuseConfig {
 /// Попытка входа: адрес источника и учётная запись, если известны.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Attempt {
-    /// Адрес источника.
+    /// Адрес источника; `::ffff:a.b.c.d` считается адресом IPv4 `a.b.c.d`.
     pub ip: Option<IpAddr>,
     /// Учётная запись, под которой входят.
     pub account: Option<AccountId>,
@@ -208,7 +211,7 @@ impl AbuseGuard {
     pub async fn failure(&self, tenant: TenantId, attempt: &Attempt) -> Result<Option<SystemTime>> {
         let cfg = &self.0.cfg;
         let mut counted = Vec::new();
-        if let Some(ip) = attempt.ip {
+        if let Some(ip) = source_ip(attempt) {
             counted.push((BlockSubject::Ip(ip), cfg.ip_failures));
             let prefix = if ip.is_ipv4() {
                 cfg.net_prefix_v4
@@ -428,9 +431,15 @@ impl AbuseGuard {
     }
 }
 
+/// Адрес попытки в канонической форме: `::ffff:a.b.c.d` — IPv4 `a.b.c.d`. Единственный путь адреса попытки
+/// в счётчики и проверку блокировок.
+fn source_ip(attempt: &Attempt) -> Option<IpAddr> {
+    attempt.ip.map(|ip| ip.to_canonical())
+}
+
 /// Субъекты, блокировка которых запрещает попытку: адрес, все подсети с ним, учётная запись.
 fn subjects_to_check(attempt: &Attempt) -> impl Iterator<Item = BlockSubject> + '_ {
-    let ip = attempt.ip.into_iter().flat_map(|ip| {
+    let ip = source_ip(attempt).into_iter().flat_map(|ip| {
         let max = if ip.is_ipv4() { 32 } else { 128 };
         std::iter::once(BlockSubject::Ip(ip))
             .chain((0..=max).filter_map(move |p| BlockSubject::net(ip, p).ok()))
