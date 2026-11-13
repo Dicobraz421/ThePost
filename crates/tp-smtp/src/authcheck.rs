@@ -193,7 +193,7 @@ impl AuthCheck {
 
     /// Проверяет письмо `raw` транзакции `env`.
     pub async fn check(&self, env: &Envelope, raw: &[u8]) -> Outcome {
-        let ip = env.conn.client.ip().to_canonical();
+        let ip = env.conn.client.ip();
         let helo = env.helo.as_str();
         let mail_from = env.mail_from.as_str();
         let spf_params = SpfParameters::helo_and_mail_from(ip, helo, &self.hostname, mail_from);

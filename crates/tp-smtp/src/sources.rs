@@ -65,7 +65,8 @@ impl Sources {
         async move { self.resolve(ip, &certs).await }
     }
 
-    /// Доверенный источник клиента `ip` с проверенной цепочкой сертификатов `certs` (лист — первый).
+    /// Доверенный источник клиента `ip` (в канонической форме) с проверенной цепочкой сертификатов `certs`
+    /// (лист — первый).
     pub async fn resolve(
         &self,
         ip: IpAddr,
@@ -80,10 +81,7 @@ impl Sources {
         };
         let names = cert_names(&cluster.sources, certs);
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        cluster
-            .source(ip.to_canonical(), &names)
-            .cloned()
-            .map(Arc::new)
+        cluster.source(ip, &names).cloned().map(Arc::new)
     }
 }
 
@@ -157,7 +155,7 @@ pub(crate) enum XCommand {
 /// Атрибуты исходного клиента из `XCLIENT`/`XFORWARD`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Origin {
-    /// Адрес (`ADDR`, `PORT`).
+    /// Адрес (`ADDR`) в канонической форме: `::ffff:a.b.c.d` — адрес IPv4 `a.b.c.d`.
     pub addr: Option<IpAddr>,
     /// Порт (`PORT`).
     pub port: Option<u16>,
@@ -228,7 +226,9 @@ pub(crate) fn parse(cmd: XCommand, line: &str) -> Result<Origin, String> {
                     .strip_prefix("IPV6:")
                     .or_else(|| value.strip_prefix("ipv6:"))
                     .unwrap_or(&value);
-                out.addr = Some(v.parse().map_err(|_| "Bad ADDR".to_owned())?);
+                // Адрес не проходит через слушатель (PLT-34): каноническая форма — здесь.
+                let ip: IpAddr = v.parse().map_err(|_| "Bad ADDR".to_owned())?;
+                out.addr = Some(ip.to_canonical());
             }
             (_, "PORT") if !unknown => {
                 out.port = Some(value.parse().map_err(|_| "Bad PORT".to_owned())?);
