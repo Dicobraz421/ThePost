@@ -22,6 +22,13 @@
 //! `mark_deleting` под блокировкой строки каждого шарда по очереди ставит `deleting` (шарду без строки —
 //! надгробие того же поколения, чтобы параллельная загрузка на нём получила новое поколение) и откатывает
 //! пометки, если на каком-то шарде ссылки есть; `finalize_delete` — на всех шардах.
+//!
+//! Кандидаты GC и срок следующего прохода (META-73) — один путь, `PgMeta::zeroed`: записи без ссылок в порядке
+//! `zero_since`. На одном шарде — один запрос по индексу `blobs_gc` (срок — `MIN(zero_since) + W`); по всем
+//! шардам занятые другим шардом записи отбрасываются до счёта `limit`, а срок записи — самое позднее
+//! обнуление среди шардов.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -178,25 +185,149 @@ async fn rollback_marks(done: &[(&PgMeta, Marked)], key: &BlobKey) {
     }
 }
 
-/// Ключи из `keys`, на которые есть ссылки на шарде `view` (строка того же поколения с `refcnt > 0`).
-async fn referenced(view: &PgMeta, keys: &[BlobKey]) -> Result<Vec<BlobKey>> {
-    let tenants: Vec<Uuid> = keys.iter().map(|k| *k.tenant.as_uuid()).collect();
-    let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.as_bytes().to_vec()).collect();
-    let gens: Vec<i64> = keys.iter().map(|k| i64::from(k.generation.0)).collect();
+/// Запись без ссылок для GC: ключ и момент обнуления (`zero_since`).
+type Zeroed = (BlobKey, OffsetDateTime);
+
+/// Наименьшая страница [`free_zeroed`]: занятые другим шардом записи впереди не требуют запроса на каждую.
+const ZEROED_PAGE: usize = 256;
+
+/// Записи шарда `view` без ссылок (`refcnt = 0`, не надгробие) в порядке (`zero_since`, организация, хэш):
+/// после `after`, с `zero_since < older_than` (`None` — без границы), не больше `limit`. Один запрос по индексу
+/// `blobs_gc`.
+async fn zeroed_page(
+    view: &PgMeta,
+    older_than: Option<OffsetDateTime>,
+    after: Option<&Zeroed>,
+    limit: usize,
+) -> Result<Vec<Zeroed>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut tx = begin_system(view.pool()).await?;
+    let q = match after {
+        None => sqlx::query_as(
+            "SELECT tenant_id, hash, gen, zero_since FROM blobs
+             WHERE refcnt = 0 AND state <> 'deleted' AND zero_since IS NOT NULL
+               AND ($1::timestamptz IS NULL OR zero_since < $1)
+             ORDER BY zero_since, tenant_id, hash LIMIT $2",
+        )
+        .bind(older_than)
+        .bind(limit),
+        Some((key, zero)) => sqlx::query_as(
+            "SELECT tenant_id, hash, gen, zero_since FROM blobs
+             WHERE refcnt = 0 AND state <> 'deleted' AND zero_since >= $3
+               AND (zero_since, tenant_id, hash) > ($3, $4, $5)
+               AND ($1::timestamptz IS NULL OR zero_since < $1)
+             ORDER BY zero_since, tenant_id, hash LIMIT $2",
+        )
+        .bind(older_than)
+        .bind(limit)
+        .bind(*zero)
+        .bind(key.tenant.as_uuid())
+        .bind(key.hash.as_bytes().as_slice()),
+    };
+    let rows: Vec<(Uuid, Vec<u8>, i64, OffsetDateTime)> =
+        q.fetch_all(&mut *tx).await.map_err(db_err)?;
+    crate::commits::commit(tx).await?;
+    rows.into_iter()
+        .map(|(t, h, g, z)| Ok((key_of(t, h, g)?, z)))
+        .collect()
+}
+
+/// Ключи из `zeroed`, которые шард `view` не отдаёт GC: строка того же поколения (не надгробие) со ссылками
+/// или обнулённая позже (срок записи — по самому позднему обнулению среди шардов).
+async fn held(view: &PgMeta, zeroed: &[Zeroed]) -> Result<Vec<BlobKey>> {
+    let tenants: Vec<Uuid> = zeroed.iter().map(|(k, _)| *k.tenant.as_uuid()).collect();
+    let hashes: Vec<Vec<u8>> = zeroed
+        .iter()
+        .map(|(k, _)| k.hash.as_bytes().to_vec())
+        .collect();
+    let gens: Vec<i64> = zeroed
+        .iter()
+        .map(|(k, _)| i64::from(k.generation.0))
+        .collect();
+    let zeros: Vec<OffsetDateTime> = zeroed.iter().map(|(_, z)| *z).collect();
     let mut tx = begin_system(view.pool()).await?;
     let rows: Vec<(Uuid, Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT b.tenant_id, b.hash, b.gen FROM unnest($1::uuid[], $2::bytea[], $3::int8[]) AS k(t, h, g)
+        "SELECT b.tenant_id, b.hash, b.gen
+         FROM unnest($1::uuid[], $2::bytea[], $3::int8[], $4::timestamptz[]) AS k(t, h, g, z)
          JOIN blobs b ON b.tenant_id = k.t AND b.hash = k.h AND b.gen = k.g
-         WHERE b.refcnt > 0",
+         WHERE b.state <> 'deleted' AND (b.refcnt > 0 OR b.zero_since IS NULL OR b.zero_since > k.z)",
     )
     .bind(tenants)
     .bind(hashes)
     .bind(gens)
+    .bind(zeros)
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
     crate::commits::commit(tx).await?;
     rows.into_iter().map(|(t, h, g)| key_of(t, h, g)).collect()
+}
+
+/// Записи без ссылок ни на одном шарде `views` в порядке срока — самого позднего обнуления среди шардов —
+/// с ним раньше `older_than` (`None` — без границы), не больше `limit`.
+///
+/// Запись выбирается на шарде, где она обнулена позже всего (на остальных её отсекает [`held`]), поэтому
+/// каждый шард отдаёт до `limit` своих записей по порядку `zero_since`. Занятые записи отбрасываются до счёта
+/// `limit`: страницы шарда читаются дальше, пока не набрано `limit` свободных или записи не кончились.
+async fn free_zeroed(
+    views: &[(ShardId, PgMeta)],
+    older_than: Option<OffsetDateTime>,
+    limit: usize,
+) -> Result<Vec<Zeroed>> {
+    let page = limit.max(ZEROED_PAGE);
+    let mut out: Vec<Zeroed> = Vec::new();
+    for (i, (_, view)) in views.iter().enumerate() {
+        let mut after: Option<Zeroed> = None;
+        let mut found = 0;
+        while found < limit {
+            let mut rows = view
+                .idempotent(|| zeroed_page(view, older_than, after.as_ref(), page))
+                .await?;
+            let Some(last) = rows.last().copied() else {
+                break;
+            };
+            let full = rows.len() == page;
+            after = Some(last);
+            for (j, (_, other)) in views.iter().enumerate() {
+                if j == i || rows.is_empty() {
+                    continue;
+                }
+                let busy = other.idempotent(|| held(other, &rows)).await?;
+                rows.retain(|(k, _)| !busy.contains(k));
+            }
+            for z in rows.into_iter().take(limit - found) {
+                found += 1;
+                // Одинаковый момент обнуления на двух шардах — запись выбрана на обоих.
+                if !out.iter().any(|(k, _)| *k == z.0) {
+                    out.push(z);
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+    }
+    out.sort_by_key(|(_, z)| *z);
+    out.truncate(limit);
+    Ok(out)
+}
+
+/// Удаляет надгробия шарда `view` старше `MetaConfig::blob_tombstone_ttl`, не больше `limit`.
+async fn prune_tombstones(view: &PgMeta, limit: usize) -> Result<()> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut tx = begin_system(view.pool()).await?;
+    sqlx::query(
+        "DELETE FROM blobs WHERE (tenant_id, hash) IN (
+             SELECT tenant_id, hash FROM blobs
+             WHERE refcnt = 0 AND state = 'deleted' AND zero_since < now() - make_interval(secs => $1)
+             LIMIT $2)",
+    )
+    .bind(view.cfg.blob_tombstone_ttl.as_secs_f64())
+    .bind(limit)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    crate::commits::commit(tx).await
 }
 
 /// Число ссылок операции: не меньше одной.
@@ -241,6 +372,23 @@ pub struct LiveBlob {
 }
 
 impl PgMeta {
+    /// Записи без ссылок в порядке срока GC (`zero_since < older_than`; `None` — без границы), не больше
+    /// `limit`: общий путь [`BlobIndex::gc_candidates`] и [`BlobIndex::next_gc_due`]. Без справочника шардов —
+    /// один запрос; со справочником — [`free_zeroed`] по всем шардам.
+    async fn zeroed(
+        &self,
+        older_than: Option<OffsetDateTime>,
+        limit: usize,
+    ) -> Result<Vec<Zeroed>> {
+        match self.shard_views().await? {
+            Some(views) => free_zeroed(&views, older_than, limit).await,
+            None => {
+                self.idempotent(|| zeroed_page(self, older_than, None, limit))
+                    .await
+            }
+        }
+    }
+
     /// Страница записей `live` по всем организациям в порядке (организация, хэш): не больше `limit` записей
     /// после `after` — ключа последней записи предыдущей страницы (`None` — с начала; поколение не учитывается).
     /// Страница короче `limit` — последняя. Каждая страница — своя короткая транзакция по первичному ключу:
@@ -494,55 +642,29 @@ impl BlobIndex for PgMeta {
         older_than: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<BlobKey>> {
-        if let Some(views) = self.shard_views().await? {
-            // Кандидаты всех шардов без тех, на которые ссылается какой-либо шард.
-            let mut keys: Vec<BlobKey> = Vec::new();
-            for (_, view) in &views {
-                for k in BlobIndex::gc_candidates(view, older_than, limit).await? {
-                    if !keys.contains(&k) {
-                        keys.push(k);
-                    }
+        match self.shard_views().await? {
+            Some(views) => {
+                for (_, view) in &views {
+                    view.idempotent(|| prune_tombstones(view, limit)).await?;
                 }
             }
-            for (_, view) in &views {
-                if keys.is_empty() {
-                    break;
-                }
-                let busy = referenced(view, &keys).await?;
-                keys.retain(|k| !busy.contains(k));
-            }
-            keys.truncate(limit);
-            return Ok(keys);
+            None => self.idempotent(|| prune_tombstones(self, limit)).await?,
         }
-        self.idempotent(|| async move {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut tx = begin_system(&self.pool).await?;
-        sqlx::query(
-            "DELETE FROM blobs WHERE (tenant_id, hash) IN (
-                 SELECT tenant_id, hash FROM blobs
-                 WHERE refcnt = 0 AND state = 'deleted' AND zero_since < now() - make_interval(secs => $1)
-                 LIMIT $2)",
-        )
-        .bind(self.cfg.blob_tombstone_ttl.as_secs_f64())
-        .bind(limit)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let rows: Vec<(Uuid, Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT tenant_id, hash, gen FROM blobs
-             WHERE refcnt = 0 AND state <> 'deleted' AND zero_since < $1
-             ORDER BY zero_since LIMIT $2",
-        )
-        .bind(older_than)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        crate::commits::commit(tx).await?;
-        rows.into_iter()
-            .map(|(tenant, hash, g)| key_of(tenant, hash, g))
-            .collect()
-}).await
+        Ok(self
+            .zeroed(Some(older_than), limit)
+            .await?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+
+    async fn next_gc_due(&self, window: Duration) -> Result<Option<OffsetDateTime>> {
+        let window = time::Duration::try_from(window).unwrap_or(time::Duration::MAX);
+        Ok(self
+            .zeroed(None, 1)
+            .await?
+            .first()
+            .map(|(_, z)| z.saturating_add(window)))
     }
 
     async fn mark_deleting(&self, key: &BlobKey, older_than: OffsetDateTime) -> Result<bool> {

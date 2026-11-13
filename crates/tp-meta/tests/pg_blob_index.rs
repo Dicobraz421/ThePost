@@ -12,7 +12,7 @@ use tp_contracts::blob::{Acquire, BlobIndex, BlobStore, Commit, Compression};
 use tp_contracts::{BlobHash, BlobKey, Error, Gen, TenantId};
 use tp_meta::{MetaConfig, PgMeta, schema};
 use tp_testkit::MemBlobStore;
-use tp_testkit::suite::blob_compression;
+use tp_testkit::suite::{blob_compression, blob_gc_due};
 
 fn random_hash() -> BlobHash {
     let mut h = [0u8; 32];
@@ -498,4 +498,84 @@ async fn compression_migration_keeps_existing_rows() {
         .execute(AssertSqlSafe(format!("DROP DATABASE {db} WITH (FORCE)")))
         .await
         .expect("drop database");
+}
+
+/// Запись учёта без ссылок: загрузка с одной ссылкой и её снятие.
+async fn zeroed(idx: &PgMeta, tenant: TenantId) -> BlobKey {
+    let hash = random_hash();
+    assert!(matches!(
+        idx.acquire(tenant, None, &hash, 1).await,
+        Ok(Acquire::Absent { .. })
+    ));
+    assert_eq!(
+        idx.commit_new(tenant, &hash, Gen::INITIAL, 1, 1).await,
+        Ok(Commit::Done {
+            generation: Gen::INITIAL
+        })
+    );
+    idx.release(tenant, &hash, Gen::INITIAL, 1)
+        .await
+        .expect("release");
+    BlobKey {
+        tenant,
+        hash,
+        generation: Gen::INITIAL,
+    }
+}
+
+/// Задаёт момент обнуления записи `key`.
+async fn set_zero_since(idx: &PgMeta, key: &BlobKey, at: OffsetDateTime) {
+    let mut tx = schema::begin(idx.pool(), key.tenant).await.expect("begin");
+    sqlx::query("UPDATE blobs SET zero_since = $3 WHERE tenant_id = $1 AND hash = $2")
+        .bind(key.tenant.as_uuid())
+        .bind(key.hash.as_bytes().as_slice())
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("zero_since");
+    tx.commit().await.expect("commit");
+}
+
+/// META-73: срок следующего прохода GC — `MIN(zero_since) + W` одним запросом: точно до микросекунды (деление
+/// пополам по `gc_candidates` — с точностью до секунды), надгробия и записи со ссылками не учитываются.
+#[tokio::test]
+async fn next_gc_due_is_exact_min_zero_since() {
+    const W: Duration = Duration::from_secs(3600);
+    let Some(db) = common::fresh_meta().await else {
+        return;
+    };
+    let idx = &db.meta;
+    let tenant = common::tenant(idx.pool()).await;
+    assert_eq!(idx.next_gc_due(W).await, Ok(None));
+    blob_gc_due(idx, tenant).await;
+
+    let early = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_000).expect("ts");
+    let (first, second, tombstone) = (
+        zeroed(idx, tenant).await,
+        zeroed(idx, tenant).await,
+        zeroed(idx, tenant).await,
+    );
+    set_zero_since(idx, &first, early + time::Duration::HOUR).await;
+    set_zero_since(idx, &second, early + time::Duration::MINUTE).await;
+    // Надгробие с самым ранним обнулением — не кандидат и срока не задаёт.
+    assert!(idx.mark_deleting(&tombstone, future()).await.expect("mark"));
+    assert!(idx.finalize_delete(&tombstone).await.expect("finalize"));
+    set_zero_since(idx, &tombstone, early).await;
+    // Запись со ссылками и старым моментом обнуления в столбце — тоже.
+    let held = zeroed(idx, tenant).await;
+    assert!(matches!(
+        idx.acquire(tenant, None, &held.hash, 1).await,
+        Ok(Acquire::Existing { .. })
+    ));
+    set_zero_since(idx, &held, early).await;
+
+    assert_eq!(
+        idx.next_gc_due(W).await,
+        Ok(Some(early + time::Duration::MINUTE + W))
+    );
+    assert_eq!(
+        idx.gc_candidates(early + time::Duration::HOUR, 10).await,
+        Ok(vec![second])
+    );
+    db.drop_db().await;
 }
