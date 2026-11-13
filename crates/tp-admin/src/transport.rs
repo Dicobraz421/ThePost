@@ -203,7 +203,7 @@ pub struct DomainWritten {
 }
 
 /// Доверенные источники.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SourceList {
     /// Версия снимка кластера.
     pub version: u64,
@@ -213,7 +213,7 @@ pub struct SourceList {
 }
 
 /// Доверенный источник: создание или замена (имя — в пути).
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBody {
     /// Версия снимка кластера.
@@ -250,7 +250,7 @@ impl From<ClusterTransport> for ClusterView {
 }
 
 /// Политики доменов назначения организации.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RouteList {
     /// Версия снимка организации.
     pub version: u64,
@@ -260,7 +260,7 @@ pub struct RouteList {
 }
 
 /// Политика домена назначения: создание или замена (шаблон — в пути).
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBody {
     /// Версия снимка организации.

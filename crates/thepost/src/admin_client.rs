@@ -14,6 +14,7 @@
 //! (`tp_admin::server::openapi_spec`), команды проверяются против роутера tp-admin. Генератор клиента (progenitor)
 //! не используется: спецификация — OpenAPI 3.1, progenitor читает только 3.0.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,15 +24,28 @@ use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tp_admin::AdminRole;
-use tp_admin::accounts::{AccountInfo, AccountPatch, AccountQuery, NewAccount};
+use tp_admin::accounts::{
+    AccountInfo, AccountPatch, AccountQuery, NewAccount, Organization, Policies, PolicyBody,
+};
 use tp_admin::app_passwords::{AppPasswordInfo, IssuedAppPassword, NewAppPassword};
+use tp_admin::audit::{AuditPage, AuditParams};
+use tp_admin::delivery::{DeliveryParams, DeliveryResults};
+use tp_admin::groups::{GroupInfo, GroupPatch, NewGroup};
 use tp_admin::init::AdminSession;
+use tp_admin::retention::{PageQuery, RestoredMessage, TrashPage};
 use tp_admin::server::{Problem, WhoAmI};
 use tp_admin::sieve::{Script, ScriptBody, ScriptProblem, ScriptText, VacationBody};
-use tp_admin::transport::{DomainBody, DomainList, DomainWritten, VersionQuery, Written};
+use tp_admin::transport::{
+    DomainBody, DomainList, DomainWritten, RouteBody, RouteList, SourceBody, SourceList,
+    VersionQuery, Written,
+};
 use tp_contracts::admin_token::is_local_admin_token;
-use tp_contracts::transport::{AcceptedDomain, DomainKind};
-use tp_contracts::{AccountId, TenantId};
+use tp_contracts::groups::{GroupMember, SenderRestriction};
+use tp_contracts::transport::{
+    AcceptedDomain, DestinationPolicy, DomainKind, SourceKind, SourceMatch, TlsRequirement,
+    TrustedSource,
+};
+use tp_contracts::{AccountId, DomainId, GroupId, TenantId};
 
 use crate::sections::{self, HTTP, HttpSection};
 
@@ -88,15 +102,22 @@ impl Default for ApiArgs {
 /// Команды Admin API.
 #[derive(Debug, Clone, Subcommand)]
 pub enum ApiAction {
-    /// Обмен одноразового токена admin init (tpa_…, из THEPOST_ADMIN_TOKEN или --token) на сессию Admin API (tps_…).
-    Login,
+    /// Обмен одноразового токена admin init (tpa_…, из THEPOST_ADMIN_TOKEN или --token) на сессию Admin API (tps_…);
+    /// --oidc — вход у поставщика OIDC с устройства.
+    Login {
+        /// Вход у поставщика auth.oidc с устройства (RFC 8628, клиент — cli.oidc): адрес и код — в stderr, токен
+        /// OIDC — строкой в stdout, без записи в историю оболочки:
+        /// export THEPOST_ADMIN_TOKEN="$(thepost admin login --oidc)".
+        #[arg(long)]
+        oidc: bool,
+    },
     /// Текущий администратор и его роли.
     Whoami,
     /// Учётные записи.
     Account {
         /// Действие.
         #[command(subcommand)]
-        action: AccountAction,
+        action: Box<AccountAction>,
     },
     /// Пароли приложений учётной записи (IMAP, SMTP, JMAP).
     AppPassword {
@@ -104,11 +125,41 @@ pub enum ApiAction {
         #[command(subcommand)]
         action: AppPasswordAction,
     },
-    /// Принятые домены организации (транспорт).
-    Domain {
+    /// Политика уровня (организация, домен, ящик): квота, сроки хранения, лимиты отправки.
+    Policy {
         /// Действие.
         #[command(subcommand)]
-        action: DomainAction,
+        action: Box<PolicyAction>,
+    },
+    /// Группы рассылки организации.
+    Group {
+        /// Действие.
+        #[command(subcommand)]
+        action: Box<GroupAction>,
+    },
+    /// Корзина учётной записи: просмотр и восстановление писем.
+    Trash {
+        /// Действие.
+        #[command(subcommand)]
+        action: TrashAction,
+    },
+    /// Журнал аудита Admin API.
+    Audit {
+        /// Действие.
+        #[command(subcommand)]
+        action: Box<AuditAction>,
+    },
+    /// Журнал доставки: поиск писем.
+    Delivery {
+        /// Действие.
+        #[command(subcommand)]
+        action: Box<DeliveryAction>,
+    },
+    /// Транспорт: принятые домены, доверенные источники, политики доменов назначения.
+    Transport {
+        /// Ресурс.
+        #[command(subcommand)]
+        action: Box<TransportAction>,
     },
     /// Правила Sieve учётной записи: просмотр, правка, включение и отключение за пользователя.
     Sieve {
@@ -137,12 +188,15 @@ pub enum AccountAction {
     },
     /// Учётные записи по возрастанию имени входа (страницы Admin API — по ссылке Link rel="next"); --login — поиск одной.
     List {
-        /// Поиск по имени входа (без учёта регистра); несовместимо с --prefix и --limit.
-        #[arg(long, conflicts_with_all = ["prefix", "limit"])]
+        /// Поиск по имени входа (без учёта регистра); несовместимо с --prefix, --after и --limit.
+        #[arg(long, conflicts_with_all = ["prefix", "after", "limit"])]
         login: Option<String>,
         /// Имя входа начинается с префикса (без учёта регистра).
         #[arg(long)]
         prefix: Option<String>,
+        /// Продолжение после этого имени входа (из подсказки предыдущего вывода с --limit).
+        #[arg(long, value_name = "ИМЯ_ВХОДА")]
+        after: Option<String>,
         /// Не больше N записей (по умолчанию — все).
         #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: Option<usize>,
@@ -197,13 +251,204 @@ pub enum AppPasswordAction {
     },
 }
 
+/// Действия с политикой уровня; уровень — организация, `--domain` или `--account`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum PolicyAction {
+    /// Политика: заданное на уровне и действующее с учётом вышестоящих (организация → домен → ящик).
+    Get {
+        /// Уровень.
+        #[command(flatten)]
+        level: PolicyLevel,
+    },
+    /// Замена политики уровня целиком. Файл — JSON с полями политики (quota_bytes, trash_retention, retention,
+    /// send_per_hour, rcpts_per_hour, max_recipients, dkim_selector, milter_profile, trash_purge, archive_after,
+    /// archive_quota_bytes); поля нет или null — не задано на уровне.
+    Set {
+        /// Уровень.
+        #[command(flatten)]
+        level: PolicyLevel,
+        /// Файл с политикой (JSON, UTF-8); `-` — stdin.
+        #[arg(long, value_name = "ПУТЬ")]
+        file: PathBuf,
+    },
+}
+
+/// Уровень политики: без ключей — организация.
+#[derive(Debug, Clone, Args)]
+pub struct PolicyLevel {
+    /// Принятый домен: идентификатор (UUID) или имя.
+    #[arg(long, conflicts_with = "account")]
+    pub domain: Option<String>,
+    /// Учётная запись: идентификатор (UUID) или имя входа.
+    #[arg(long)]
+    pub account: Option<String>,
+}
+
+/// Действия с группами рассылки; группа — идентификатор (UUID), имя или адрес.
+#[derive(Debug, Clone, Subcommand)]
+pub enum GroupAction {
+    /// Группы организации.
+    List,
+    /// Группа: адрес, участники, ограничение отправителей, модераторы.
+    Get {
+        /// Группа: идентификатор (UUID), имя или адрес.
+        group: String,
+    },
+    /// Новая группа (не из каталога).
+    Create {
+        /// Отображаемое имя.
+        name: String,
+        /// Адрес рассылки (без адреса — группа только для вложения).
+        #[arg(long)]
+        address: Option<String>,
+        /// Участник — учётная запись: идентификатор (UUID) или имя входа (можно повторять).
+        #[arg(long = "account", value_name = "УЧЁТНАЯ_ЗАПИСЬ")]
+        accounts: Vec<String>,
+        /// Участник — вложенная группа: идентификатор (UUID), имя или адрес (можно повторять).
+        #[arg(long = "group", value_name = "ГРУППА")]
+        groups: Vec<String>,
+    },
+    /// Удаление группы (не из каталога); письма её очереди модерации отклоняются с уведомлением.
+    Delete {
+        /// Группа: идентификатор (UUID), имя или адрес.
+        group: String,
+    },
+    /// Участники группы; --set — замена участников перечисленными (без --account и --group — пусто).
+    Members {
+        /// Группа: идентификатор (UUID), имя или адрес.
+        group: String,
+        /// Заменить участников (у группы каталога участников ведёт каталог — 400).
+        #[arg(long)]
+        set: bool,
+        /// Участник — учётная запись: идентификатор (UUID) или имя входа (можно повторять).
+        #[arg(long = "account", value_name = "УЧЁТНАЯ_ЗАПИСЬ", requires = "set")]
+        accounts: Vec<String>,
+        /// Участник — вложенная группа: идентификатор (UUID), имя или адрес (можно повторять).
+        #[arg(long = "group", value_name = "ГРУППА", requires = "set")]
+        groups: Vec<String>,
+    },
+}
+
+/// Действия с корзиной учётной записи.
+#[derive(Debug, Clone, Subcommand)]
+pub enum TrashAction {
+    /// Письма корзины, новые первыми, и действующий срок корзины.
+    List {
+        /// Учётная запись: идентификатор (UUID) или имя входа.
+        account: String,
+        /// Скрытые письма («очистить корзину» с hide): пользователь их не видит.
+        #[arg(long)]
+        hidden: bool,
+        /// Тема и отправитель писем: только администратору, запрос пишется в журнал аудита.
+        #[arg(long)]
+        subject: bool,
+        /// Смещение от начала списка (из подсказки предыдущей страницы).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Размер страницы (по умолчанию и наибольший — из конфигурации узла).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+        limit: Option<usize>,
+    },
+    /// Восстановление письма в исходную папку (нет — во «Входящие») с тем же идентификатором.
+    Restore {
+        /// Учётная запись: идентификатор (UUID) или имя входа.
+        account: String,
+        /// Письмо (UUID, из `trash list`).
+        message: String,
+        /// Скрытое письмо (из `trash list --hidden`).
+        #[arg(long)]
+        hidden: bool,
+    },
+}
+
+/// Действия с журналом аудита.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AuditAction {
+    /// Записи по возрастанию номера; условия — по «и», хотя бы одно обязательно.
+    Search {
+        /// Начало интервала, RFC 3339 (например, 2026-12-01T00:00:00Z), включительно.
+        #[arg(long, value_name = "ВРЕМЯ")]
+        since: Option<String>,
+        /// Конец интервала, RFC 3339, не включительно.
+        #[arg(long, value_name = "ВРЕМЯ")]
+        until: Option<String>,
+        /// Администратор: имя входа или UUID учётной записи.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Метод HTTP (PUT, POST, PATCH, DELETE).
+        #[arg(long)]
+        method: Option<String>,
+        /// Начало шаблона маршрута: /api/v1/orgs/{org}/transport — все маршруты транспорта.
+        #[arg(long)]
+        route: Option<String>,
+        /// Размер страницы (по умолчанию и наибольший — из конфигурации узла).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+        limit: Option<usize>,
+        /// Продолжение: номер из подсказки предыдущей страницы.
+        #[arg(long)]
+        after: Option<u64>,
+    },
+}
+
+/// Действия с журналом доставки.
+#[derive(Debug, Clone, Subcommand)]
+pub enum DeliveryAction {
+    /// События по возрастанию времени; условия — по «и».
+    Search {
+        /// Отправитель конверта (точно, без учёта регистра).
+        #[arg(long)]
+        sender: Option<String>,
+        /// Один из получателей (точно, без учёта регистра).
+        #[arg(long)]
+        recipient: Option<String>,
+        /// Message-ID без угловых скобок.
+        #[arg(long)]
+        message_id: Option<String>,
+        /// Начало интервала, RFC 3339 (например, 2026-12-01T00:00:00Z), включительно.
+        #[arg(long, value_name = "ВРЕМЯ")]
+        since: Option<String>,
+        /// Конец интервала, RFC 3339, не включительно.
+        #[arg(long, value_name = "ВРЕМЯ")]
+        until: Option<String>,
+        /// Размер страницы (по умолчанию и наибольший — из конфигурации узла).
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+        limit: Option<usize>,
+        /// Продолжение: позиция из подсказки предыдущей страницы (с теми же условиями).
+        #[arg(long)]
+        after: Option<String>,
+    },
+}
+
+/// Ресурсы транспорта; каждая запись — по версии снимка последнего чтения (устарела — 409, повторите команду).
+#[derive(Debug, Clone, Subcommand)]
+pub enum TransportAction {
+    /// Принятые домены организации.
+    Domain {
+        /// Действие.
+        #[command(subcommand)]
+        action: DomainAction,
+    },
+    /// Доверенные источники организации: шлюзы и приложения, отправляющие почту без входа.
+    Source {
+        /// Действие.
+        #[command(subcommand)]
+        action: SourceAction,
+    },
+    /// Политики доменов назначения: TLS, smart host, исходящий адрес.
+    Route {
+        /// Действие.
+        #[command(subcommand)]
+        action: RouteAction,
+    },
+}
+
 /// Действия с принятыми доменами.
 #[derive(Debug, Clone, Subcommand)]
 pub enum DomainAction {
     /// Принятые домены организации.
     List,
     /// Новый принятый домен.
-    Add {
+    Create {
         /// Имя домена.
         name: String,
         /// Внутренняя пересылка на узел host[:port] вместо собственного домена (authoritative).
@@ -211,9 +456,90 @@ pub enum DomainAction {
         relay: Option<String>,
     },
     /// Удаление принятого домена.
-    Remove {
-        /// Идентификатор домена (из `domain list`).
-        id: String,
+    Delete {
+        /// Домен: идентификатор (UUID) или имя.
+        domain: String,
+    },
+}
+
+/// Действия с доверенными источниками организации.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SourceAction {
+    /// Доверенные источники организации.
+    List,
+    /// Создание или замена источника: откуда (сети или сертификат клиента) и кто (шлюз или приложение).
+    Set {
+        /// Имя источника ([a-z0-9._-], до 64 символов).
+        name: String,
+        /// Сеть источника, CIDR (можно повторять).
+        #[arg(
+            long = "network",
+            value_name = "CIDR",
+            required_unless_present = "client_cert"
+        )]
+        networks: Vec<String>,
+        /// Имя (dNSName) в сертификате клиента (mTLS) вместо сетей.
+        #[arg(long, conflicts_with = "networks")]
+        client_cert: Option<String>,
+        /// Приложение (отправляет от перечисленных адресов) вместо шлюза.
+        #[arg(long)]
+        application: bool,
+        /// Адрес отправителя приложения: user@domain или @domain (можно повторять).
+        #[arg(long = "sender", value_name = "ШАБЛОН", requires = "application")]
+        senders: Vec<String>,
+        /// Приложению разрешены внешние получатели.
+        #[arg(long, requires = "application")]
+        external: bool,
+        /// Шлюз: принимать адрес исходного клиента из XCLIENT/XFORWARD.
+        #[arg(long, conflicts_with = "application")]
+        xclient: bool,
+        /// Шлюз: доверять Authentication-Results и ARC с этим authserv-id.
+        #[arg(long, conflicts_with = "application")]
+        authserv_id: Option<String>,
+    },
+    /// Удаление источника организации.
+    Delete {
+        /// Имя источника.
+        name: String,
+    },
+}
+
+/// Требование TLS политики домена назначения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TlsMode {
+    /// TLS, если сервер предлагает.
+    #[default]
+    Opportunistic,
+    /// Обязательный TLS с проверкой сертификата; иначе — временный отказ доставки.
+    Required,
+}
+
+/// Действия с политиками доменов назначения.
+#[derive(Debug, Clone, Subcommand)]
+pub enum RouteAction {
+    /// Политики доменов назначения организации.
+    List,
+    /// Создание или замена политики домена назначения.
+    Set {
+        /// Шаблон: example.org, *.example.org (поддомены) или * (все внешние).
+        pattern: String,
+        /// Требование TLS.
+        #[arg(long, value_enum, default_value_t = TlsMode::Opportunistic)]
+        tls: TlsMode,
+        /// Закреплённый ключ сервера: SHA-256 SubjectPublicKeyInfo, hex (можно повторять); вместо --tls.
+        #[arg(long = "pin", value_name = "SHA256", conflicts_with = "tls")]
+        pins: Vec<String>,
+        /// Отправка через узел host[:port] вместо MX.
+        #[arg(long)]
+        smart_host: Option<String>,
+        /// Исходящий IP-адрес.
+        #[arg(long, value_name = "IP")]
+        egress_ip: Option<String>,
+    },
+    /// Удаление политики домена назначения.
+    Delete {
+        /// Шаблон (как в `transport route list`).
+        pattern: String,
     },
 }
 
@@ -384,12 +710,12 @@ pub const DOMAIN_LIST: Op = Op {
     path: "/api/v1/orgs/{org}/transport/domains",
 };
 /// Новый принятый домен.
-pub const DOMAIN_ADD: Op = Op {
+pub const DOMAIN_CREATE: Op = Op {
     method: "POST",
     path: "/api/v1/orgs/{org}/transport/domains",
 };
 /// Удаление принятого домена.
-pub const DOMAIN_REMOVE: Op = Op {
+pub const DOMAIN_DELETE: Op = Op {
     method: "DELETE",
     path: "/api/v1/orgs/{org}/transport/domains/{id}",
 };
@@ -449,6 +775,117 @@ pub const ORG_SIEVE_DELETE: Op = Op {
     path: "/api/v1/orgs/{org}/sieve",
 };
 
+/// Организация и её политика.
+pub const ORG_GET: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}",
+};
+/// Политика организации целиком.
+pub const ORG_POLICY_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/policy",
+};
+/// Политика домена и действующая политика.
+pub const DOMAIN_POLICY_GET: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/transport/domains/{id}/policy",
+};
+/// Политика домена целиком.
+pub const DOMAIN_POLICY_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/transport/domains/{id}/policy",
+};
+/// Политика ящика целиком.
+pub const ACCOUNT_POLICY_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/accounts/{account}/policy",
+};
+/// Группы организации.
+pub const GROUP_LIST: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/groups",
+};
+/// Новая группа.
+pub const GROUP_CREATE: Op = Op {
+    method: "POST",
+    path: "/api/v1/orgs/{org}/groups",
+};
+/// Группа.
+pub const GROUP_GET: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/groups/{group}",
+};
+/// Изменение группы.
+pub const GROUP_PATCH: Op = Op {
+    method: "PATCH",
+    path: "/api/v1/orgs/{org}/groups/{group}",
+};
+/// Удаление группы.
+pub const GROUP_DELETE: Op = Op {
+    method: "DELETE",
+    path: "/api/v1/orgs/{org}/groups/{group}",
+};
+/// Корзина ящика.
+pub const TRASH_LIST: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/accounts/{account}/trash",
+};
+/// Восстановление письма из корзины.
+pub const TRASH_RESTORE: Op = Op {
+    method: "POST",
+    path: "/api/v1/orgs/{org}/accounts/{account}/trash/{message}/restore",
+};
+/// Скрытые письма корзины.
+pub const TRASH_HIDDEN_LIST: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/accounts/{account}/trash/hidden",
+};
+/// Восстановление скрытого письма.
+pub const TRASH_HIDDEN_RESTORE: Op = Op {
+    method: "POST",
+    path: "/api/v1/orgs/{org}/accounts/{account}/trash/hidden/{message}/restore",
+};
+/// Журнал аудита организации.
+pub const AUDIT_SEARCH: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/audit",
+};
+/// Поиск в журнале доставки.
+pub const DELIVERY_SEARCH: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/delivery",
+};
+/// Доверенные источники организации.
+pub const SOURCE_LIST: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/transport/sources",
+};
+/// Создание или замена доверенного источника.
+pub const SOURCE_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/transport/sources/{name}",
+};
+/// Удаление доверенного источника.
+pub const SOURCE_DELETE: Op = Op {
+    method: "DELETE",
+    path: "/api/v1/orgs/{org}/transport/sources/{name}",
+};
+/// Политики доменов назначения.
+pub const ROUTE_LIST: Op = Op {
+    method: "GET",
+    path: "/api/v1/orgs/{org}/transport/routes",
+};
+/// Создание или замена политики домена назначения.
+pub const ROUTE_PUT: Op = Op {
+    method: "PUT",
+    path: "/api/v1/orgs/{org}/transport/routes/{pattern}",
+};
+/// Удаление политики домена назначения.
+pub const ROUTE_DELETE: Op = Op {
+    method: "DELETE",
+    path: "/api/v1/orgs/{org}/transport/routes/{pattern}",
+};
+
 /// Все операции клиента (сверка со спецификацией OpenAPI — тест).
 pub const OPERATIONS: &[Op] = &[
     SESSION,
@@ -461,8 +898,8 @@ pub const OPERATIONS: &[Op] = &[
     APP_PASSWORD_CREATE,
     APP_PASSWORD_REVOKE,
     DOMAIN_LIST,
-    DOMAIN_ADD,
-    DOMAIN_REMOVE,
+    DOMAIN_CREATE,
+    DOMAIN_DELETE,
     SIEVE_LIST,
     SIEVE_GET,
     SIEVE_PUT,
@@ -474,6 +911,28 @@ pub const OPERATIONS: &[Op] = &[
     ORG_SIEVE_GET,
     ORG_SIEVE_PUT,
     ORG_SIEVE_DELETE,
+    ORG_GET,
+    ORG_POLICY_PUT,
+    DOMAIN_POLICY_GET,
+    DOMAIN_POLICY_PUT,
+    ACCOUNT_POLICY_PUT,
+    GROUP_LIST,
+    GROUP_CREATE,
+    GROUP_GET,
+    GROUP_PATCH,
+    GROUP_DELETE,
+    TRASH_LIST,
+    TRASH_RESTORE,
+    TRASH_HIDDEN_LIST,
+    TRASH_HIDDEN_RESTORE,
+    AUDIT_SEARCH,
+    DELIVERY_SEARCH,
+    SOURCE_LIST,
+    SOURCE_PUT,
+    SOURCE_DELETE,
+    ROUTE_LIST,
+    ROUTE_PUT,
+    ROUTE_DELETE,
 ];
 
 /// Результат команды: текст для stdout или сообщение об ошибке.
@@ -662,12 +1121,19 @@ fn query<Q: Serialize>(q: &Q) -> CliResult<Vec<(String, String)>> {
 /// Поле ответа `v` как в JSON Admin API (даты — RFC 3339, форматом tp-admin); `null` или нет поля — «—».
 fn json_field<T: Serialize>(v: &T, field: &str) -> String {
     match serde_json::to_value(v) {
-        Ok(serde_json::Value::Object(mut fields)) => match fields.remove(field) {
-            Some(serde_json::Value::String(s)) => s,
-            None | Some(serde_json::Value::Null) => "—".to_owned(),
-            Some(other) => other.to_string(),
-        },
+        Ok(serde_json::Value::Object(mut fields)) => fields
+            .remove(field)
+            .map_or_else(|| "—".to_owned(), |v| value_text(&v)),
         _ => "—".to_owned(),
+    }
+}
+
+/// Значение JSON для вывода: строка — без кавычек, `null` — «—».
+fn value_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "—".to_owned(),
+        other => other.to_string(),
     }
 }
 
@@ -704,6 +1170,9 @@ fn problem(op: Op, status: StatusCode, body: &[u8]) -> String {
 
 /// `thepost admin <ресурс> <действие>`: код возврата (0 — успех, 1 — отказ или ошибка).
 pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
+    if matches!(action, ApiAction::Login { oidc: true }) {
+        return crate::oidc_device::command(config).await;
+    }
     match run(config, &args, action).await {
         Ok(out) => {
             print!("{out}");
@@ -717,7 +1186,7 @@ pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
 }
 
 async fn run(config: &Path, args: &ApiArgs, action: ApiAction) -> CliResult<String> {
-    let token = token(args, matches!(action, ApiAction::Login))?;
+    let token = token(args, matches!(action, ApiAction::Login { .. }))?;
     let base = base_url(config, args)?;
     let client = Client::new(base, token, args)?;
     execute(&client, args, action).await
@@ -806,7 +1275,10 @@ fn out<T: Serialize>(args: &ApiArgs, v: &T, text: String) -> CliResult<String> {
 /// Выполняет команду через `client`; текст для stdout.
 pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliResult<String> {
     match action {
-        ApiAction::Login => {
+        ApiAction::Login { oidc: true } => Err(
+            "login --oidc — вход у поставщика OIDC (thepost admin login --oidc), не запрос Admin API".to_owned(),
+        ),
+        ApiAction::Login { oidc: false } => {
             let s: AdminSession = client.call(SESSION, &[], &[], NO_BODY).await?;
             let text = format!(
                 "{}Значение сессии показывается один раз. Дальше: export {ENV_TOKEN}=<сессия>\n",
@@ -826,7 +1298,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
         }
         ApiAction::Account { action } => {
             let org = org(client, args).await?;
-            match action {
+            match *action {
                 AccountAction::Create { login, name } => {
                     let body = NewAccount {
                         login,
@@ -847,14 +1319,21 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                 AccountAction::List {
                     login: None,
                     prefix,
+                    after,
                     limit,
                 } => {
-                    let (found, more) = list_accounts(client, &org, prefix, limit).await?;
+                    let (found, more) =
+                        list_accounts(client, &org, prefix.clone(), after, limit).await?;
                     let rows: Vec<Vec<String>> = found.iter().map(account_row).collect();
                     let mut text = table(ACCOUNT_COLUMNS, &rows);
-                    if more {
+                    if let Some(last) = found.last().filter(|_| more) {
+                        // `after` следующей страницы — как в ссылке rel="next": последнее показанное имя входа.
+                        let prefix = prefix.map(|p| format!(" --prefix {p}")).unwrap_or_default();
                         text.push_str(&format!(
-                            "Показаны первые {}; есть ещё — уточните --prefix или увеличьте --limit.\n",
+                            "Показано {}; есть ещё. Следующая страница: thepost admin account list{prefix} \
+                             --after {} --limit {}\n",
+                            found.len(),
+                            last.login.to_lowercase(),
                             found.len()
                         ));
                     }
@@ -959,52 +1438,22 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                 }
             }
         }
-        ApiAction::Domain { action } => {
+        ApiAction::Policy { action } => policy_command(client, args, *action).await,
+        ApiAction::Group { action } => group_command(client, args, *action).await,
+        ApiAction::Trash { action } => trash_command(client, args, action).await,
+        ApiAction::Audit { action } => audit_command(client, args, *action).await,
+        ApiAction::Delivery { action } => delivery_command(client, args, *action).await,
+        ApiAction::Transport { action } => {
             let org = org(client, args).await?;
-            match action {
-                DomainAction::List => {
-                    let list = domains(client, &org).await?;
-                    let rows: Vec<Vec<String>> = list.domains.iter().map(domain_row).collect();
-                    let text = format!(
-                        "{}Версия снимка: {}\n",
-                        table(DOMAIN_COLUMNS, &rows),
-                        list.version
-                    );
-                    out(args, &list, text)
+            match *action {
+                TransportAction::Domain { action } => {
+                    domain_command(client, args, &org, action).await
                 }
-                DomainAction::Add { name, relay } => {
-                    let version = domains(client, &org).await?.version;
-                    let kind = match relay {
-                        Some(next_hop) => DomainKind::InternalRelay { next_hop },
-                        None => DomainKind::Authoritative,
-                    };
-                    let body = DomainBody {
-                        version,
-                        name,
-                        kind,
-                    };
-                    let w: DomainWritten = client
-                        .call(DOMAIN_ADD, &[org.as_str()], &[], Some(&body))
-                        .await?;
-                    let fields: Vec<(&str, String)> = DOMAIN_COLUMNS
-                        .iter()
-                        .copied()
-                        .zip(domain_row(&w.domain))
-                        .collect();
-                    let text = format!("{}Версия снимка: {}\n", record(&fields), w.version);
-                    out(args, &w, text)
+                TransportAction::Source { action } => {
+                    source_command(client, args, &org, action).await
                 }
-                DomainAction::Remove { id } => {
-                    let version = domains(client, &org).await?.version;
-                    let query = query(&VersionQuery { version })?;
-                    let w: Written = client
-                        .call(DOMAIN_REMOVE, &[org.as_str(), id.as_str()], &query, NO_BODY)
-                        .await?;
-                    out(
-                        args,
-                        &w,
-                        format!("Домен {id} удалён. Версия снимка: {}\n", w.version),
-                    )
+                TransportAction::Route { action } => {
+                    route_command(client, args, &org, action).await
                 }
             }
         }
@@ -1044,7 +1493,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                     file,
                 } => {
                     let body = ScriptText {
-                        text: script_text(file).await?,
+                        text: input_text(file).await?,
                     };
                     let id = account_id(client, &org, &account).await?;
                     client
@@ -1098,7 +1547,7 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                     }
                     OrgSieveAction::Put { file } => {
                         let body = ScriptText {
-                            text: script_text(file).await?,
+                            text: input_text(file).await?,
                         };
                         client
                             .call_empty(ORG_SIEVE_PUT, &[org.as_str()], &[], Some(&body))
@@ -1135,11 +1584,11 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                     html_file,
                 } => {
                     let text = match text_file {
-                        Some(file) => Some(script_text(file).await?),
+                        Some(file) => Some(input_text(file).await?),
                         None => text,
                     };
                     let html = match html_file {
-                        Some(file) => Some(script_text(file).await?),
+                        Some(file) => Some(input_text(file).await?),
                         None => None,
                     };
                     let id = account_id(client, &org, &account).await?;
@@ -1162,6 +1611,733 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             }
         }
     }
+}
+
+/// Уровень политики с идентификатором из пути операции.
+enum Level {
+    Org,
+    Domain(String),
+    Account(String),
+}
+
+/// Уровень `level`: домен и учётная запись — по идентификатору или имени.
+async fn level(client: &Client, org: &str, level: PolicyLevel) -> CliResult<Level> {
+    Ok(match (level.domain, level.account) {
+        (Some(domain), _) => Level::Domain(domain_id(client, org, &domain).await?),
+        (None, Some(account)) => Level::Account(account_id(client, org, &account).await?),
+        (None, None) => Level::Org,
+    })
+}
+
+/// `thepost admin policy …`.
+async fn policy_command(
+    client: &Client,
+    args: &ApiArgs,
+    action: PolicyAction,
+) -> CliResult<String> {
+    let org = org(client, args).await?;
+    match action {
+        PolicyAction::Get { level: l } => {
+            let p: Policies = match level(client, &org, l).await? {
+                Level::Org => {
+                    let o: Organization = client.call(ORG_GET, &[&org], &[], NO_BODY).await?;
+                    o.policies
+                }
+                Level::Domain(id) => {
+                    client
+                        .call(DOMAIN_POLICY_GET, &[&org, &id], &[], NO_BODY)
+                        .await?
+                }
+                Level::Account(id) => {
+                    let a: AccountInfo =
+                        client.call(ACCOUNT_GET, &[&org, &id], &[], NO_BODY).await?;
+                    a.policies
+                }
+            };
+            out(args, &p, policy_table(&p.policy, Some(&p.effective)))
+        }
+        PolicyAction::Set { level: l, file } => {
+            let text = input_text(file).await?;
+            let body: PolicyBody =
+                serde_json::from_str(&text).map_err(|e| format!("политика (JSON): {e}"))?;
+            let (op, id) = match level(client, &org, l).await? {
+                Level::Org => (ORG_POLICY_PUT, None),
+                Level::Domain(id) => (DOMAIN_POLICY_PUT, Some(id)),
+                Level::Account(id) => (ACCOUNT_POLICY_PUT, Some(id)),
+            };
+            let params: Vec<&str> = [Some(org.as_str()), id.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            let p: PolicyBody = client.call(op, &params, &[], Some(&body)).await?;
+            out(args, &p, policy_table(&p, None))
+        }
+    }
+}
+
+/// Поля политики: заданное на уровне и действующее (`effective`); не задано — «—».
+fn policy_table(policy: &PolicyBody, effective: Option<&PolicyBody>) -> String {
+    let fields = |p: &PolicyBody| match serde_json::to_value(p) {
+        Ok(serde_json::Value::Object(fields)) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let effective = effective.map(fields);
+    let rows: Vec<Vec<String>> = fields(policy)
+        .iter()
+        .map(|(name, v)| {
+            let mut row = vec![name.clone(), value_text(v)];
+            if let Some(e) = &effective {
+                row.push(e.get(name).map_or_else(|| "—".to_owned(), value_text));
+            }
+            row
+        })
+        .collect();
+    let cols: &[&str] = if effective.is_some() {
+        &["ПОЛЕ", "НА УРОВНЕ", "ДЕЙСТВУЕТ"]
+    } else {
+        &["ПОЛЕ", "НА УРОВНЕ"]
+    };
+    table(cols, &rows)
+}
+
+/// `thepost admin group …`.
+async fn group_command(client: &Client, args: &ApiArgs, action: GroupAction) -> CliResult<String> {
+    let org = org(client, args).await?;
+    match action {
+        GroupAction::List => {
+            let list = groups(client, &org).await?;
+            let rows: Vec<Vec<String>> = list.iter().map(group_row).collect();
+            out(args, &list, table(GROUP_COLUMNS, &rows))
+        }
+        GroupAction::Get { group } => {
+            let id = group_id(client, &org, &group).await?;
+            let g: GroupInfo = client.call(GROUP_GET, &[&org, &id], &[], NO_BODY).await?;
+            out(args, &g, group_record(&g))
+        }
+        GroupAction::Create {
+            name,
+            address,
+            accounts,
+            groups,
+        } => {
+            let body = NewGroup {
+                name,
+                address,
+                members: members(client, &org, accounts, groups).await?,
+                senders: SenderRestriction::default(),
+                moderators: Vec::new(),
+                hidden_from_gal: false,
+            };
+            let g: GroupInfo = client.call(GROUP_CREATE, &[&org], &[], Some(&body)).await?;
+            out(args, &g, group_record(&g))
+        }
+        GroupAction::Delete { group } => {
+            let id = group_id(client, &org, &group).await?;
+            client
+                .call_empty(GROUP_DELETE, &[&org, &id], &[], NO_BODY)
+                .await?;
+            out(args, &(), format!("Группа {group} удалена.\n"))
+        }
+        GroupAction::Members {
+            group,
+            set,
+            accounts,
+            groups,
+        } => {
+            let id = group_id(client, &org, &group).await?;
+            let params = [org.as_str(), id.as_str()];
+            let g: GroupInfo = if set {
+                let patch = GroupPatch {
+                    members: Some(members(client, &org, accounts, groups).await?),
+                    ..GroupPatch::default()
+                };
+                client.call(GROUP_PATCH, &params, &[], Some(&patch)).await?
+            } else {
+                client.call(GROUP_GET, &params, &[], NO_BODY).await?
+            };
+            let rows: Vec<Vec<String>> = g
+                .members
+                .iter()
+                .map(|m| {
+                    let (kind, id) = member(m);
+                    vec![kind.to_owned(), id.clone(), name_of(&g, id)]
+                })
+                .collect();
+            out(
+                args,
+                &g.members,
+                table(&["ВИД", "ИДЕНТИФИКАТОР", "ИМЯ"], &rows),
+            )
+        }
+    }
+}
+
+const GROUP_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ИМЯ", "АДРЕС", "УЧАСТНИКОВ"];
+
+/// Группы организации.
+async fn groups(client: &Client, org: &str) -> CliResult<Vec<GroupInfo>> {
+    client.call(GROUP_LIST, &[org], &[], NO_BODY).await
+}
+
+/// Идентификатор группы: UUID как есть, иначе единственная группа с таким именем или адресом (без учёта регистра).
+async fn group_id(client: &Client, org: &str, group: &str) -> CliResult<String> {
+    if group.parse::<GroupId>().is_ok() {
+        return Ok(group.to_owned());
+    }
+    let want = group.to_lowercase();
+    let list = groups(client, org).await?;
+    let found: Vec<&GroupInfo> = list
+        .iter()
+        .filter(|g| {
+            g.name.to_lowercase() == want
+                || g.address
+                    .as_deref()
+                    .is_some_and(|a| a.to_lowercase() == want)
+        })
+        .collect();
+    match found.as_slice() {
+        [g] => Ok(g.id.clone()),
+        [] => Err(format!("группа {group} не найдена")),
+        _ => Err(format!(
+            "групп с именем {group} несколько — укажите идентификатор (из group list)"
+        )),
+    }
+}
+
+/// Участники: учётные записи (идентификатор или имя входа) и группы (идентификатор, имя или адрес).
+async fn members(
+    client: &Client,
+    org: &str,
+    accounts: Vec<String>,
+    groups: Vec<String>,
+) -> CliResult<Vec<GroupMember>> {
+    let mut out = Vec::with_capacity(accounts.len() + groups.len());
+    for a in accounts {
+        let id = account_id(client, org, &a).await?;
+        let id = id
+            .parse::<AccountId>()
+            .map_err(|e| format!("учётная запись {id}: {e}"))?;
+        out.push(GroupMember::Account(id));
+    }
+    for g in groups {
+        let id = group_id(client, org, &g).await?;
+        let id = id
+            .parse::<GroupId>()
+            .map_err(|e| format!("группа {id}: {e}"))?;
+        out.push(GroupMember::Group(id));
+    }
+    Ok(out)
+}
+
+/// Вид и идентификатор участника.
+fn member(m: &GroupMember) -> (&'static str, String) {
+    match m {
+        GroupMember::Account(id) => ("учётная запись", id.to_string()),
+        GroupMember::Group(id) => ("группа", id.to_string()),
+    }
+}
+
+/// Имя по идентификатору из словаря `names` ответа; нет в словаре — «—» (записи уже нет).
+fn name_of(g: &GroupInfo, id: String) -> String {
+    g.names.get(&id).cloned().unwrap_or_else(|| "—".to_owned())
+}
+
+/// Группа — строка таблицы [`GROUP_COLUMNS`].
+fn group_row(g: &GroupInfo) -> Vec<String> {
+    vec![
+        g.id.clone(),
+        g.name.clone(),
+        optional(g.address.as_ref()),
+        g.members.len().to_string(),
+    ]
+}
+
+/// Группа — строки «подпись: значение»; участники и модераторы — по именам.
+fn group_record(g: &GroupInfo) -> String {
+    let names = |ids: Vec<String>| {
+        let list: Vec<String> = ids.into_iter().map(|id| name_of(g, id)).collect();
+        or_dash(&list.join(", "))
+    };
+    let senders =
+        serde_json::to_value(&g.senders).map_or_else(|_| "—".to_owned(), |v| value_text(&v));
+    record(&[
+        ("Идентификатор", g.id.clone()),
+        ("Имя", g.name.clone()),
+        ("Адрес", optional(g.address.as_ref())),
+        ("Из каталога", optional(g.external_id.as_ref())),
+        (
+            "Участники",
+            names(g.members.iter().map(|m| member(m).1).collect()),
+        ),
+        ("Отправители", senders),
+        (
+            "Модераторы",
+            names(g.moderators.iter().map(ToString::to_string).collect()),
+        ),
+        (
+            "Скрыта из GAL",
+            if g.hidden_from_gal { "да" } else { "нет" }.to_owned(),
+        ),
+    ])
+}
+
+/// `thepost admin trash …`.
+async fn trash_command(client: &Client, args: &ApiArgs, action: TrashAction) -> CliResult<String> {
+    let org = org(client, args).await?;
+    match action {
+        TrashAction::List {
+            account,
+            hidden,
+            subject,
+            offset,
+            limit,
+        } => {
+            let id = account_id(client, &org, &account).await?;
+            let op = if hidden {
+                TRASH_HIDDEN_LIST
+            } else {
+                TRASH_LIST
+            };
+            let query = query(&PageQuery {
+                offset,
+                limit,
+                include: subject.then(|| "subject".to_owned()),
+            })?;
+            let page: TrashPage = client.call(op, &[&org, &id], &query, NO_BODY).await?;
+            let mut cols = vec!["ПИСЬМО", "ПАПКА", "РАЗМЕР", "УДАЛЕНО", "УДАЛЯЕТСЯ"];
+            if subject {
+                cols.extend(["ТЕМА", "ОТПРАВИТЕЛЬ"]);
+            }
+            let rows: Vec<Vec<String>> = page
+                .items
+                .iter()
+                .map(|e| {
+                    let mut row = vec![
+                        e.message.clone(),
+                        e.origin.clone(),
+                        e.size.to_string(),
+                        json_field(e, "deleted_at"),
+                        json_field(e, "expires_at"),
+                    ];
+                    if subject {
+                        for v in [&e.subject, &e.from] {
+                            row.push(optional(v.clone().flatten().as_ref()));
+                        }
+                    }
+                    row
+                })
+                .collect();
+            let retention = match page.trash_retention {
+                Some(_) => json_field(&page, "trash_retention"),
+                None => "по умолчанию узла".to_owned(),
+            };
+            let mut text = format!("{}Срок корзины: {retention}\n", table(&cols, &rows));
+            if let Some(next) = page.next_offset {
+                text.push_str(&format!("Есть ещё. Следующая страница: --offset {next}\n"));
+            }
+            out(args, &page, text)
+        }
+        TrashAction::Restore {
+            account,
+            message,
+            hidden,
+        } => {
+            let id = account_id(client, &org, &account).await?;
+            let op = if hidden {
+                TRASH_HIDDEN_RESTORE
+            } else {
+                TRASH_RESTORE
+            };
+            let r: RestoredMessage = client
+                .call(op, &[&org, &id, &message], &[], NO_BODY)
+                .await?;
+            let text = format!("Письмо {} восстановлено, UID {}.\n", r.message, r.uid);
+            out(args, &r, text)
+        }
+    }
+}
+
+/// `thepost admin audit search`: одна страница; продолжение — подсказкой `--after`.
+async fn audit_command(client: &Client, args: &ApiArgs, action: AuditAction) -> CliResult<String> {
+    let AuditAction::Search {
+        since,
+        until,
+        actor,
+        method,
+        route,
+        limit,
+        after,
+    } = action;
+    let org = org(client, args).await?;
+    let params: AuditParams = from_json(
+        serde_json::json!({
+            "since": since, "until": until, "actor": actor, "method": method, "route": route,
+            "limit": limit, "after": after,
+        }),
+        "журнал аудита",
+    )?;
+    let page: AuditPage = client
+        .call(AUDIT_SEARCH, &[&org], &query(&params)?, NO_BODY)
+        .await?;
+    let rows: Vec<Vec<String>> = page
+        .entries
+        .iter()
+        .map(|e| {
+            let r = &e.record;
+            vec![
+                e.seq.to_string(),
+                json_field(r, "at"),
+                r.actor_login.clone(),
+                r.method.clone(),
+                r.route.clone(),
+                r.status.to_string(),
+            ]
+        })
+        .collect();
+    let mut text = table(
+        &[
+            "НОМЕР",
+            "МОМЕНТ",
+            "АДМИНИСТРАТОР",
+            "МЕТОД",
+            "МАРШРУТ",
+            "КОД",
+        ],
+        &rows,
+    );
+    if let Some(next) = page.next {
+        text.push_str(&format!(
+            "Есть ещё. Следующая страница: те же условия и --after {next}\n"
+        ));
+    }
+    out(args, &page, text)
+}
+
+/// `thepost admin delivery search`: одна страница; продолжение — подсказкой `--after`.
+async fn delivery_command(
+    client: &Client,
+    args: &ApiArgs,
+    action: DeliveryAction,
+) -> CliResult<String> {
+    let DeliveryAction::Search {
+        sender,
+        recipient,
+        message_id,
+        since,
+        until,
+        limit,
+        after,
+    } = action;
+    let org = org(client, args).await?;
+    let params: DeliveryParams = from_json(
+        serde_json::json!({
+            "sender": sender, "recipient": recipient, "message_id": message_id, "since": since,
+            "until": until, "limit": limit, "after": after,
+        }),
+        "журнал доставки",
+    )?;
+    let page: DeliveryResults = client
+        .call(DELIVERY_SEARCH, &[&org], &query(&params)?, NO_BODY)
+        .await?;
+    let rows: Vec<Vec<String>> = page
+        .events
+        .iter()
+        .map(|e| {
+            vec![
+                json_field(e, "at"),
+                json_field(e, "kind"),
+                or_dash(&e.sender),
+                e.recipients.join(", "),
+                json_field(e, "decision"),
+                optional(e.reason.as_ref()),
+            ]
+        })
+        .collect();
+    let mut text = table(
+        &[
+            "МОМЕНТ",
+            "СОБЫТИЕ",
+            "ОТПРАВИТЕЛЬ",
+            "ПОЛУЧАТЕЛИ",
+            "РЕШЕНИЕ",
+            "ПРИЧИНА",
+        ],
+        &rows,
+    );
+    if let Some(next) = &page.next {
+        text.push_str(&format!(
+            "Есть ещё. Следующая страница: те же условия и --after {next}\n"
+        ));
+    }
+    out(args, &page, text)
+}
+
+/// Структура запроса tp-admin из значений ключей CLI: разбор и проверка — её serde (время — RFC 3339).
+fn from_json<T: DeserializeOwned>(v: serde_json::Value, what: &str) -> CliResult<T> {
+    serde_json::from_value(v)
+        .map_err(|e| format!("{what}: {e} (время — RFC 3339, например 2026-12-01T00:00:00Z)"))
+}
+
+/// `thepost admin transport domain …`.
+async fn domain_command(
+    client: &Client,
+    args: &ApiArgs,
+    org: &str,
+    action: DomainAction,
+) -> CliResult<String> {
+    match action {
+        DomainAction::List => {
+            let list = domains(client, org).await?;
+            let rows: Vec<Vec<String>> = list.domains.iter().map(domain_row).collect();
+            let text = format!(
+                "{}Версия снимка: {}\n",
+                table(DOMAIN_COLUMNS, &rows),
+                list.version
+            );
+            out(args, &list, text)
+        }
+        DomainAction::Create { name, relay } => {
+            let version = domains(client, org).await?.version;
+            let kind = match relay {
+                Some(next_hop) => DomainKind::InternalRelay { next_hop },
+                None => DomainKind::Authoritative,
+            };
+            let body = DomainBody {
+                version,
+                name,
+                kind,
+            };
+            let w: DomainWritten = client.call(DOMAIN_CREATE, &[org], &[], Some(&body)).await?;
+            let fields: Vec<(&str, String)> = DOMAIN_COLUMNS
+                .iter()
+                .copied()
+                .zip(domain_row(&w.domain))
+                .collect();
+            let text = format!("{}Версия снимка: {}\n", record(&fields), w.version);
+            out(args, &w, text)
+        }
+        DomainAction::Delete { domain } => {
+            let list = domains(client, org).await?;
+            let id = find_domain(&list, &domain)?;
+            let query = query(&VersionQuery {
+                version: list.version,
+            })?;
+            let w: Written = client
+                .call(DOMAIN_DELETE, &[org, &id], &query, NO_BODY)
+                .await?;
+            let text = format!("Домен {domain} удалён. Версия снимка: {}\n", w.version);
+            out(args, &w, text)
+        }
+    }
+}
+
+/// Идентификатор принятого домена в `list`: UUID как есть, иначе по имени (без учёта регистра).
+fn find_domain(list: &DomainList, domain: &str) -> CliResult<String> {
+    if domain.parse::<DomainId>().is_ok() {
+        return Ok(domain.to_owned());
+    }
+    let name = domain.trim_end_matches('.');
+    list.domains
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(name))
+        .map(|d| d.id.to_string())
+        .ok_or_else(|| format!("принятый домен {domain} не найден"))
+}
+
+/// Идентификатор принятого домена организации по идентификатору или имени.
+async fn domain_id(client: &Client, org: &str, domain: &str) -> CliResult<String> {
+    if domain.parse::<DomainId>().is_ok() {
+        return Ok(domain.to_owned());
+    }
+    find_domain(&domains(client, org).await?, domain)
+}
+
+const SOURCE_COLUMNS: &[&str] = &["ИМЯ", "ОТКУДА", "ВИД"];
+
+/// `thepost admin transport source …`.
+async fn source_command(
+    client: &Client,
+    args: &ApiArgs,
+    org: &str,
+    action: SourceAction,
+) -> CliResult<String> {
+    let sources = move || async move {
+        client
+            .call::<(), SourceList>(SOURCE_LIST, &[org], &[], NO_BODY)
+            .await
+    };
+    match action {
+        SourceAction::List => {
+            let list = sources().await?;
+            let rows: Vec<Vec<String>> = list.sources.iter().map(source_row).collect();
+            let text = format!(
+                "{}Версия снимка: {}\n",
+                table(SOURCE_COLUMNS, &rows),
+                list.version
+            );
+            out(args, &list, text)
+        }
+        SourceAction::Set {
+            name,
+            networks,
+            client_cert,
+            application,
+            senders,
+            external,
+            xclient,
+            authserv_id,
+        } => {
+            let matcher = match client_cert {
+                Some(subject) => serde_json::json!({ "client_cert": { "subject": subject } }),
+                None => serde_json::json!({ "networks": networks }),
+            };
+            let kind = if application {
+                serde_json::json!({ "application": { "senders": senders, "external": external } })
+            } else {
+                serde_json::json!({ "gateway": { "xclient": xclient, "authserv_id": authserv_id } })
+            };
+            let version = sources().await?.version;
+            let body: SourceBody = from_json(
+                serde_json::json!({ "version": version, "matcher": matcher, "kind": kind }),
+                "источник",
+            )?;
+            let w: Written = client
+                .call(SOURCE_PUT, &[org, &name], &[], Some(&body))
+                .await?;
+            let text = format!("Источник {name} записан. Версия снимка: {}\n", w.version);
+            out(args, &w, text)
+        }
+        SourceAction::Delete { name } => {
+            let query = query(&VersionQuery {
+                version: sources().await?.version,
+            })?;
+            let w: Written = client
+                .call(SOURCE_DELETE, &[org, &name], &query, NO_BODY)
+                .await?;
+            let text = format!("Источник {name} удалён. Версия снимка: {}\n", w.version);
+            out(args, &w, text)
+        }
+    }
+}
+
+/// Доверенный источник — строка таблицы [`SOURCE_COLUMNS`].
+fn source_row(s: &TrustedSource) -> Vec<String> {
+    let join = |items: Vec<String>| items.join(", ");
+    let matcher = match &s.matcher {
+        SourceMatch::Networks(nets) => join(nets.iter().map(ToString::to_string).collect()),
+        SourceMatch::ClientCert { subject } => format!("сертификат {subject}"),
+    };
+    let kind = match &s.kind {
+        SourceKind::Gateway {
+            xclient,
+            authserv_id,
+        } => {
+            let mut k = "шлюз".to_owned();
+            if *xclient {
+                k.push_str(", XCLIENT");
+            }
+            if let Some(id) = authserv_id {
+                k.push_str(&format!(", authserv-id {id}"));
+            }
+            k
+        }
+        SourceKind::Application { senders, external } => format!(
+            "приложение: {}{}",
+            join(senders.iter().map(ToString::to_string).collect()),
+            if *external {
+                ", внешние получатели"
+            } else {
+                ""
+            }
+        ),
+    };
+    vec![s.name.clone(), matcher, kind]
+}
+
+const ROUTE_COLUMNS: &[&str] = &["ШАБЛОН", "TLS", "SMART HOST", "ИСХОДЯЩИЙ IP"];
+
+/// `thepost admin transport route …`.
+async fn route_command(
+    client: &Client,
+    args: &ApiArgs,
+    org: &str,
+    action: RouteAction,
+) -> CliResult<String> {
+    let routes = move || async move {
+        client
+            .call::<(), RouteList>(ROUTE_LIST, &[org], &[], NO_BODY)
+            .await
+    };
+    match action {
+        RouteAction::List => {
+            let list = routes().await?;
+            let rows: Vec<Vec<String>> = list.routes.iter().map(route_row).collect();
+            let text = format!(
+                "{}Версия снимка: {}\n",
+                table(ROUTE_COLUMNS, &rows),
+                list.version
+            );
+            out(args, &list, text)
+        }
+        RouteAction::Set {
+            pattern,
+            tls,
+            pins,
+            smart_host,
+            egress_ip,
+        } => {
+            let tls = match (tls, pins.is_empty()) {
+                (_, false) => TlsRequirement::Pinned { spki_sha256: pins },
+                (TlsMode::Opportunistic, true) => TlsRequirement::Opportunistic,
+                (TlsMode::Required, true) => TlsRequirement::Required,
+            };
+            let egress_ip = egress_ip
+                .map(|ip| {
+                    ip.parse::<IpAddr>()
+                        .map_err(|e| format!("--egress-ip {ip}: {e}"))
+                })
+                .transpose()?;
+            let body = RouteBody {
+                version: routes().await?.version,
+                tls,
+                smart_host,
+                egress_ip,
+            };
+            let w: Written = client
+                .call(ROUTE_PUT, &[org, &pattern], &[], Some(&body))
+                .await?;
+            let text = format!(
+                "Политика {pattern} записана. Версия снимка: {}\n",
+                w.version
+            );
+            out(args, &w, text)
+        }
+        RouteAction::Delete { pattern } => {
+            let query = query(&VersionQuery {
+                version: routes().await?.version,
+            })?;
+            let w: Written = client
+                .call(ROUTE_DELETE, &[org, &pattern], &query, NO_BODY)
+                .await?;
+            let text = format!("Политика {pattern} удалена. Версия снимка: {}\n", w.version);
+            out(args, &w, text)
+        }
+    }
+}
+
+/// Политика домена назначения — строка таблицы [`ROUTE_COLUMNS`].
+fn route_row(r: &DestinationPolicy) -> Vec<String> {
+    let tls = match &r.tls {
+        TlsRequirement::Opportunistic => "opportunistic".to_owned(),
+        TlsRequirement::Required => "required".to_owned(),
+        TlsRequirement::Pinned { spki_sha256 } => format!("pinned: {}", spki_sha256.join(", ")),
+    };
+    vec![
+        r.pattern.clone(),
+        tls,
+        optional(r.smart_host.as_ref()),
+        optional(r.egress_ip.as_ref()),
+    ]
 }
 
 /// Параметры `vacation set`: `None` — поле без изменений, `-` — сброс (`from`, `to`, `subject`).
@@ -1229,8 +2405,8 @@ async fn patch_account(
         .await
 }
 
-/// Текст скрипта из файла `file` (`-` — stdin); чтение — вне потоков async.
-async fn script_text(file: PathBuf) -> CliResult<String> {
+/// Текст из файла `file` (`-` — stdin); чтение — вне потоков async.
+async fn input_text(file: PathBuf) -> CliResult<String> {
     tokio::task::spawn_blocking(move || {
         if file.as_os_str() == "-" {
             std::io::read_to_string(std::io::stdin()).map_err(|e| format!("stdin: {e}"))
@@ -1350,12 +2526,14 @@ async fn list_accounts(
     client: &Client,
     org: &str,
     prefix: Option<String>,
+    after: Option<String>,
     limit: Option<usize>,
 ) -> CliResult<(Vec<AccountInfo>, bool)> {
     let mut query = query(&AccountQuery {
         prefix,
+        after,
         limit,
-        ..AccountQuery::default()
+        login: None,
     })?;
     let mut out = Vec::new();
     loop {
@@ -1509,34 +2687,48 @@ mod tests {
             panic!("{:?}", cli.command)
         };
         assert!(api.json);
+        let AdminAction::Api(ApiAction::Account { action }) = action else {
+            panic!("{action:?}")
+        };
         assert!(matches!(
-            action,
-            AdminAction::Api(ApiAction::Account {
-                action: AccountAction::Create { ref login, name: Some(_) }
-            }) if login == "a@b.test"
+            *action,
+            AccountAction::Create { ref login, name: Some(_) } if login == "a@b.test"
         ));
         let cli = Cli::try_parse_from([
             "thepost",
             "admin",
             "--url",
             "https://127.0.0.1:8443",
+            "transport",
             "domain",
-            "add",
+            "create",
             "b.test",
             "--org",
             "00000000-0000-0000-0000-000000000001",
         ])
-        .expect("domain add");
+        .expect("transport domain create");
         let Command::Admin { api, action } = cli.command else {
             panic!("{:?}", cli.command)
         };
         assert_eq!(api.url.as_deref(), Some("https://127.0.0.1:8443"));
         assert!(api.org.is_some());
+        let AdminAction::Api(ApiAction::Transport { action }) = action else {
+            panic!("{action:?}")
+        };
         assert!(matches!(
-            action,
-            AdminAction::Api(ApiAction::Domain {
-                action: DomainAction::Add { relay: None, .. }
-            })
+            *action,
+            TransportAction::Domain {
+                action: DomainAction::Create { relay: None, .. }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["thepost", "admin", "login", "--oidc"]).expect("login --oidc");
+        assert!(matches!(
+            cli.command,
+            Command::Admin {
+                action: AdminAction::Api(ApiAction::Login { oidc: true }),
+                ..
+            }
         ));
         for args in [
             &["thepost", "admin", "login"][..],
@@ -1558,7 +2750,168 @@ mod tests {
                 "a@b.test",
                 "id1",
             ],
-            &["thepost", "admin", "domain", "list"],
+            &["thepost", "admin", "transport", "domain", "list"],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "domain",
+                "delete",
+                "b.test",
+            ],
+            &["thepost", "admin", "transport", "source", "list"],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "source",
+                "set",
+                "gw",
+                "--network",
+                "192.0.2.0/24",
+                "--network",
+                "2001:db8::/32",
+                "--xclient",
+                "--authserv-id",
+                "mx.b.test",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "source",
+                "set",
+                "mfu",
+                "--client-cert",
+                "mfu.b.test",
+                "--application",
+                "--sender",
+                "@b.test",
+                "--external",
+            ],
+            &["thepost", "admin", "transport", "source", "delete", "gw"],
+            &["thepost", "admin", "transport", "route", "list"],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "route",
+                "set",
+                "*.b.test",
+                "--tls",
+                "required",
+                "--smart-host",
+                "relay.b.test:587",
+                "--egress-ip",
+                "192.0.2.1",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "route",
+                "set",
+                "*",
+                "--pin",
+                "ab",
+                "--pin",
+                "cd",
+            ],
+            &["thepost", "admin", "transport", "route", "delete", "*"],
+            &["thepost", "admin", "policy", "get"],
+            &["thepost", "admin", "policy", "get", "--domain", "b.test"],
+            &[
+                "thepost",
+                "admin",
+                "policy",
+                "set",
+                "--account",
+                "a@b.test",
+                "--file",
+                "-",
+            ],
+            &["thepost", "admin", "group", "list"],
+            &["thepost", "admin", "group", "get", "Отдел"],
+            &[
+                "thepost",
+                "admin",
+                "group",
+                "create",
+                "Отдел",
+                "--address",
+                "o@b.test",
+                "--account",
+                "a@b.test",
+                "--group",
+                "Вложенная",
+            ],
+            &["thepost", "admin", "group", "delete", "Отдел"],
+            &["thepost", "admin", "group", "members", "Отдел"],
+            &["thepost", "admin", "group", "members", "Отдел", "--set"],
+            &[
+                "thepost",
+                "admin",
+                "group",
+                "members",
+                "Отдел",
+                "--set",
+                "--account",
+                "a@b.test",
+            ],
+            &["thepost", "admin", "trash", "list", "a@b.test"],
+            &[
+                "thepost",
+                "admin",
+                "trash",
+                "list",
+                "a@b.test",
+                "--hidden",
+                "--subject",
+                "--offset",
+                "2",
+                "--limit",
+                "2",
+            ],
+            &[
+                "thepost", "admin", "trash", "restore", "a@b.test", "m1", "--hidden",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "audit",
+                "search",
+                "--since",
+                "2026-12-01T00:00:00Z",
+                "--actor",
+                "a@b.test",
+                "--method",
+                "put",
+                "--route",
+                "/api/v1/orgs/{org}/transport",
+                "--after",
+                "3",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "delivery",
+                "search",
+                "--sender",
+                "a@b.test",
+                "--recipient",
+                "c@d.test",
+                "--message-id",
+                "x@b.test",
+                "--until",
+                "2026-12-01T00:00:00Z",
+                "--after",
+                "p",
+                "--limit",
+                "5",
+            ],
+            &[
+                "thepost", "admin", "account", "list", "--after", "a@b.test", "--limit", "2",
+            ],
             &["thepost", "admin", "sieve", "list", "a@b.test"],
             &["thepost", "admin", "sieve", "get", "a@b.test", "main"],
             &[
@@ -1626,6 +2979,92 @@ mod tests {
                 "-",
             ],
             &["thepost", "admin", "account", "rename", "a@b.test"],
+            &[
+                "thepost", "admin", "account", "list", "--login", "a@b.test", "--after", "a@b.test",
+            ],
+            &["thepost", "admin", "domain", "list"],
+            &["thepost", "admin", "transport", "domain", "add", "b.test"],
+            &["thepost", "admin", "transport", "source", "set", "gw"],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "source",
+                "set",
+                "gw",
+                "--network",
+                "192.0.2.0/24",
+                "--client-cert",
+                "mfu.b.test",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "source",
+                "set",
+                "gw",
+                "--network",
+                "192.0.2.0/24",
+                "--sender",
+                "@b.test",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "source",
+                "set",
+                "gw",
+                "--network",
+                "192.0.2.0/24",
+                "--application",
+                "--xclient",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "route",
+                "set",
+                "*",
+                "--tls",
+                "required",
+                "--pin",
+                "ab",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "transport",
+                "route",
+                "set",
+                "*",
+                "--tls",
+                "never",
+            ],
+            &[
+                "thepost",
+                "admin",
+                "policy",
+                "get",
+                "--domain",
+                "b.test",
+                "--account",
+                "a@b.test",
+            ],
+            &["thepost", "admin", "policy", "set"],
+            &[
+                "thepost",
+                "admin",
+                "group",
+                "members",
+                "Отдел",
+                "--account",
+                "a@b.test",
+            ],
+            &["thepost", "admin", "trash", "restore", "a@b.test"],
+            &["thepost", "admin", "audit", "search", "--after", "x"],
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
         }
@@ -1648,7 +3087,7 @@ mod tests {
     fn url_from_config_yaml() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.yaml");
-        let base = "domain: example.test\nprofile: dev\nroles: [admin]\nservice_http:\n  allow_plaintext: true\ndatabase:\n  url: postgres://thepost@db/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\nblob:\n  url: file:///var/lib/thepost/blob\n";
+        let base = DEV_CONFIG;
         std::fs::write(
             &path,
             format!(
@@ -1865,6 +3304,31 @@ mod tests {
             .collect()
     }
 
+    /// `account …`.
+    fn account_action(action: AccountAction) -> ApiAction {
+        ApiAction::Account {
+            action: Box::new(action),
+        }
+    }
+
+    /// `group …`.
+    fn group_action(action: GroupAction) -> ApiAction {
+        ApiAction::Group {
+            action: Box::new(action),
+        }
+    }
+
+    /// `transport domain …`.
+    fn domain_action(action: DomainAction) -> ApiAction {
+        transport(TransportAction::Domain { action })
+    }
+
+    fn transport(action: TransportAction) -> ApiAction {
+        ApiAction::Transport {
+            action: Box::new(action),
+        }
+    }
+
     fn client(url: &Url, token: &str) -> Client {
         Client::new(url.clone(), token.to_owned(), &ApiArgs::default()).expect("client")
     }
@@ -1882,9 +3346,10 @@ mod tests {
         let action = AccountAction::List {
             login: None,
             prefix: prefix.map(str::to_owned),
+            after: None,
             limit,
         };
-        let json = exec(c, true, ApiAction::Account { action })
+        let json = exec(c, true, account_action(action))
             .await
             .expect("account list");
         let v: Value = serde_json::from_str(&json).expect("json");
@@ -1911,12 +3376,15 @@ mod tests {
 
         // Обмен одноразового токена: сессия один раз, повтор — 401 с подсказкой.
         let local = client(&url, &granted.token);
-        let session: Value =
-            serde_json::from_str(&exec(&local, true, ApiAction::Login).await.expect("login"))
-                .expect("json");
+        let session: Value = serde_json::from_str(
+            &exec(&local, true, ApiAction::Login { oidc: false })
+                .await
+                .expect("login"),
+        )
+        .expect("json");
         let session = session["session"].as_str().expect("session").to_owned();
         assert!(session.starts_with("tps_"), "{session}");
-        let err = exec(&local, false, ApiAction::Login)
+        let err = exec(&local, false, ApiAction::Login { oidc: false })
             .await
             .expect_err("повтор");
         assert!(err.contains("401") && err.contains("одноразовый"), "{err}");
@@ -1929,28 +3397,20 @@ mod tests {
         );
 
         // Домен admin init уже принят; добавление второго.
-        let domains = exec(
-            &s,
-            false,
-            ApiAction::Domain {
-                action: DomainAction::List,
-            },
-        )
-        .await
-        .expect("domains");
+        let domains = exec(&s, false, domain_action(DomainAction::List))
+            .await
+            .expect("domains");
         assert!(domains.contains("example.test"), "{domains}");
         let added = exec(
             &s,
             true,
-            ApiAction::Domain {
-                action: DomainAction::Add {
-                    name: "Second.Test".into(),
-                    relay: None,
-                },
-            },
+            domain_action(DomainAction::Create {
+                name: "Second.Test".into(),
+                relay: None,
+            }),
         )
         .await
-        .expect("domain add");
+        .expect("transport domain create");
         let added: Value = serde_json::from_str(&added).expect("json");
         assert_eq!(added["domain"]["name"], "second.test");
 
@@ -1958,12 +3418,10 @@ mod tests {
         let created = exec(
             &s,
             false,
-            ApiAction::Account {
-                action: AccountAction::Create {
-                    login: "a@second.test".into(),
-                    name: Some("Анна".into()),
-                },
-            },
+            account_action(AccountAction::Create {
+                login: "a@second.test".into(),
+                name: Some("Анна".into()),
+            }),
         )
         .await
         .expect("account create");
@@ -1974,12 +3432,10 @@ mod tests {
         let dup = exec(
             &s,
             false,
-            ApiAction::Account {
-                action: AccountAction::Create {
-                    login: "a@second.test".into(),
-                    name: None,
-                },
-            },
+            account_action(AccountAction::Create {
+                login: "a@second.test".into(),
+                name: None,
+            }),
         )
         .await
         .expect_err("занято");
@@ -1987,13 +3443,12 @@ mod tests {
         let listed = exec(
             &s,
             false,
-            ApiAction::Account {
-                action: AccountAction::List {
-                    login: Some("A@second.test".into()),
-                    prefix: None,
-                    limit: None,
-                },
-            },
+            account_action(AccountAction::List {
+                login: Some("A@second.test".into()),
+                prefix: None,
+                after: None,
+                limit: None,
+            }),
         )
         .await
         .expect("account list");
@@ -2005,7 +3460,7 @@ mod tests {
                 login: login.into(),
                 name: None,
             };
-            exec(&s, false, ApiAction::Account { action })
+            exec(&s, false, account_action(action))
                 .await
                 .expect("account create");
         }
@@ -2029,13 +3484,12 @@ mod tests {
         let text = exec(
             &s,
             false,
-            ApiAction::Account {
-                action: AccountAction::List {
-                    login: None,
-                    prefix: None,
-                    limit: Some(3),
-                },
-            },
+            account_action(AccountAction::List {
+                login: None,
+                prefix: None,
+                after: None,
+                limit: Some(3),
+            }),
         )
         .await
         .expect("limit text");
@@ -2044,13 +3498,12 @@ mod tests {
         let text = exec(
             &s,
             false,
-            ApiAction::Account {
-                action: AccountAction::List {
-                    login: None,
-                    prefix: Some("c".into()),
-                    limit: None,
-                },
-            },
+            account_action(AccountAction::List {
+                login: None,
+                prefix: Some("c".into()),
+                after: None,
+                limit: None,
+            }),
         )
         .await
         .expect("prefix text");
@@ -2103,11 +3556,9 @@ mod tests {
         let missing = exec(
             &s,
             false,
-            ApiAction::Account {
-                action: AccountAction::Get {
-                    account: "nobody@second.test".into(),
-                },
-            },
+            account_action(AccountAction::Get {
+                account: "nobody@second.test".into(),
+            }),
         )
         .await
         .expect_err("нет записи");
@@ -2127,15 +3578,13 @@ mod tests {
         let third = exec(
             &s,
             true,
-            ApiAction::Domain {
-                action: DomainAction::Add {
-                    name: "third.test".into(),
-                    relay: Some("mx.third.test:25".into()),
-                },
-            },
+            domain_action(DomainAction::Create {
+                name: "third.test".into(),
+                relay: Some("mx.third.test:25".into()),
+            }),
         )
         .await
-        .expect("domain add relay");
+        .expect("transport domain create relay");
         let third: Value = serde_json::from_str(&third).expect("json");
         assert!(
             third["domain"]["kind"]["internal_relay"].is_object(),
@@ -2148,22 +3597,14 @@ mod tests {
         let removed = exec(
             &s,
             false,
-            ApiAction::Domain {
-                action: DomainAction::Remove { id },
-            },
+            domain_action(DomainAction::Delete { domain: id }),
         )
         .await
-        .expect("domain remove");
+        .expect("transport domain delete");
         assert!(removed.contains("удалён"), "{removed}");
-        let domains = exec(
-            &s,
-            false,
-            ApiAction::Domain {
-                action: DomainAction::List,
-            },
-        )
-        .await
-        .expect("domains");
+        let domains = exec(&s, false, domain_action(DomainAction::List))
+            .await
+            .expect("domains");
         assert!(!domains.contains("third.test"), "{domains}");
     }
 
@@ -2177,18 +3618,14 @@ mod tests {
         let account = || "a@rules.test".to_owned();
         let name = || "пересылка".to_owned();
         for action in [
-            ApiAction::Domain {
-                action: DomainAction::Add {
-                    name: "rules.test".into(),
-                    relay: None,
-                },
-            },
-            ApiAction::Account {
-                action: AccountAction::Create {
-                    login: account(),
-                    name: None,
-                },
-            },
+            domain_action(DomainAction::Create {
+                name: "rules.test".into(),
+                relay: None,
+            }),
+            account_action(AccountAction::Create {
+                login: account(),
+                name: None,
+            }),
         ] {
             exec(&c, false, action).await.expect("подготовка");
         }
@@ -2427,14 +3864,12 @@ mod tests {
         let (_admin, url) = admin_api().await;
         let c = client(&url, "oidc");
         let login = || "a@block.test".to_owned();
-        let account = |action| ApiAction::Account { action };
+        let account = account_action;
         for action in [
-            ApiAction::Domain {
-                action: DomainAction::Add {
-                    name: "block.test".into(),
-                    relay: None,
-                },
-            },
+            domain_action(DomainAction::Create {
+                name: "block.test".into(),
+                relay: None,
+            }),
             account(AccountAction::Create {
                 login: login(),
                 name: None,
@@ -2471,5 +3906,503 @@ mod tests {
             account: "нет@block.test".into(),
         });
         assert!(exec(&c, false, missing).await.is_err());
+    }
+
+    /// `--after` из подсказки вывода (`… --after <имя входа>`); нет подсказки — `None`.
+    fn after_hint(text: &str) -> Option<String> {
+        text.split("--after ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_owned)
+    }
+
+    /// ADM-37: `account list --after` с подсказки предыдущей страницы — все записи по порядку без пропусков и
+    /// повторов; подсказка сохраняет `--prefix`.
+    #[tokio::test]
+    async fn account_list_after_pages() {
+        let (_admin, url) = admin_api().await;
+        let c = client(&url, "oidc");
+        let domain = DomainAction::Create {
+            name: "page.test".into(),
+            relay: None,
+        };
+        exec(&c, false, domain_action(domain))
+            .await
+            .expect("domain");
+        let logins: Vec<String> = (1..=5).map(|i| format!("u{i}@page.test")).collect();
+        for login in logins.iter().rev() {
+            let action = AccountAction::Create {
+                login: login.clone(),
+                name: None,
+            };
+            exec(&c, false, account_action(action))
+                .await
+                .expect("account create");
+        }
+        let list = |after: Option<String>| {
+            account_action(AccountAction::List {
+                login: None,
+                prefix: Some("u".into()),
+                after,
+                limit: Some(2),
+            })
+        };
+        let mut seen = Vec::new();
+        let mut after = None;
+        for _ in 0..logins.len() {
+            let page: Value = serde_json::from_str(
+                &exec(&c, true, list(after.clone()))
+                    .await
+                    .expect("page json"),
+            )
+            .expect("json");
+            seen.extend(
+                page.as_array()
+                    .expect("array")
+                    .iter()
+                    .map(|a| a["login"].as_str().expect("login").to_owned()),
+            );
+            let text = exec(&c, false, list(after.clone())).await.expect("page");
+            after = after_hint(&text);
+            match &after {
+                Some(next) => {
+                    assert!(text.contains("--prefix u"), "{text}");
+                    assert_eq!(seen.last(), Some(next), "{text}");
+                }
+                None => break,
+            }
+        }
+        assert_eq!(after, None, "последняя страница без подсказки");
+        assert_eq!(seen, logins);
+    }
+
+    /// Начало config.yaml профиля dev без внешних секретов.
+    const DEV_CONFIG: &str = "domain: example.test\nprofile: dev\nroles: [admin]\nservice_http:\n  allow_plaintext: true\ndatabase:\n  url: postgres://thepost@db/thepost?sslmode=disable\n  tls: { allow_plaintext: true }\nblob:\n  url: file:///var/lib/thepost/blob\n";
+
+    /// ADM-39: `login --oidc` — вход с устройства у поставщика `auth.oidc` (заглушка RFC 8628): код устройства,
+    /// затем токен (код возврата 0); без `cli.oidc.client_id` — отказ без запроса токена.
+    #[tokio::test]
+    async fn login_oidc_gets_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let issuer = format!("http://{}", listener.local_addr().expect("addr"));
+        let doc = json!({
+            "issuer": issuer,
+            "device_authorization_endpoint": format!("{issuer}/device"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+        });
+        let device = json!({
+            "device_code": "dev-1",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://sso.example.test/device",
+            "expires_in": 600,
+            "interval": 0,
+        });
+        let counter = polls.clone();
+        let router = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || async move { Json(doc) }),
+            )
+            .route("/device", post(move || async move { Json(device) }))
+            .route(
+                "/token",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "access_token": "at-1", "token_type": "Bearer" }))
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        let config = |cli: &str| {
+            format!(
+                "{DEV_CONFIG}http:\n  admin: {{ listen: \"127.0.0.1:9443\", allow_plaintext: true }}\n\
+                 auth:\n  oidc:\n    issuer: \"{issuer}\"\n    audience: [thepost]\n    \
+                 tls: {{ allow_plaintext: true }}\n{cli}"
+            )
+        };
+        let login = || ApiAction::Login { oidc: true };
+        std::fs::write(&path, config("cli:\n  oidc:\n    client_id: thepost-cli\n"))
+            .expect("write");
+        assert_eq!(command(&path, ApiArgs::default(), login()).await, 0);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        std::fs::write(&path, config("")).expect("write");
+        assert_eq!(command(&path, ApiArgs::default(), login()).await, 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn login_help_explains_oidc() {
+        use clap::CommandFactory;
+
+        let mut cmd = crate::cli::Cli::command();
+        let mut cmd = &mut cmd;
+        for name in ["admin", "login"] {
+            cmd = cmd.find_subcommand_mut(name).expect(name);
+        }
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            help.contains("--oidc") && help.contains("RFC 8628") && help.contains(ENV_TOKEN),
+            "{help}"
+        );
+    }
+
+    /// ADM-38: политики, группы, корзина, журнал аудита, журнал доставки, источники и маршруты транспорта —
+    /// каждая команда против роутера tp-admin.
+    #[tokio::test]
+    async fn resource_commands_against_admin_api() {
+        let (_admin, url) = admin_api().await;
+        let c = client(&url, "oidc");
+        let a = || "a@res.test".to_owned();
+        let b = || "b@res.test".to_owned();
+        let domain = DomainAction::Create {
+            name: "res.test".into(),
+            relay: None,
+        };
+        exec(&c, false, domain_action(domain))
+            .await
+            .expect("domain");
+        for login in [a(), b()] {
+            let action = AccountAction::Create { login, name: None };
+            exec(&c, false, account_action(action))
+                .await
+                .expect("account");
+        }
+        let json = |out: CliResult<String>| -> Value {
+            serde_json::from_str(&out.expect("ответ")).expect("json")
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).expect("write");
+            path
+        };
+
+        // Политика: организация, ящик, домен; действующее значение наследуется сверху.
+        let policy = |action| ApiAction::Policy {
+            action: Box::new(action),
+        };
+        let level = |domain: Option<&str>, account: Option<String>| PolicyLevel {
+            domain: domain.map(str::to_owned),
+            account,
+        };
+        let file = write(
+            "org.json",
+            r#"{"quota_bytes": 1000, "trash_retention": "30d"}"#,
+        );
+        let set = PolicyAction::Set {
+            level: level(None, None),
+            file,
+        };
+        assert_eq!(json(exec(&c, true, policy(set)).await)["quota_bytes"], 1000);
+        let set = PolicyAction::Set {
+            level: level(None, Some(a())),
+            file: write("account.json", r#"{"send_per_hour": 5}"#),
+        };
+        exec(&c, false, policy(set)).await.expect("account policy");
+        let get = |l| policy(PolicyAction::Get { level: l });
+        let got = json(exec(&c, true, get(level(None, Some(a())))).await);
+        assert_eq!(got["policy"]["send_per_hour"], 5);
+        assert_eq!(got["policy"]["quota_bytes"], Value::Null);
+        assert_eq!(got["effective"]["quota_bytes"], 1000);
+        let text = exec(&c, false, get(level(None, None)))
+            .await
+            .expect("org policy");
+        assert!(
+            text.contains("ДЕЙСТВУЕТ")
+                && text
+                    .lines()
+                    .any(|l| l.starts_with("quota_bytes") && l.contains("1000")),
+            "{text}"
+        );
+        let got = json(exec(&c, true, get(level(Some("RES.test"), None))).await);
+        assert_eq!(got["policy"]["trash_retention"], Value::Null);
+        assert!(got["effective"]["trash_retention"].is_string(), "{got}");
+        let set = PolicyAction::Set {
+            level: level(None, None),
+            file: write("bad.json", r#"{"quota": 1}"#),
+        };
+        let err = exec(&c, false, policy(set)).await.expect_err("поле");
+        assert!(err.contains("quota"), "{err}");
+
+        // Группы: создание с участником, список, чтение по адресу, замена участников, удаление.
+        let group = group_action;
+        let create = GroupAction::Create {
+            name: "Отдел".into(),
+            address: Some("otdel@res.test".into()),
+            accounts: vec![a()],
+            groups: vec![],
+        };
+        let created = json(exec(&c, true, group(create)).await);
+        let a_id = created["members"][0]["account"]
+            .as_str()
+            .expect("account")
+            .to_owned();
+        assert_eq!(created["names"][a_id.as_str()], "a@res.test");
+        let listed = exec(&c, false, group(GroupAction::List))
+            .await
+            .expect("group list");
+        assert!(
+            listed.contains("Отдел") && listed.contains("otdel@res.test"),
+            "{listed}"
+        );
+        let shown = exec(
+            &c,
+            false,
+            group(GroupAction::Get {
+                group: "OTDEL@res.test".into(),
+            }),
+        )
+        .await
+        .expect("group get");
+        assert!(
+            shown.contains("a@res.test") && shown.contains("anyone"),
+            "{shown}"
+        );
+        let members = |set, accounts| {
+            group(GroupAction::Members {
+                group: "отдел".into(),
+                set,
+                accounts,
+                groups: vec![],
+            })
+        };
+        let replaced = json(exec(&c, true, members(true, vec![b()])).await);
+        assert_eq!(replaced.as_array().map(Vec::len), Some(1), "{replaced}");
+        let shown = exec(&c, false, members(false, vec![]))
+            .await
+            .expect("members");
+        assert!(
+            shown.contains("b@res.test") && !shown.contains("a@res.test"),
+            "{shown}"
+        );
+        let delete = GroupAction::Delete {
+            group: "Отдел".into(),
+        };
+        exec(&c, false, group(delete)).await.expect("group delete");
+        let get = GroupAction::Get {
+            group: "Отдел".into(),
+        };
+        let err = exec(&c, false, group(get)).await.expect_err("нет группы");
+        assert!(err.contains("не найдена"), "{err}");
+
+        // Корзина: пустая видимая и скрытая, срок — действующий; восстановление чужого письма — отказ узла.
+        let trash = |action| ApiAction::Trash { action };
+        for hidden in [false, true] {
+            let list = TrashAction::List {
+                account: a(),
+                hidden,
+                subject: true,
+                offset: 0,
+                limit: None,
+            };
+            let text = exec(&c, false, trash(list)).await.expect("trash list");
+            assert!(
+                text.starts_with("нет записей")
+                    && text.contains("Срок корзины:")
+                    && !text.contains("по умолчанию"),
+                "{text}"
+            );
+        }
+        for (hidden, path) in [
+            (false, "/trash/{message}/restore: 4"),
+            (true, "/trash/hidden/{message}/restore: 404"),
+        ] {
+            let restore = TrashAction::Restore {
+                account: a(),
+                message: tp_contracts::MessageId::new().to_string(),
+                hidden,
+            };
+            let err = exec(&c, false, trash(restore))
+                .await
+                .expect_err("нет письма");
+            assert!(err.contains(path), "{err}");
+        }
+
+        // Журнал аудита: записи политик (PUT) по одной на страницу через подсказку --after, без повторов.
+        let audit = |since: Option<&str>, after| ApiAction::Audit {
+            action: Box::new(AuditAction::Search {
+                since: since.map(str::to_owned),
+                until: None,
+                actor: None,
+                method: Some("put".into()),
+                route: None,
+                limit: Some(1),
+                after,
+            }),
+        };
+        let (mut routes, mut seqs, mut after) = (Vec::new(), Vec::new(), None);
+        for _ in 0..10 {
+            let page = json(exec(&c, true, audit(None, after)).await);
+            for e in page["entries"].as_array().expect("entries") {
+                routes.push(e["route"].as_str().expect("route").to_owned());
+                seqs.push(e["seq"].as_u64().expect("seq"));
+            }
+            let text = exec(&c, false, audit(None, after))
+                .await
+                .expect("audit text");
+            after = page["next"].as_u64();
+            assert_eq!(after_hint(&text), after.map(|n| n.to_string()), "{text}");
+            if after.is_none() {
+                break;
+            }
+        }
+        assert_eq!(after, None, "последняя страница без подсказки");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        for route in [
+            "/api/v1/orgs/{org}/policy",
+            "/api/v1/orgs/{org}/accounts/{account}/policy",
+        ] {
+            assert!(routes.iter().any(|r| r == route), "{routes:?}");
+        }
+        let err = exec(&c, false, audit(Some("завтра"), None))
+            .await
+            .expect_err("время");
+        assert!(err.contains("RFC 3339"), "{err}");
+
+        // Журнал доставки: поиск по отправителю.
+        let search = DeliveryAction::Search {
+            sender: Some(a()),
+            recipient: None,
+            message_id: None,
+            since: Some("2026-01-01T00:00:00Z".into()),
+            until: None,
+            limit: None,
+            after: None,
+        };
+        let found = exec(
+            &c,
+            false,
+            ApiAction::Delivery {
+                action: Box::new(search),
+            },
+        )
+        .await
+        .expect("delivery");
+        assert_eq!(found, "нет записей\n");
+
+        // Доверенные источники: шлюз по сети, приложение по сертификату; удаление; неверная сеть — отказ.
+        let source = |action| transport(TransportAction::Source { action });
+        let set = |name: &str, networks: Vec<&str>, cert: Option<&str>, senders: Vec<&str>| {
+            source(SourceAction::Set {
+                name: name.into(),
+                networks: networks.into_iter().map(str::to_owned).collect(),
+                client_cert: cert.map(str::to_owned),
+                application: !senders.is_empty(),
+                senders: senders.into_iter().map(str::to_owned).collect(),
+                external: false,
+                xclient: cert.is_none(),
+                authserv_id: cert.is_none().then(|| "mx.res.test".to_owned()),
+            })
+        };
+        let done = exec(&c, false, set("gw", vec!["192.0.2.0/24"], None, vec![]))
+            .await
+            .expect("source gw");
+        assert!(done.starts_with("Источник gw записан"), "{done}");
+        exec(
+            &c,
+            false,
+            set("mfu", vec![], Some("mfu.res.test"), vec!["@res.test"]),
+        )
+        .await
+        .expect("source mfu");
+        let listed = exec(&c, false, source(SourceAction::List))
+            .await
+            .expect("source list");
+        for part in [
+            "192.0.2.0/24",
+            "XCLIENT",
+            "authserv-id mx.res.test",
+            "сертификат mfu.res.test",
+            "приложение: @res.test",
+        ] {
+            assert!(listed.contains(part), "{part}: {listed}");
+        }
+        let delete = SourceAction::Delete { name: "gw".into() };
+        exec(&c, false, source(delete))
+            .await
+            .expect("source delete");
+        let listed = json(exec(&c, true, source(SourceAction::List)).await);
+        assert_eq!(
+            listed["sources"].as_array().map(Vec::len),
+            Some(1),
+            "{listed}"
+        );
+        let err = exec(&c, false, set("bad", vec!["не сеть"], None, vec![]))
+            .await
+            .expect_err("сеть");
+        assert!(err.starts_with("источник:"), "{err}");
+
+        // Политики доменов назначения: TLS, smart host, закреплённый ключ; удаление; неверный адрес — отказ.
+        let route = |action| transport(TransportAction::Route { action });
+        let set = |pattern: &str, tls, pins: Vec<String>, egress_ip: Option<&str>| {
+            route(RouteAction::Set {
+                pattern: pattern.into(),
+                tls,
+                pins,
+                smart_host: Some("relay.example.net:587".into()),
+                egress_ip: egress_ip.map(str::to_owned),
+            })
+        };
+        let done = exec(
+            &c,
+            false,
+            set("Example.org", TlsMode::Required, vec![], Some("192.0.2.1")),
+        )
+        .await
+        .expect("route set");
+        assert!(done.starts_with("Политика Example.org записана"), "{done}");
+        let pin = "ab".repeat(32);
+        let pinned = format!("pinned: {pin}");
+        exec(
+            &c,
+            false,
+            set("*", TlsMode::Opportunistic, vec![pin.clone()], None),
+        )
+        .await
+        .expect("route pin");
+        let listed = exec(&c, false, route(RouteAction::List))
+            .await
+            .expect("route list");
+        for part in [
+            "example.org",
+            "required",
+            "relay.example.net:587",
+            "192.0.2.1",
+            pinned.as_str(),
+        ] {
+            assert!(listed.contains(part), "{part}: {listed}");
+        }
+        let delete = RouteAction::Delete {
+            pattern: "example.org".into(),
+        };
+        exec(&c, false, route(delete)).await.expect("route delete");
+        let listed = json(exec(&c, true, route(RouteAction::List)).await);
+        assert_eq!(
+            listed["routes"].as_array().map(Vec::len),
+            Some(1),
+            "{listed}"
+        );
+        let err = exec(
+            &c,
+            false,
+            set("x.test", TlsMode::Required, vec![], Some("не адрес")),
+        )
+        .await
+        .expect_err("адрес");
+        assert!(err.contains("--egress-ip"), "{err}");
     }
 }
