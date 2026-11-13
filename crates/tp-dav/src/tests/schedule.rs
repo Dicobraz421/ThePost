@@ -100,7 +100,7 @@ impl Sched {
                 delivery: Arc::new(inbox.clone()),
                 sender: Some(Arc::new(sender.clone())),
                 freebusy: Arc::new(store.clone()),
-                group_store: Some(Arc::new(groups.clone())),
+                group_store: Arc::new(groups.clone()),
             }),
             cfg,
         );

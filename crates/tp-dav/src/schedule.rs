@@ -65,15 +65,14 @@ pub struct ScheduleDeps {
     /// Занятость учётных записей (хранилище).
     pub freebusy: Arc<dyn FreeBusy>,
     /// Группы рассылки: раскрытие вложенных групп участника-группы с защитой от циклов (`GroupStore::expand`,
-    /// DAV-35); `None` — участники группы только её учётные записи ([`GroupMember::Account`]).
-    pub group_store: Option<Arc<dyn GroupStore>>,
+    /// DAV-35).
+    pub group_store: Arc<dyn GroupStore>,
 }
 
 impl std::fmt::Debug for ScheduleDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScheduleDeps")
             .field("imip", &self.sender.is_some())
-            .field("group_store", &self.group_store.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -103,7 +102,7 @@ impl ScheduleDeps {
     /// адрес группы и адреса её включённых учётных записей (имя входа, [`itip::address`]) без адресов `me`.
     /// Участники с `SCHEDULE-AGENT` не `SERVER` не раскрываются. Вложенные группы ([`GroupMember::Group`]) раскрываются
     /// через [`ScheduleDeps::group_store`] (`GroupStore::expand`: каждая группа один раз, циклы не зацикливают;
-    /// неизвестная вложенная группа пропускается); без него участники группы — только её учётные записи.
+    /// неизвестная вложенная группа пропускается).
     pub async fn groups(
         &self,
         tenant: TenantId,
@@ -129,10 +128,7 @@ impl ScheduleDeps {
                 match m {
                     GroupMember::Account(id) => ids.push(*id),
                     GroupMember::Group(nested) => {
-                        let Some(store) = &self.group_store else {
-                            continue;
-                        };
-                        match store.expand(tenant, *nested).await {
+                        match self.group_store.expand(tenant, *nested).await {
                             Ok(found) => ids.extend(found),
                             Err(Error::NotFound) => {}
                             Err(e) => return Err(e),

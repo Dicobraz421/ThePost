@@ -23,8 +23,8 @@ use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
     Clock, FakeAuthenticator, FakeSearch, MemAddressBook, MemBlobIndex, MemBlobStore, MemDav,
-    MemDeliveryLog, MemEventBus, MemItipSender, MemMailboxAudit, MemMetadata, MemOutbound,
-    MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions, MemTrash,
+    MemDeliveryLog, MemEventBus, MemGroups, MemItipSender, MemMailboxAudit, MemMetadata,
+    MemOutbound, MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions, MemTrash,
     RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
@@ -236,7 +236,10 @@ impl Env {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let blobs = MemBlobStore::new(clock.clone());
         let index = MemBlobIndex::new(clock.clone());
-        let meta = MemMetadata::new(clock).with_blob_index(index.clone());
+        let groups = MemGroups::new();
+        let meta = MemMetadata::new(clock)
+            .with_blob_index(index.clone())
+            .with_groups(groups.clone());
         let bus = MemEventBus::default();
         let policies = MemPolicies::new(&meta);
         let trash = MemTrash::new(&meta).with_policies(policies.clone());
@@ -289,7 +292,7 @@ impl Env {
             delivery: Arc::new(tp_dav::ItipInbox::new(Arc::new(dav.clone()), dav_cfg)),
             sender: Some(Arc::new(imip.clone())),
             freebusy: Arc::new(dav.clone()),
-            group_store: None,
+            group_store: Arc::new(groups),
         };
         let jmap = Jmap::new(
             Deps {

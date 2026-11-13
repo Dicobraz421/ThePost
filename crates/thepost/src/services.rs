@@ -420,14 +420,14 @@ impl Services {
     /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
     /// записям организации сообщения iTIP кладутся прямо в календарь ([`Services::itip`]), остальным адресам —
     /// письмом iMIP через `outbound` (локальные получатели — в ящики, внешние — в очередь с подписью DKIM);
-    /// занятость — из `PgMeta`.
+    /// занятость и группы рассылки (раскрытие вложенных групп участника, DAV-35) — из `PgMeta`.
     fn schedule(&self, outbound: Arc<dyn Outbound>) -> tp_dav::ScheduleDeps {
         tp_dav::ScheduleDeps {
             accounts: Arc::new(self.meta.clone()),
             delivery: self.itip.clone(),
             sender: Some(Arc::new(tp_dav::ImipSender::new(outbound))),
             freebusy: Arc::new(self.meta.clone()),
-            group_store: None,
+            group_store: Arc::new(self.meta.clone()),
         }
     }
 
