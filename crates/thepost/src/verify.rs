@@ -44,7 +44,7 @@ pub fn summary(report: &VerifyReport) -> String {
         report.records_checked,
         report.orphans,
         report.orphans_deleted,
-        report.damaged,
+        report.missing + report.size_mismatch,
         report.damaged_marked,
         report.errors,
     );
@@ -223,7 +223,11 @@ mod tests {
         );
 
         let report = verifier.run(false).await.expect("verify");
-        assert_eq!((report.orphans, report.damaged), (1, 2), "{report:?}");
+        assert_eq!(
+            (report.orphans, report.missing, report.size_mismatch),
+            (1, 1, 1),
+            "{report:?}"
+        );
         assert_eq!(exit_code(&report), 1);
         assert!(store.contains(&orphan), "без --fix ничего не удаляется");
         let json = report.to_json().expect("json");

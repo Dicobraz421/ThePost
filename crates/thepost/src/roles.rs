@@ -242,7 +242,7 @@ impl ScheduledVerify {
         let duration_secs = started.elapsed().as_secs();
         self.probe.update(|m| {
             m.passes += 1;
-            m.damaged = report.damaged;
+            m.damaged = report.missing + report.size_mismatch;
             m.orphans = report.orphans;
             m.errors = report.errors;
             m.duration_secs = duration_secs;
@@ -263,7 +263,7 @@ impl ScheduledVerify {
         let (objects, records, damaged, orphans, errors, truncated) = (
             report.objects_listed,
             report.records_checked,
-            report.damaged,
+            report.missing + report.size_mismatch,
             report.orphans,
             report.errors,
             report.truncated,
