@@ -111,8 +111,10 @@ pub struct VerifyMetrics {
     pub passes: u64,
     /// Проходы, прерванные ошибкой (листинг хранилища, СУБД) или потерей лизы.
     pub failed: u64,
-    /// Повреждённые записи учёта в последнем проходе: объекта нет или его размер не совпадает с учётом.
-    pub damaged: u64,
+    /// Записи учёта в последнем проходе, у которых объекта нет в хранилище.
+    pub missing: u64,
+    /// Записи учёта в последнем проходе, у которых размер объекта не совпадает с учётом.
+    pub size_mismatch: u64,
     /// «Сироты» в последнем проходе: объекты хранилища без записи учёта.
     pub orphans: u64,
     /// Объекты и записи, которые в последнем проходе проверить не удалось.
@@ -242,7 +244,8 @@ impl ScheduledVerify {
         let duration_secs = started.elapsed().as_secs();
         self.probe.update(|m| {
             m.passes += 1;
-            m.damaged = report.damaged;
+            m.missing = report.missing;
+            m.size_mismatch = report.size_mismatch;
             m.orphans = report.orphans;
             m.errors = report.errors;
             m.duration_secs = duration_secs;
@@ -260,15 +263,16 @@ impl ScheduledVerify {
         for path in &report.orphan_paths {
             tracing::error!(path = %path, "проверка целостности BLOB: объект без записи учёта («сирота»)");
         }
-        let (objects, records, damaged, orphans, errors, truncated) = (
+        let (objects, records, missing, size_mismatch, orphans, errors, truncated) = (
             report.objects_listed,
             report.records_checked,
-            report.damaged,
+            report.missing,
+            report.size_mismatch,
             report.orphans,
             report.errors,
             report.truncated,
         );
-        if damaged + orphans + errors == 0 {
+        if missing + size_mismatch + orphans + errors == 0 {
             tracing::info!(
                 objects,
                 records,
@@ -279,7 +283,8 @@ impl ScheduledVerify {
             tracing::error!(
                 objects,
                 records,
-                damaged,
+                missing,
+                size_mismatch,
                 orphans,
                 errors,
                 truncated,
@@ -770,7 +775,8 @@ mod tests {
         };
         let text = metrics.encode().expect("encode");
         assert!(text.contains("tp_blob_verify_passes_total 0"), "{text}");
-        assert!(text.contains("tp_blob_verify_damaged 0"), "{text}");
+        assert!(text.contains("tp_blob_verify_missing 0"), "{text}");
+        assert!(text.contains("tp_blob_verify_size_mismatch 0"), "{text}");
 
         // Лиза у другого узла: прохода нет.
         let leases = MemLease::default();
@@ -832,10 +838,14 @@ mod tests {
         task.await.expect("join").expect("run");
 
         let m = probe.metrics();
-        assert_eq!((m.damaged, m.orphans, m.errors, m.failed), (1, 1, 0, 0));
+        assert_eq!(
+            (m.missing, m.size_mismatch, m.orphans, m.errors, m.failed),
+            (1, 0, 1, 0, 0)
+        );
         assert!(m.finished_at > 0);
         let text = metrics.encode().expect("encode");
-        assert!(text.contains("tp_blob_verify_damaged 1"), "{text}");
+        assert!(text.contains("tp_blob_verify_missing 1"), "{text}");
+        assert!(text.contains("tp_blob_verify_size_mismatch 0"), "{text}");
         assert!(text.contains("tp_blob_verify_orphans 1"), "{text}");
         assert!(!text.contains("tp_blob_verify_passes_total 0"), "{text}");
         assert_eq!(leases.holder(&lease_name).as_deref(), Some("node-a/1"));
