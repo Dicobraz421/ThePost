@@ -896,14 +896,20 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа. */
+        /**
+         * Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`) и вход по паролю
+         *     (`admin.password_login`). Без входа.
+         */
         get: operations["session_info"];
         put?: never;
         /**
-         * Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
-         *     первой проверкой; повтор, срок, отзыв — 401.
+         * Новая сессия Admin API. С телом `PasswordLogin` — вход администратора по паролю (решение 117): неверный пароль
+         *     или блокировка перебора — 401, нет ролей администрирования — 403, вход по паролю выключен
+         *     (`admin.password_login`) — 404. Без тела — обмен одноразового токена `admin init`
+         *     (`Authorization: Bearer tpa_…`): токен гасится первой проверкой; повтор, срок, отзыв — 401. Каждая попытка — в
+         *     журнал аудита.
          */
-        post: operations["exchange"];
+        post: operations["create_session"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1444,6 +1450,16 @@ export interface components {
             /** @description Идентификатор. */
             id: string;
         };
+        /** @description Вход администратора по паролю. */
+        PasswordLogin: {
+            /** @description Имя входа (адрес учётной записи). */
+            login: string;
+            /**
+             * Format: password
+             * @description Пароль: каталога (`auth.ldap`) или приложения, в том числе выданный `thepost admin init`.
+             */
+            password: string;
+        };
         /** @description Политика уровня и действующая политика. */
         Policies: {
             /** @description Действующее с учётом вышестоящих уровней; `null` — значение по умолчанию конфигурации. */
@@ -1650,6 +1666,8 @@ export interface components {
         /** @description Способы входа консоли. */
         SessionInfo: {
             oidc?: components["schemas"]["OidcLogin"] | null;
+            /** @description Вход по паролю администратора включён (`POST /api/v1/session` с телом `PasswordLogin`, `admin.password_login`). */
+            password: boolean;
         };
         /** @description Доверенный источник: создание или замена (имя — в пути). */
         SourceBody: {
@@ -5071,14 +5089,19 @@ export interface operations {
             };
         };
     };
-    exchange: {
+    create_session: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description Вход по паролю; без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`) */
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PasswordLogin"] | null;
+            };
+        };
         responses: {
             201: {
                 headers: {
@@ -5088,7 +5111,34 @@ export interface operations {
                     "application/json": components["schemas"]["AdminSession"];
                 };
             };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description неверный пароль или токен, блокировка перебора */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description у учётной записи нет ролей администрирования */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description вход по паролю выключен (`admin.password_login`) */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

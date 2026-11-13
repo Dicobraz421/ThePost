@@ -379,7 +379,7 @@ impl Env {
         Self::build(config(), Vec::new(), false, true)
     }
 
-    /// Без локального входа (`admin init` и обмен — 503).
+    /// Без локального входа (`admin init`, вход по паролю и обмен — 503).
     pub fn without_local() -> Self {
         Self::build(config(), Vec::new(), true, false)
     }

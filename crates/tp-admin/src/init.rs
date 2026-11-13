@@ -1,5 +1,5 @@
-//! Первый администратор без OIDC: `thepost admin init` (ADM-11, решение владельца #193; CONTRACTS.md#Auth —
-//! локальный токен Admin API).
+//! Вход администратора без OIDC: `thepost admin init` (ADM-11, решение владельца #193; CONTRACTS.md#Auth —
+//! локальный токен Admin API) и вход по паролю (ADM-41, решение 2026-11-11, п. 117).
 //!
 //! - [`serve_init`] — обработчик одного соединения локального сокета узла: запрос — одна строка JSON
 //!   ([`InitRequest`]), ответ — одна строка JSON ([`InitReply`]). Принимается только от root или учётной записи
@@ -8,25 +8,34 @@
 //!   (`admin.init.socket`) и права на него — у вызывающего, `thepost`; [`serve_local`] — цикл приёма на Unix;
 //!   клиент — [`request`].
 //! - [`Admin::init`] — организация по умолчанию, принятый домен адреса (создаётся, если нет), учётная запись
-//!   администратора, пароль (пароль приложения: вход IMAP, SMTP, JMAP) и одноразовый токен Admin API со сроком
-//!   `admin.init.token_ttl`. Администратор уже заведён (есть учётная запись с этим адресом или ранее выпущенный
-//!   токен) — отказ, `force` — повтор (прежние пароли `admin init` отзываются). Каждый вызов — в журнал аудита.
-//! - `POST /api/v1/session` — обмен токена на сессию Admin API (решение 2026-11-11, п. 2): токен гасится первой
-//!   проверкой, в том же ответе — значение сессии (`tps_…`, срок `admin.init.session_ttl`); дальше — только сессия
-//!   или OIDC Bearer. Роль сессии — администратор инсталляции. Сессии — в памяти узла: после перезапуска —
-//!   повторный `admin init --force` или вход через OIDC.
+//!   администратора, пароль (пароль приложения с подписью [`INIT_PASSWORD_LABEL`]: вход IMAP, SMTP, JMAP и вход
+//!   администратора по паролю) и одноразовый токен Admin API со сроком `admin.init.token_ttl`. Администратор уже
+//!   заведён (есть учётная запись с этим адресом или ранее выпущенный токен) — отказ, `force` — повтор (прежние
+//!   пароли `admin init` отзываются). Каждый вызов — в журнал аудита.
+//! - `POST /api/v1/session` с телом [`PasswordLogin`] — вход администратора по имени входа и паролю (решение 117):
+//!   пароль проверяет [`crate::Deps::auth`] — тот же путь, что вход пользователя на узле (пароль каталога или
+//!   приложения под защитой от перебора `AbuseGuard` по адресу клиента и учётной записи). Роли сессии — по
+//!   назначениям `admin.roles` ([`Admin::caller`]); учётная запись `admin init` (действующий пароль с подписью
+//!   [`INIT_PASSWORD_LABEL`]) — администратор инсталляции. Без ролей — 403, неверный пароль или блокировка — 401,
+//!   выключен (`admin.password_login`, [`crate::AdminConfig::password_login_enabled`]) — 404.
+//! - `POST /api/v1/session` без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`) на сессию
+//!   (решение 2026-11-11, п. 2): токен гасится первой проверкой; роль — администратор инсталляции. Работает и при
+//!   выключенном входе по паролю: первый вход и вход без ролей в `admin.roles`.
+//! - Сессия — значение `tps_…` со сроком `admin.init.session_ttl`, в памяти узла: после истечения или перезапуска —
+//!   снова вход по паролю (или OIDC). Каждый вход и каждая неудача — в журнал аудита.
 //! - `GET /api/v1/session` — без входа: способы входа консоли — поставщик OIDC ([`OidcLogin`]: издатель — тот, чьи
 //!   токены проверяет узел, `auth.oidc.issuer` ([`crate::Deps::oidc_issuer`]); клиент консоли — `admin.oidc`,
-//!   [`OidcClient`]). Не настроен — `{"oidc": null}`, вход только токеном `admin init`. Секретов в ответе нет: клиент
-//!   консоли — публичный (код авторизации с PKCE).
+//!   [`OidcClient`]; не настроен — `null`) и вход по паролю (`password`). Секретов в ответе нет: клиент консоли —
+//!   публичный (код авторизации с PKCE).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -39,7 +48,7 @@ use tp_contracts::admin_audit::AdminAuditRecord;
 use tp_contracts::admin_token::{
     LOCAL_ADMIN_TOKEN_PREFIX, LocalAdminToken, LocalAdminTokens, is_local_admin_token,
 };
-use tp_contracts::auth::Principal;
+use tp_contracts::auth::{Credentials, Principal};
 use tp_contracts::config::duration;
 use tp_contracts::meta::{Account, AccountKind, AccountScope, AccountUpsert};
 use tp_contracts::transport::{AcceptedDomain, DomainKind};
@@ -48,7 +57,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::server::{Admin, AdminRole, ApiError, Caller, Problem};
 
-/// Маршрут обмена локального токена на сессию.
+/// Маршрут сессии: способы входа (`GET`), вход по паролю и обмен локального токена (`POST`).
 pub const SESSION_ROUTE: &str = "/api/v1/session";
 
 /// Префикс значения сессии Admin API в `Authorization: Bearer`.
@@ -404,6 +413,25 @@ impl Admin {
         }
     }
 
+    /// Учётная запись заведена `admin init`: у неё действующий пароль с подписью [`INIT_PASSWORD_LABEL`]
+    /// (организация по умолчанию; подпись зарезервирована — Admin API её не выдаёт, [`crate::app_passwords`]).
+    pub(crate) async fn init_admin(&self, p: &Principal) -> Result<bool> {
+        if p.tenant != TenantId::DEFAULT {
+            return Ok(false);
+        }
+        let scope = AccountScope {
+            tenant: p.tenant,
+            account: p.account,
+        };
+        Ok(self
+            .d
+            .app_passwords
+            .list(scope)
+            .await?
+            .iter()
+            .any(|x| x.label == INIT_PASSWORD_LABEL && x.revoked_at.is_none()))
+    }
+
     /// Администратор по значению сессии в момент `now`; не сессия — `None`, нет или истекла — `Forbidden`.
     pub(crate) fn session_caller(
         &self,
@@ -621,24 +649,50 @@ pub struct OidcLogin {
 /// Способы входа консоли.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SessionInfo {
-    /// Поставщик OIDC; `null` — не настроен (вход только токеном `admin init`).
+    /// Поставщик OIDC; `null` — не настроен.
     pub oidc: Option<OidcLogin>,
+    /// Вход по паролю администратора включён (`POST /api/v1/session` с телом `PasswordLogin`, `admin.password_login`).
+    pub password: bool,
 }
 
-/// Маршрут сессии (вне слоя доступа: способы входа — без входа, обмен — вход самим локальным токеном).
+/// Наибольшая длина имени входа, символов: длина адреса (RFC 3696, errata 1690).
+const MAX_LOGIN_CHARS: usize = 320;
+
+/// Вход администратора по паролю.
+// `Debug` — без пароля.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordLogin {
+    /// Имя входа (адрес учётной записи).
+    pub login: String,
+    /// Пароль: каталога (`auth.ldap`) или приложения, в том числе выданный `thepost admin init`.
+    #[schema(format = Password)]
+    pub password: String,
+}
+
+impl fmt::Debug for PasswordLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordLogin")
+            .field("login", &self.login)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Маршрут сессии (вне слоя доступа: способы входа — без входа, вход — паролем или самим локальным токеном).
 pub(crate) fn routes(r: Router<Arc<Admin>>) -> Router<Arc<Admin>> {
-    r.route(SESSION_ROUTE, get(session_info).post(exchange))
+    r.route(SESSION_ROUTE, get(session_info).post(create_session))
 }
 
 /// Спецификация OpenAPI маршрута сессии.
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(session_info, exchange),
-    components(schemas(AdminSession, SessionInfo, OidcLogin))
+    paths(session_info, create_session),
+    components(schemas(AdminSession, SessionInfo, OidcLogin, PasswordLogin))
 )]
 pub(crate) struct Doc;
 
-/// Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`). Без входа.
+/// Способы входа консоли: поставщик OIDC (издатель `auth.oidc`, клиент `admin.oidc`) и вход по паролю
+/// (`admin.password_login`). Без входа.
 #[utoipa::path(get, path = "/api/v1/session", tag = "admin", security(()),
     responses((status = 200, body = SessionInfo)))]
 async fn session_info(State(a): State<Arc<Admin>>) -> Json<SessionInfo> {
@@ -652,53 +706,206 @@ async fn session_info(State(a): State<Arc<Admin>>) -> Json<SessionInfo> {
             client_id: c.client_id.clone(),
             scope: c.scope.clone(),
         });
-    Json(SessionInfo { oidc })
+    Json(SessionInfo {
+        oidc,
+        password: a.cfg.password_login_enabled(),
+    })
 }
 
-/// Обменивает одноразовый токен `admin init` (`Authorization: Bearer tpa_…`) на сессию Admin API. Токен гасится
-/// первой проверкой; повтор, срок, отзыв — 401.
-#[utoipa::path(post, path = "/api/v1/session", tag = "admin",
-    responses((status = 201, body = AdminSession), (status = 401, body = Problem), (status = 503, body = Problem)))]
-async fn exchange(State(a): State<Arc<Admin>>, headers: HeaderMap) -> Response {
-    let Some(local) = a.local.clone() else {
-        return ApiError(Error::UNAVAILABLE).into_response();
-    };
+/// Новая сессия Admin API. С телом `PasswordLogin` — вход администратора по паролю (решение 117): неверный пароль
+/// или блокировка перебора — 401, нет ролей администрирования — 403, вход по паролю выключен
+/// (`admin.password_login`) — 404. Без тела — обмен одноразового токена `admin init`
+/// (`Authorization: Bearer tpa_…`): токен гасится первой проверкой; повтор, срок, отзыв — 401. Каждая попытка — в
+/// журнал аудита.
+#[utoipa::path(post, path = "/api/v1/session", tag = "admin", security((), ("bearer" = [])),
+    request_body(content = Option<PasswordLogin>,
+        description = "Вход по паролю; без тела — обмен токена `admin init` (`Authorization: Bearer tpa_…`)"),
+    responses((status = 201, body = AdminSession), (status = 400, body = Problem),
+        (status = 401, description = "неверный пароль или токен, блокировка перебора", body = Problem),
+        (status = 403, description = "у учётной записи нет ролей администрирования", body = Problem),
+        (status = 404, description = "вход по паролю выключен (`admin.password_login`)", body = Problem),
+        (status = 503, body = Problem)))]
+async fn create_session(State(a): State<Arc<Admin>>, req: Request) -> Response {
+    // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`): по нему — защита от перебора.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let (parts, body) = req.into_parts();
     let now = OffsetDateTime::now_utc();
-    let r = exchange_inner(&a, &local, &headers, now).await;
-    let (actor, login, roles, status) = match &r {
-        Ok(s) => (
-            s.account.parse().unwrap_or_else(|_| nobody()),
-            s.login.clone(),
-            s.roles.iter().map(|r| r.as_str().to_owned()).collect(),
-            201,
+    let attempt = match axum::body::to_bytes(body, a.cfg.max_body_size).await {
+        Ok(body) if body.is_empty() => exchange(&a, &parts.headers, now).await,
+        Ok(body) => password_login(&a, &body, peer, now).await,
+        Err(_) => Attempt::anonymous(
+            String::new(),
+            Err(Denied::Invalid(
+                "тело запроса больше admin.max_body_size".into(),
+            )),
         ),
-        Err(e) if e.is_retryable() => (nobody(), String::new(), Vec::new(), 503),
-        Err(_) => (nobody(), String::new(), Vec::new(), 401),
     };
+    let status = attempt.status();
     let record = AdminAuditRecord {
         at: now,
-        tenant: Some(TenantId::DEFAULT),
-        actor_tenant: TenantId::DEFAULT,
-        actor,
-        actor_login: login,
-        roles,
+        tenant: Some(attempt.tenant),
+        actor_tenant: attempt.tenant,
+        actor: attempt.actor,
+        actor_login: attempt.login,
+        roles: attempt
+            .result
+            .as_ref()
+            .map(|s| s.roles.iter().map(|r| r.as_str().to_owned()).collect())
+            .unwrap_or_default(),
         method: "POST".into(),
         route: SESSION_ROUTE.into(),
         path: SESSION_ROUTE.into(),
-        status,
+        status: status.as_u16(),
         content_messages: None,
     };
     if let Err(e) = crate::audit::record(&a.d, &record).await {
         tracing::error!(error = %e, route = SESSION_ROUTE, "admin: запись аудита не сохранена");
     }
-    match r {
+    match attempt.result {
         Ok(s) => {
             let mut resp = (StatusCode::CREATED, Json(s)).into_response();
             resp.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             resp
         }
-        Err(e) => crate::server::auth_error(&e),
+        Err(Denied::Credentials(e)) => crate::server::auth_error(&e),
+        Err(Denied::Disabled) => ApiError(Error::NotFound).into_response(),
+        Err(Denied::Invalid(m)) => ApiError(Error::Invalid(m)).into_response(),
+        Err(Denied::NoRole) => ApiError(Error::Forbidden).into_response(),
+    }
+}
+
+/// Отказ во входе.
+#[derive(Debug)]
+enum Denied {
+    /// Вход по паролю выключен (`admin.password_login`).
+    Disabled,
+    /// Тело запроса.
+    Invalid(String),
+    /// Учётные данные не приняты (`Forbidden` — 401) или временная ошибка (её код).
+    Credentials(Error),
+    /// Учётные данные верны, ролей администрирования нет.
+    NoRole,
+}
+
+/// Попытка входа для журнала аудита: субъект (известен после проверки учётных данных) и исход.
+struct Attempt {
+    tenant: TenantId,
+    actor: AccountId,
+    login: String,
+    result: std::result::Result<AdminSession, Denied>,
+}
+
+impl Attempt {
+    /// Попытка без проверенного субъекта: в журнал — имя входа попытки.
+    fn anonymous(login: String, result: std::result::Result<AdminSession, Denied>) -> Self {
+        Self {
+            tenant: TenantId::DEFAULT,
+            actor: nobody(),
+            login,
+            result,
+        }
+    }
+
+    fn status(&self) -> StatusCode {
+        match &self.result {
+            Ok(_) => StatusCode::CREATED,
+            Err(Denied::Disabled) => StatusCode::NOT_FOUND,
+            Err(Denied::Invalid(_)) => StatusCode::BAD_REQUEST,
+            Err(Denied::Credentials(e)) if e.is_retryable() => StatusCode::SERVICE_UNAVAILABLE,
+            Err(Denied::Credentials(_)) => StatusCode::UNAUTHORIZED,
+            Err(Denied::NoRole) => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
+/// Вход по паролю (см. [`create_session`]).
+async fn password_login(
+    a: &Admin,
+    body: &[u8],
+    peer: Option<IpAddr>,
+    now: OffsetDateTime,
+) -> Attempt {
+    let req = match serde_json::from_slice::<PasswordLogin>(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Attempt::anonymous(
+                String::new(),
+                Err(Denied::Invalid(format!(
+                    "тело запроса — не PasswordLogin: {e}"
+                ))),
+            );
+        }
+    };
+    let login: String = req.login.trim().chars().take(MAX_LOGIN_CHARS + 1).collect();
+    if !a.cfg.password_login_enabled() {
+        return Attempt::anonymous(login, Err(Denied::Disabled));
+    }
+    if login.is_empty() || login.chars().count() > MAX_LOGIN_CHARS || req.password.is_empty() {
+        let m = format!("login — от 1 до {MAX_LOGIN_CHARS} символов, password — непустой");
+        return Attempt::anonymous(login, Err(Denied::Invalid(m)));
+    }
+    let Some(local) = a.local.as_deref() else {
+        return Attempt::anonymous(login, Err(Denied::Credentials(Error::UNAVAILABLE)));
+    };
+    let credentials = Credentials::Password {
+        login: login.clone(),
+        secret: req.password,
+    };
+    let principal = match a.d.auth.verify(credentials, peer).await {
+        Ok(p) => p,
+        Err(e) => return Attempt::anonymous(login, Err(Denied::Credentials(e))),
+    };
+    let subject = |result| Attempt {
+        tenant: principal.tenant,
+        actor: principal.account,
+        login: principal.login.clone(),
+        result,
+    };
+    let mut roles = a.caller(principal.clone()).roles;
+    match a.init_admin(&principal).await {
+        Ok(true) => {
+            roles.insert(AdminRole::InstallationAdmin);
+        }
+        Ok(false) => {}
+        Err(e) => return subject(Err(Denied::Credentials(e))),
+    }
+    if roles.is_empty() {
+        return subject(Err(Denied::NoRole));
+    }
+    let result = a
+        .open_session(local, principal.clone(), roles.clone(), now)
+        .map(|(session, expires_at)| {
+            tracing::info!(login = %principal.login, "admin: вход по паролю, открыта сессия");
+            AdminSession {
+                session,
+                expires_at,
+                tenant: principal.tenant.to_string(),
+                account: principal.account.to_string(),
+                login: principal.login.clone(),
+                roles: roles.into_iter().collect(),
+            }
+        })
+        .map_err(Denied::Credentials);
+    subject(result)
+}
+
+/// Обмен токена `admin init` (см. [`create_session`]).
+async fn exchange(a: &Admin, headers: &HeaderMap, now: OffsetDateTime) -> Attempt {
+    let Some(local) = a.local.as_deref() else {
+        return Attempt::anonymous(String::new(), Err(Denied::Credentials(Error::UNAVAILABLE)));
+    };
+    match exchange_inner(a, local, headers, now).await {
+        Ok(s) => Attempt {
+            tenant: TenantId::DEFAULT,
+            actor: s.account.parse().unwrap_or_else(|_| nobody()),
+            login: s.login.clone(),
+            result: Ok(s),
+        },
+        Err(e) => Attempt::anonymous(String::new(), Err(Denied::Credentials(e))),
     }
 }
 
@@ -755,6 +962,231 @@ mod tests {
         }
     }
 
+    /// Субъект пароля `secret` для учётной записи `scope` (FakeAuthenticator — вместо проверки узла).
+    fn add_password(env: &Env, scope: AccountScope, login: &str, secret: &str, groups: &[&str]) {
+        let p = Principal {
+            account: scope.account,
+            ..crate::testenv::subject(scope.tenant, login, groups)
+        };
+        env.auth.add_password(login, secret, p);
+    }
+
+    fn password_body(login: &str, password: &str) -> serde_json::Value {
+        json!({"login": login, "password": password})
+    }
+
+    /// Приёмка ADM-41: верный пароль — сессия с ролями по `admin.roles`; неверный — 401 и запись в аудит с именем
+    /// входа попытки.
+    #[tokio::test]
+    async fn password_login_opens_session() {
+        let env = Env::new();
+        let scope = env.account("admin@example.org").await;
+        add_password(&env, scope, "admin@example.org", "s3cret", &["staff"]);
+
+        let body = password_body(" Admin@Example.org ", "s3cret");
+        let (s, h, b) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert_eq!(b["login"], "admin@example.org");
+        assert_eq!(b["account"], scope.account.to_string());
+        assert_eq!(b["roles"], json!(["organization_admin"]));
+        let session = b["session"].as_str().expect("session").to_owned();
+        assert!(session.starts_with(SESSION_PREFIX), "{session}");
+        let (s, _, b) = env
+            .call("GET", "/api/v1/whoami", Some(&session), None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["roles"], json!(["organization_admin"]));
+
+        let body = password_body("admin@example.org", "wrong");
+        let (s, h, _) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(h[header::WWW_AUTHENTICATE], "Bearer realm=\"admin\"");
+
+        let log = env.audit.records();
+        let got: Vec<_> = log
+            .iter()
+            .map(|r| (r.route.as_str(), r.status, r.actor_login.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (SESSION_ROUTE, 201, "admin@example.org"),
+                (SESSION_ROUTE, 401, "admin@example.org"),
+            ]
+        );
+        assert_eq!(log[0].actor, scope.account);
+        assert_eq!(log[0].roles, vec!["organization_admin".to_owned()]);
+        assert_eq!(log[1].actor, nobody());
+        assert!(log[1].roles.is_empty());
+    }
+
+    /// Пароль верен, ролей администрирования нет — 403 и запись в аудит; пароль не принят узлом — сессии нет.
+    #[tokio::test]
+    async fn password_login_without_role_is_forbidden() {
+        let env = Env::new();
+        let scope = env.account("user@example.org").await;
+        add_password(&env, scope, "user@example.org", "s3cret", &["staff"]);
+        let body = password_body("user@example.org", "s3cret");
+        let (s, _, b) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert!(b.get("session").is_none(), "{b}");
+        let log = env.audit.records();
+        assert_eq!((log[0].status, log[0].actor), (403, scope.account));
+        assert_eq!(env.admin.local.as_ref().expect("local").sessions().len(), 0);
+    }
+
+    /// Учётная запись `admin init` входит по паролю `admin init` администратором инсталляции без `admin.roles`;
+    /// отозванный пароль `admin init` роль снимает. Подпись пароля `admin init` в Admin API не выдаётся.
+    #[tokio::test]
+    async fn init_admin_logs_in_by_password() {
+        let env = Env::new();
+        let g = env
+            .admin
+            .init(&req("boss@example.test", false))
+            .await
+            .expect("init");
+        let scope = AccountScope {
+            tenant: TenantId::DEFAULT,
+            account: g.account,
+        };
+        add_password(&env, scope, &g.login, &g.password, &[]);
+        let body = password_body(&g.login, &g.password);
+        let (s, _, b) = env
+            .call("POST", SESSION_ROUTE, None, Some(body.clone()))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(b["roles"], json!(["installation_admin"]));
+
+        let reserved = json!({"label": " Thepost Admin Init "});
+        let path = format!(
+            "/api/v1/orgs/{}/accounts/{}/app-passwords",
+            TenantId::DEFAULT,
+            g.account
+        );
+        let (s, _, b) = env.call("POST", &path, Some("root"), Some(reserved)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+
+        for p in env.app_passwords.list(scope).await.expect("list") {
+            env.app_passwords
+                .revoke(scope, &p.id)
+                .await
+                .expect("revoke");
+        }
+        let (s, _, _) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    /// `admin.password_login`: по умолчанию включён без `admin.oidc`, выключен с ним; выключен — 404 без проверки
+    /// пароля, запись в аудит; `GET /api/v1/session` сообщает консоли.
+    #[tokio::test]
+    async fn password_login_setting() {
+        let oidc = || {
+            Some(OidcClient {
+                client_id: "thepost-console".into(),
+                scope: None,
+            })
+        };
+        for (password_login, oidc, enabled) in [
+            (None, None, true),
+            (None, oidc(), false),
+            (Some(false), None, false),
+            (Some(true), oidc(), true),
+        ] {
+            let cfg = crate::server::AdminConfig {
+                password_login,
+                oidc,
+                ..crate::testenv::config()
+            };
+            assert_eq!(cfg.password_login_enabled(), enabled, "{password_login:?}");
+            let env = Env::with(cfg, Vec::new());
+            let (_, _, b) = env.call("GET", SESSION_ROUTE, None, None).await;
+            assert_eq!(b["password"], enabled);
+            if enabled {
+                continue;
+            }
+            let scope = env.account("admin@example.org").await;
+            add_password(&env, scope, "admin@example.org", "s3cret", &[]);
+            let body = password_body("admin@example.org", "s3cret");
+            let (s, _, _) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
+            assert_eq!(s, StatusCode::NOT_FOUND);
+            assert!(env.auth.peers().is_empty(), "пароль не проверяется");
+            let log = env.audit.records();
+            assert_eq!(
+                (log[0].status, log[0].actor_login.as_str()),
+                (404, "admin@example.org")
+            );
+        }
+        let c: crate::server::AdminConfig =
+            serde_json::from_value(json!({"password_login": false})).expect("config");
+        assert_eq!(c.password_login, Some(false));
+    }
+
+    /// Пароль проверяется с адресом клиента соединения (по нему — защита от перебора узла); тело не по схеме — 400.
+    #[tokio::test]
+    async fn password_login_passes_peer_and_checks_body() {
+        let env = Env::new();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 7], 50_000));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(SESSION_ROUTE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(ConnectInfo(peer))
+            .body(axum::body::Body::from(
+                password_body("admin@example.org", "nope").to_string(),
+            ))
+            .expect("request");
+        let resp = tower::ServiceExt::oneshot(env.router.clone(), req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(env.auth.peers(), vec![Some(peer.ip())]);
+
+        for bad in [
+            json!({"login": "admin@example.org"}),
+            json!({"login": "a@b.test", "password": "x", "otp": "1"}),
+            json!({"login": " ", "password": "x"}),
+            json!({"login": "a@b.test", "password": ""}),
+            json!({"login": "a".repeat(400), "password": "x"}),
+        ] {
+            let (s, _, b) = env
+                .call("POST", SESSION_ROUTE, None, Some(bad.clone()))
+                .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {b}");
+        }
+        assert_eq!(
+            env.auth.peers().len(),
+            1,
+            "тело не по схеме — пароль не проверяется"
+        );
+        let log = env.audit.records();
+        assert!(log[1..].iter().all(|r| r.status == 400), "{log:?}");
+        assert!(
+            log.iter()
+                .all(|r| r.actor_login.chars().count() <= MAX_LOGIN_CHARS + 1)
+        );
+
+        let spec = serde_json::to_value(crate::server::openapi_spec()).expect("spec");
+        let post = &spec["paths"][SESSION_ROUTE]["post"];
+        assert_eq!(post["security"], json!([{}, {"bearer": []}]));
+        // Тело необязательно: без него — обмен токена `admin init`.
+        assert!(post["requestBody"].get("required").is_none(), "{post}");
+        assert_eq!(
+            post["requestBody"]["content"]["application/json"]["schema"]["oneOf"][0]["$ref"],
+            "#/components/schemas/PasswordLogin"
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                PasswordLogin {
+                    login: "a".into(),
+                    password: "hidden".into()
+                }
+            )
+            .contains("hidden")
+        );
+    }
+
     /// Приёмка ADM-25: способы входа — без заголовка `Authorization`; с настройкой OIDC и без. Издатель — из
     /// `auth.oidc` (`Deps::oidc_issuer`), клиент — из `admin.oidc`.
     #[tokio::test]
@@ -762,7 +1194,7 @@ mod tests {
         let env = Env::new();
         let (s, _, b) = env.call("GET", SESSION_ROUTE, None, None).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(b, json!({"oidc": null}));
+        assert_eq!(b, json!({"oidc": null, "password": true}));
 
         let oidc = OidcClient {
             client_id: "thepost-console".into(),
@@ -779,7 +1211,10 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             b,
-            json!({"oidc": {"issuer": crate::testenv::ISSUER, "client_id": "thepost-console"}})
+            json!({
+                "oidc": {"issuer": crate::testenv::ISSUER, "client_id": "thepost-console"},
+                "password": false
+            })
         );
         let spec = serde_json::to_value(crate::server::openapi_spec()).expect("spec");
         assert_eq!(spec["paths"][SESSION_ROUTE]["get"]["security"], json!([{}]));
@@ -1036,6 +1471,9 @@ mod tests {
             Err(Error::UNAVAILABLE)
         );
         let (s, _, _) = env.call("POST", SESSION_ROUTE, Some("tpa_x"), None).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let body = json!({"login": "admin@example.org", "password": "x"});
+        let (s, _, _) = env.call("POST", SESSION_ROUTE, None, Some(body)).await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 
