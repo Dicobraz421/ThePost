@@ -44,7 +44,7 @@ impl AclAuthorizer {
 }
 
 /// Идентификаторы субъекта в ACL: имя входа и группы, допустимые в ACL, без [`ANYONE`].
-fn identifiers(p: &Principal) -> Vec<String> {
+pub(crate) fn identifiers(p: &Principal) -> Vec<String> {
     std::iter::once(&p.login)
         .chain(&p.groups)
         .filter(|id| !id.eq_ignore_ascii_case(ANYONE) && validate_identifier(id, false).is_ok())

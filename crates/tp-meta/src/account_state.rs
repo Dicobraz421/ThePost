@@ -30,8 +30,9 @@ use crate::{BoxDb, PgMeta};
 
 /// Таблицы ящика учётной записи на его шарде (кроме писем и состояния ящика), зависимые раньше главных.
 /// Журнал событий ядра не чистится: его позиции читают подписчики, срок хранения — `EventLog::purge`.
-const BOX_TABLES: [&str; 15] = [
+const BOX_TABLES: [&str; 16] = [
     "mailbox_acl",
+    "collection_acl",
     "send_delegations",
     "index_manifests",
     "dav_tombstones",
