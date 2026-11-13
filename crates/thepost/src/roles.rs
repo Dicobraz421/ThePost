@@ -392,9 +392,9 @@ impl PurgeProbe {
         let probe = Self::default();
         for step in Purged::STEPS {
             let label = [("step", step)];
-            probe.runs.get_or_create(&label);
-            probe.errors.get_or_create(&label);
-            probe.last_success.get_or_create(&label);
+            probe.runs.get_or_create_owned(&label);
+            probe.errors.get_or_create_owned(&label);
+            probe.last_success.get_or_create_owned(&label);
         }
         probe
     }
