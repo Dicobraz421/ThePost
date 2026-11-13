@@ -165,9 +165,9 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0035_delivery_itip.sql"),
     ),
     (
-        38,
+        37,
         "inbox log",
-        include_str!("../migrations/0038_inbox_log.sql"),
+        include_str!("../migrations/0037_inbox_log.sql"),
     ),
 ];
 

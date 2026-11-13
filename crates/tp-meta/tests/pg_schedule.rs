@@ -1,7 +1,7 @@
 //! META-51: планирование встреч на PostgreSQL — наборы `tp_testkit::suite::freebusy` и `suite::itip`, сигналы
 //! входящих, RLS новых таблиц, миграция 0024 на базе прежней схемы, занятость учётных записей разных шардов.
 //! META-54: набор `suite::freebusy_recurring` (разворот повторов при запросе) и миграция 0025.
-//! META-69: набор `suite::itip::inbox_log` (журнал входящих), очистка надгробий входящих, миграция 0038.
+//! META-69: набор `suite::itip::inbox_log` (журнал входящих), очистка надгробий входящих, миграция 0037.
 
 mod common;
 
@@ -484,7 +484,7 @@ async fn migration_on_existing_db() {
         .expect("drop database");
 }
 
-/// META-69: миграция 0038 на базе прежней схемы — ресурс входящих, записанный до неё, в журнале создан на своём
+/// META-69: миграция 0037 на базе прежней схемы — ресурс входящих, записанный до неё, в журнале создан на своём
 /// `ModSeq`, время поступления — время миграции; перезапись — `updated`, удаление — надгробие.
 #[tokio::test]
 async fn inbox_log_migration_on_existing_db() {
@@ -508,7 +508,7 @@ async fn inbox_log_migration_on_existing_db() {
         )
         .await
         .expect("connect db");
-    schema::migrator_until(35)
+    schema::migrator_until(36)
         .run(&pool)
         .await
         .expect("migrate until");
