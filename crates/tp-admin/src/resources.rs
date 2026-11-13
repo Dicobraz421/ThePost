@@ -433,6 +433,7 @@ async fn delete_resource(
 mod tests {
     use serde_json::{Value, json};
     use tp_contracts::meta::AccountStore;
+    use tp_contracts::sharing::ResourceStore;
     use tp_contracts::transport::{AcceptedDomain, DomainKind, TransportStore};
 
     use super::*;
@@ -654,7 +655,11 @@ mod tests {
             tenant: TenantId::DEFAULT,
             account: id,
         };
-        assert_eq!(env.sharing.booking(scope), None, "правила сняты");
+        assert_eq!(
+            env.meta.booking_policy(scope).await.expect("booking"),
+            None,
+            "правила сняты"
+        );
         let (s, _, _) = env
             .call(
                 "DELETE",

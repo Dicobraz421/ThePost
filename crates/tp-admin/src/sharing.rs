@@ -11,13 +11,13 @@
 //!   субъектам — имя входа, имя группы, `anyone`; `PUT …/acl/{identifier}` заменяет права субъекта целиком, пустые
 //!   права отзывают запись.
 //!
-//! Выдача прав и назначение представителя — в пределах политики организации (`SharingPolicy::check`): сверх неё —
-//! 409 с пояснением. Ужесточение политики уже выданное не удаляет: его ограничивает слой авторизации
+//! Выдача прав и назначение представителя — в пределах политики организации: проверяет единый слой прав
+//! (`tp_auth::CollectionAuthorizer::check_grant`, `check_delegate`) от имени владельца — администратор действует за
+//! него; сверх политики — 409 с пояснением. Ужесточение политики уже выданное не удаляет: его ограничивает слой авторизации
 //! (`SharingPolicy::limit`, `tp-auth`). Ресурсы и правила бронирования — [`crate::resources`]. Хранилища подключает
 //! [`Admin::with_sharing`]; без них маршруты отвечают 503. Изменения пишет в журнал аудита слой доступа
 //! ([`crate::server`]).
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -26,9 +26,10 @@ use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tp_auth::CollectionAuthorizer;
+use tp_contracts::auth::Principal;
 use tp_contracts::dav::{CollectionId, CollectionKind, DavStore};
-use tp_contracts::groups::GroupMember;
-use tp_contracts::meta::AccountScope;
+use tp_contracts::meta::{Account, AccountScope};
 use tp_contracts::sharing::{
     ANYONE, CollectionAcl, CollectionAclEntry, CollectionRights, Delegate, DelegateLevel,
     DelegateStore, ResourceStore, SharingPolicy, SharingPolicyStore, SharingScope,
@@ -302,78 +303,35 @@ fn beyond_policy(subject: &str) -> Refused {
     )
 }
 
-/// Субъект прав для проверки политики.
-enum Subject {
-    /// `anyone`.
-    Anyone,
-    /// Учётная запись организации.
-    Account(AccountId),
-    /// Группа организации.
-    Group(GroupId),
-    /// Не найден в организации (имя группы каталога без группы рассылки и т. п.) — вне групп политики.
-    Unknown,
+/// Единый слой прав на коллекции (`tp-auth`) поверх хранилищ общего доступа и групп, учётных записей Admin API.
+fn authorizer(a: &Admin, s: &SharingStores) -> CollectionAuthorizer {
+    CollectionAuthorizer::new(tp_auth::SharingStores {
+        acl: s.acl.clone(),
+        delegates: s.delegates.clone(),
+        policy: s.policy.clone(),
+        dav: s.collections.clone(),
+        groups: a.d.groups.clone(),
+        accounts: a.d.accounts.clone(),
+    })
 }
 
-/// Субъект входит в группы политики [`SharingScope::Groups`] (с вложенными); при других областях — нет.
-async fn in_policy_groups(
-    a: &Admin,
-    org: TenantId,
-    policy: &SharingPolicy,
-    subject: &Subject,
-) -> Result<bool> {
-    let SharingScope::Groups { groups } = &policy.scope else {
-        return Ok(false);
-    };
-    match subject {
-        Subject::Anyone | Subject::Unknown => Ok(false),
-        Subject::Account(id) => {
-            for g in groups {
-                match a.d.groups.expand(org, *g).await {
-                    Ok(members) if members.contains(id) => return Ok(true),
-                    Ok(_) | Err(Error::NotFound) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(false)
-        }
-        Subject::Group(id) => {
-            // Группа политики или вложенная в неё: обход вложенных групп, каждая — один раз.
-            let mut seen = BTreeSet::new();
-            let mut queue: Vec<GroupId> = groups.clone();
-            while let Some(g) = queue.pop() {
-                if !seen.insert(g) {
-                    continue;
-                }
-                if g == *id {
-                    return Ok(true);
-                }
-                if let Some(group) = a.d.groups.get(org, g).await? {
-                    queue.extend(group.members.iter().filter_map(|m| match m {
-                        GroupMember::Group(x) => Some(*x),
-                        GroupMember::Account(_) => None,
-                    }));
-                }
-            }
-            Ok(false)
-        }
+/// Владелец как субъект проверки: администратор выдаёт права и назначает представителей от его имени.
+fn as_owner(acc: &Account) -> Principal {
+    Principal {
+        tenant: acc.tenant,
+        account: acc.id,
+        login: acc.login.clone(),
+        groups: Default::default(),
+        scopes: None,
     }
 }
 
-/// Проверяет выдачу `rights` субъекту по политике организации; сверх политики — 409.
-async fn check_policy(
-    a: &Admin,
-    s: &SharingStores,
-    org: TenantId,
-    subject: &Subject,
-    rights: CollectionRights,
-    name: &str,
-) -> std::result::Result<(), Refused> {
-    let policy = s.policy.sharing_policy(org).await?;
-    let anyone = matches!(subject, Subject::Anyone);
-    let in_group = in_policy_groups(a, org, &policy, subject).await?;
-    policy
-        .check(rights, anyone, in_group)
-        .map_err(|_| beyond_policy(name))
+/// Отказ слоя прав: сверх политики (`Forbidden`) — 409 с пояснением, остальное — как есть.
+fn refused(e: Error, subject: &str) -> Refused {
+    match e {
+        Error::Forbidden => beyond_policy(subject),
+        e => e.into(),
+    }
 }
 
 /// Политика общего доступа организации; не задана — по умолчанию.
@@ -465,22 +423,20 @@ async fn put_delegate(
     Json(body): Json<DelegateBody>,
 ) -> std::result::Result<Json<DelegateInfo>, Refused> {
     let s = stores(&a)?;
-    account(&a, org, id).await?;
+    if delegate == id {
+        return Err(Error::invalid("представитель — сам владелец").into());
+    }
+    let owner = account(&a, org, id).await?;
     let acc = account(&a, org, delegate).await?;
     let d = Delegate {
         delegate,
         level: body.level.into(),
         schedule_on_behalf: body.schedule_on_behalf,
     };
-    check_policy(
-        &a,
-        s,
-        org,
-        &Subject::Account(delegate),
-        d.rights(),
-        &acc.login,
-    )
-    .await?;
+    authorizer(&a, s)
+        .check_delegate(&as_owner(&owner), id, &d)
+        .await
+        .map_err(|e| refused(e, &acc.login))?;
     let owner = AccountScope {
         tenant: org,
         account: id,
@@ -620,35 +576,34 @@ async fn put_acl(
 ) -> std::result::Result<Json<Vec<AclEntryBody>>, Refused> {
     let s = stores(&a)?;
     validate_identifier(&identifier, false)?;
-    account(&a, org, id).await?;
+    let acc = account(&a, org, id).await?;
     let owner = AccountScope {
         tenant: org,
         account: id,
     };
     // Нет коллекции — 404 раньше проверки политики.
     s.acl.collection_acl(owner, collection).await?;
-    let (identifier, subject) = resolve(&a, org, identifier).await?;
+    let identifier = stored(&a, org, identifier).await?;
     let rights = CollectionRights::from(body);
-    check_policy(&a, s, org, &subject, rights, &identifier).await?;
+    authorizer(&a, s)
+        .check_grant(&as_owner(&acc), id, collection, &identifier, rights)
+        .await
+        .map_err(|e| refused(e, &identifier))?;
     s.acl
         .set_collection_acl(owner, collection, &identifier, rights)
         .await?;
     Ok(Json(acl_entries(s, owner, collection).await?))
 }
 
-/// Субъект по идентификатору: `anyone`, имя входа учётной записи (приводится к хранимому), имя группы рассылки;
-/// иное (группа каталога без группы рассылки) — как есть, вне групп политики.
-async fn resolve(a: &Admin, org: TenantId, identifier: String) -> Result<(String, Subject)> {
-    if identifier == ANYONE {
-        return Ok((identifier, Subject::Anyone));
+/// Идентификатор, как хранится: `anyone` и имя входа учётной записи — в хранимом виде (без учёта регистра), иное
+/// (имя группы) — как есть.
+async fn stored(a: &Admin, org: TenantId, identifier: String) -> Result<String> {
+    if identifier.eq_ignore_ascii_case(ANYONE) {
+        return Ok(ANYONE.to_owned());
     }
-    if let Some(acc) = a.d.accounts.by_login(org, &identifier).await? {
-        return Ok((acc.login, Subject::Account(acc.id)));
-    }
-    let groups = a.d.groups.list(org).await?;
-    Ok(match groups.iter().find(|g| g.name == identifier) {
-        Some(g) => (identifier, Subject::Group(g.id)),
-        None => (identifier, Subject::Unknown),
+    Ok(match a.d.accounts.by_login(org, &identifier).await? {
+        Some(acc) => acc.login,
+        None => identifier,
     })
 }
 
@@ -656,7 +611,8 @@ async fn resolve(a: &Admin, org: TenantId, identifier: String) -> Result<(String
 mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
-    use tp_contracts::groups::{DistributionGroup, GroupStore, SenderRestriction};
+    use tp_contracts::dav::Collection;
+    use tp_contracts::groups::{DistributionGroup, GroupMember, GroupStore, SenderRestriction};
 
     use super::*;
     use crate::testenv::Env;
@@ -817,7 +773,12 @@ mod tests {
         let owner = env.account("owner@example.org").await;
         let peer = env.account("peer@example.org").await;
         env.account("out@example.org").await;
-        let collection = env.sharing.add_collection(owner, "work").await;
+        let work = Collection::new(CollectionKind::Calendar, "work");
+        env.dav
+            .create_collection(owner, work.clone())
+            .await
+            .expect("collection");
+        let collection = work.id;
         let (s, _, b) = env
             .call(
                 "GET",
@@ -872,7 +833,8 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(b.as_array().map(Vec::len), Some(2));
 
-        // Полные права — только группе staff (с вложенной team), остальным — занятость.
+        // Полные права — только группе staff (участникам — с вложенной team), остальным — занятость; субъект-группа —
+        // по имени группы политики (единый слой прав tp-auth).
         let team = group(&env, "team", vec![GroupMember::Account(peer.account)]).await;
         let staff = group(&env, "staff", vec![GroupMember::Group(team)]).await;
         let policy = format!("{}/calendar-sharing", org());
@@ -886,8 +848,9 @@ mod tests {
         let admin = json!({"admin": true});
         for (who, status) in [
             ("peer@example.org", StatusCode::OK),
-            ("team", StatusCode::OK),
             ("staff", StatusCode::OK),
+            ("Staff", StatusCode::OK),
+            ("team", StatusCode::CONFLICT),
             ("out@example.org", StatusCode::CONFLICT),
             ("ldap-group", StatusCode::CONFLICT),
         ] {
@@ -913,7 +876,12 @@ mod tests {
 
         // Отзыв — пустые права; уже выданное `anyone` политика не удаляет.
         let (s, _, b) = env
-            .call("PUT", &format!("{base}/team"), Some("org"), Some(json!({})))
+            .call(
+                "PUT",
+                &format!("{base}/staff"),
+                Some("org"),
+                Some(json!({})),
+            )
             .await;
         assert_eq!(s, StatusCode::OK, "{b}");
         let ids: Vec<&str> = b
@@ -922,7 +890,10 @@ mod tests {
             .iter()
             .filter_map(|e| e["identifier"].as_str())
             .collect();
-        assert!(ids.contains(&"anyone") && !ids.contains(&"team"), "{ids:?}");
+        assert!(
+            ids.contains(&"anyone") && !ids.contains(&"staff"),
+            "{ids:?}"
+        );
 
         // Недопустимый идентификатор — 400; нет коллекции — 404; оператор не меняет.
         let (s, _, _) = env
