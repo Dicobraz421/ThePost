@@ -1,7 +1,8 @@
 //! JMAP Calendars — события (JMAP-28): `CalendarEvent/get`, `/changes`, `/set`, `/copy` поверх [`DavStore`].
 //!
 //! Хранится iCalendar — тот же объект, что читает и пишет CalDAV; JSCalendar ↔ iCalendar — calcard (JSCalendar 2.0,
-//! draft-ietf-calext-jscalendarbis: `recurrenceRule`, `calendarAddress`), индекс объекта — `tp_dav::index`.
+//! draft-ietf-calext-jscalendarbis: `recurrenceRule`, `calendarAddress`), индекс объекта — `tp_dav::index::for_write`,
+//! как у CalDAV (`Schedule-Tag`, занятость с обрезкой; JMAP-40).
 //! Объект JMAP — событие ресурса (главный `VEVENT` с исключениями в `recurrenceOverrides`); свойства `VCALENDAR`
 //! и прочие компоненты ресурса при изменении из JMAP сохраняются.
 //!
@@ -147,7 +148,7 @@ fn to_ical(
     })
     .ok_or_else(|| invalid("JSCalendar cannot be converted to iCalendar", &[]))?;
     let index =
-        scheduling::object_index(&ical, opts).map_err(|e| invalid(&e.to_string(), &["uid"]))?;
+        tp_dav::index::for_write(&ical, opts).map_err(|e| invalid(&e.to_string(), &["uid"]))?;
     if index.span.is_none() {
         let why = "invalid start, duration or recurrence";
         return Err(invalid(why, &["start", "duration", "recurrenceRule"]));
