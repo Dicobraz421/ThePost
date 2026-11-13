@@ -251,9 +251,7 @@ impl Services {
             accounts: Arc::new(meta.clone()),
             tenant,
         });
-        // TODO(AUTH-05): механизм GSSAPI (`AuthSasl::with_gssapi(Gssapi::system(..))`) — после включения feature
-        // `gssapi` в сборке (нужна libkrb5 в CI и образе).
-        let sasl: Arc<dyn SaslServer> = Arc::new(tp_auth::AuthSasl::new(authn.clone()));
+        let sasl = sasl_server(authn.clone(), auth.gssapi.as_ref())?;
         let authz: Arc<dyn Authorizer> = Arc::new(tp_auth::AclAuthorizer::new(
             Arc::new(meta.clone()),
             Arc::new(meta.clone()),
@@ -963,6 +961,31 @@ fn parse(raw: &[u8]) -> Parsed {
     }
 }
 
+/// SASL узла для smtp-in, submission, IMAP, POP3 и ManageSieve. Секция `auth.gssapi` задана и узел собран с фичей
+/// `gssapi` — механизм GSSAPI (системная MIT Kerberos); без фичи механизм не объявляется (предупреждение в журнале).
+fn sasl_server(
+    authn: Arc<dyn Authenticator>,
+    gssapi: Option<&tp_auth::GssapiConfig>,
+) -> Result<Arc<dyn SaslServer>> {
+    let sasl = tp_auth::AuthSasl::new(authn);
+    let Some(gssapi) = gssapi else {
+        return Ok(Arc::new(sasl));
+    };
+    #[cfg(feature = "gssapi")]
+    {
+        let gss = tp_auth::Gssapi::system(gssapi).map_err(|e| infra::context("auth.gssapi", e))?;
+        Ok(Arc::new(sasl.with_gssapi(gss)))
+    }
+    #[cfg(not(feature = "gssapi"))]
+    {
+        tracing::warn!(
+            keytab = ?gssapi.keytab,
+            "auth.gssapi: узел собран без фичи gssapi — механизм GSSAPI не объявляется"
+        );
+        Ok(Arc::new(sasl))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,6 +1028,43 @@ mod tests {
             accounts: Arc::new(meta),
             tenant: TenantId::DEFAULT,
         }
+    }
+
+    /// APP-58: секция `auth.gssapi` задана — под фичей `gssapi` механизм GSSAPI объявляется в SMTP (AUTH в EHLO) и
+    /// IMAP (AUTH= в CAPABILITY) — оба берут механизмы из общего SASL узла; без фичи не объявляется. Без секции —
+    /// не объявляется никогда.
+    #[test]
+    fn sasl_offers_gssapi_with_feature() {
+        use tp_contracts::sasl::Mechanism;
+        let authn: Arc<dyn Authenticator> = Arc::new(FakeAuthenticator::default());
+        let offered = |gssapi: Option<&tp_auth::GssapiConfig>| {
+            sasl_server(authn.clone(), gssapi)
+                .expect("sasl")
+                .mechanisms(true)
+        };
+        assert!(!offered(None).contains(&Mechanism::Gssapi));
+        let with_section = offered(Some(&tp_auth::GssapiConfig::default()));
+        assert_eq!(
+            with_section.contains(&Mechanism::Gssapi),
+            cfg!(feature = "gssapi")
+        );
+        assert!(with_section.contains(&Mechanism::Plain));
+    }
+
+    /// APP-58: keytab секции не найден — ошибка `auth.gssapi` при сборке сервисов, до запуска ролей.
+    #[cfg(feature = "gssapi")]
+    #[test]
+    fn sasl_rejects_missing_keytab() {
+        let authn: Arc<dyn Authenticator> = Arc::new(FakeAuthenticator::default());
+        let cfg = tp_auth::GssapiConfig {
+            keytab: Some(std::path::PathBuf::from("/nonexistent/thepost.keytab")),
+            ..tp_auth::GssapiConfig::default()
+        };
+        let err = sasl_server(authn, Some(&cfg)).err().expect("error");
+        assert!(
+            matches!(&err, Error::Invalid(m) if m.starts_with("auth.gssapi")),
+            "{err:?}"
+        );
     }
 
     /// Неудачи считаются по учётной записи из имени входа; успешный вход сбрасывает счётчик; порог — блокировка,
