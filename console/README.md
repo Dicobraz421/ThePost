@@ -10,11 +10,57 @@ DEPS-05) и раздаётся ролью admin под `/console/` (ADM-15). В�
 
 ```bash
 npm ci
-THEPOST_ADMIN=http://127.0.0.1:8080 npm run dev
+NODE_EXTRA_CA_CERTS=/путь/к/ca.pem THEPOST_ADMIN=https://127.0.0.1:8443 npm run dev
 ```
 
 Консоль — `http://localhost:5173/console/`; запросы `/api/*` сервер разработки передаёт узлу (`THEPOST_ADMIN`,
-по умолчанию `http://127.0.0.1:8080`). Вход — одноразовый токен: `thepost admin init` на узле.
+по умолчанию `https://127.0.0.1:8443`: Admin API слушает только TLS, `http.admin.listen`). Сертификат узла
+проверяется: CA, которым он выпущен, — в `NODE_EXTRA_CA_CERTS` (стандартная переменная Node). Вход — одноразовый
+токен: `thepost admin init` на узле.
+
+## Консоль на отдельном веб-сервере
+
+Кроме раздачи узлом (`/console/`), консоль ставится архивом `console/dist` из выпуска на любой веб-сервер
+(решение 68 от 11.11). Сборка рассчитана на адрес `/console/`: архив распаковывается в каталог `console`, неизвестные
+пути отдаются `index.html` (маршруты приложения).
+
+Адрес Admin API — файл `config.json` рядом с `index.html` (необязательный, читается один раз при открытии консоли):
+
+```json
+{ "apiBase": "https://mail.example.org:8443" }
+```
+
+`apiBase` — источник `https://узел[:порт]` без пути. Нет файла или поля — запросы идут к источнику страницы (как при
+раздаче узлом). Вход через OIDC не меняется: поставщика сообщает узел (`GET /api/v1/session`), адрес возврата —
+`<адрес консоли>/login`, он регистрируется у поставщика.
+
+Пример nginx (архив распакован в `/srv/www/console`):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name console.example.org;
+    # ssl_certificate …; ssl_certificate_key …;
+    root /srv/www;
+    location = / { return 302 /console/; }
+    location /console/ {
+        try_files $uri /console/index.html;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https://mail.example.org:8443 https://idp.example.org; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+    }
+    location /console/assets/ { expires 1y; }
+}
+```
+
+- `connect-src` политики содержимого — адрес API из `apiBase` и, если вход через OIDC, поставщик; без них браузер
+  не пропустит запросы. Политику ставит веб-сервер; `admin.console.connect_src` узла действует только на консоль,
+  которую раздаёт сам узел.
+- На узле — источник консоли в `admin.console.cors_origins`, иначе браузер не пропустит ответы Admin API:
+
+  ```yaml
+  admin:
+    console:
+      cors_origins: ["https://console.example.org"]
+  ```
 
 ## Скрипты (их запускает job `console` в CI)
 

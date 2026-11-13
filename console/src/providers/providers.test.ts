@@ -1,6 +1,6 @@
-import { beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
 
-import { loadSession } from "../api/client";
+import { loadConfig, loadSession } from "../api/client";
 import { ORG, session, stubApi, whoami } from "../test-api";
 import { authProvider, sessionInfo } from "./auth";
 import { dataProvider } from "./data";
@@ -8,6 +8,12 @@ import { dataProvider } from "./data";
 beforeEach(() => {
   sessionStorage.clear();
   localStorage.clear();
+});
+
+// Адрес API — состояние модуля: после теста с config.json — снова источник страницы.
+afterEach(async () => {
+  stubApi({});
+  await loadConfig();
 });
 
 const signIn = async () => {
@@ -56,6 +62,48 @@ test("поставщик OIDC — из GET /api/v1/session (SessionInfo); не �
   expect(await sessionInfo()).toEqual({ oidc: null });
   stubApi({ "GET /api/v1/session": { status: 503, body: { status: 503, title: "Service Unavailable" } } });
   expect(await sessionInfo()).toEqual({ oidc: null });
+});
+
+const json = { "Content-Type": "application/json" };
+// `config.json` — рядом с `index.html`: каталог сборки (`base` Vite; в тестах — корень).
+const CONFIG = `${import.meta.env.BASE_URL}config.json`;
+
+test("config.json: запросы входа и провайдера данных — на apiBase, продолжение списка — оттуда же", async () => {
+  const API = "https://mail.example.org:8443";
+  const config = stubApi({ [`GET ${CONFIG}`]: { body: { apiBase: `${API}/` }, headers: json } });
+  await loadConfig();
+  expect(config[0].path).toBe(CONFIG);
+
+  const calls = stubApi({
+    [`POST ${API}/api/v1/session`]: { status: 201, body: session() },
+    [`GET ${API}/api/v1/orgs/${ORG}/accounts`]: {
+      body: [{ id: "1" }],
+      headers: { Link: `<${API}/api/v1/orgs/${ORG}/accounts?after=x@example.org>; rel="next"` },
+    },
+  });
+  expect(await authProvider.login({ token: "tpa_once" })).toMatchObject({ success: true });
+  const page = await dataProvider.getList({ resource: "accounts", pagination: { mode: "off" } });
+  expect(calls.map((c) => c.path)).toEqual([`${API}/api/v1/session`, `${API}/api/v1/orgs/${ORG}/accounts`]);
+  expect(page.cursor).toEqual({ next: "x@example.org" });
+});
+
+test("config.json: нет файла, страница вместо него или нет поля — источник страницы; не источник — ошибка", async () => {
+  const replies = [
+    { status: 404 },
+    { body: "<!doctype html>", headers: { "Content-Type": "text/html" } },
+    { body: {}, headers: json },
+  ];
+  for (const reply of replies) {
+    stubApi({ [`GET ${CONFIG}`]: reply });
+    await loadConfig();
+    const calls = stubApi({ "GET /api/v1/session": { body: { oidc: null } } });
+    await sessionInfo();
+    expect(calls[0].path).toBe("/api/v1/session");
+  }
+  for (const apiBase of ["https://mail.example.org/api", "mail.example.org", 8443]) {
+    stubApi({ [`GET ${CONFIG}`]: { body: { apiBase }, headers: json } });
+    await expect(loadConfig()).rejects.toThrow("config.json: apiBase");
+  }
 });
 
 test("список: организация в пути, курсор after/limit, продолжение из Link", async () => {
