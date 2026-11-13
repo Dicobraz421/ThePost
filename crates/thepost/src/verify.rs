@@ -235,7 +235,7 @@ mod tests {
         assert!(json.contains(&orphan.path()), "{json}");
         let text = summary(&report);
         assert!(
-            text.contains("«сирот» 1") && text.contains("повреждённых записей 2"),
+            text.contains("«сирот» 1") && text.contains("пропало 1, неверный размер 1"),
             "{text}"
         );
 
