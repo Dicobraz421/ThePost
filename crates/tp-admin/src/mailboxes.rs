@@ -187,7 +187,7 @@ pub struct MailboxAuditQuery {
     #[serde(default)]
     #[param(value_type = Option<String>)]
     pub actor_kind: Option<AuditActorKind>,
-    /// Действие (`login`, `read`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,
+    /// Действие (`login`, `read`, `search`, `move`, `delete`, `send`, `send_as`, `send_on_behalf`, `change_rights`,
     /// `change_rules`, `change_forwarding`).
     #[serde(default)]
     #[param(value_type = Option<String>)]
@@ -231,7 +231,7 @@ pub struct MailboxAuditEntry {
     pub mailbox: Option<String>,
     /// Письмо.
     pub message: Option<String>,
-    /// Пояснение (Message-ID, адрес, право).
+    /// Пояснение (Message-ID, адрес, право, строка запроса поиска).
     pub detail: Option<String>,
     /// Клиент: протокол и адрес.
     pub client: Option<String>,

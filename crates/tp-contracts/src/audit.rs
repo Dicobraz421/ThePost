@@ -1,9 +1,9 @@
 //! Аудит доступа к ящику (CONTRACTS.md#MailboxAudit; SRS 5.2, решение 2026-11-04-exchange-parity; CTR-35).
 //!
-//! Действия не владельца (представитель, участник общего ящика, администратор) — вход, чтение, перемещение,
-//! удаление, отправка от имени, изменение прав — записываются по умолчанию; действия владельца (удаление,
-//! перемещение, отправка, изменение правил и пересылки) — по политике [`AuditPolicy`]; чтение владельцем не
-//! записывается никогда. Протоколы (`tp-imap`, `tp-jmap`, `tp-smtp`, Admin API) вызывают [`MailboxAudit::record_audit`]
+//! Действия не владельца (представитель, участник общего ящика, администратор) — вход, чтение, поиск по тексту,
+//! перемещение, удаление, отправка от имени, изменение прав — записываются по умолчанию; действия владельца (удаление,
+//! перемещение, отправка, изменение правил и пересылки) — по политике [`AuditPolicy`]; вход, чтение и поиск владельцем
+//! не записываются никогда. Протоколы (`tp-imap`, `tp-jmap`, `tp-smtp`, Admin API) вызывают [`MailboxAudit::record_audit`]
 //! для каждого действия, политику применяет хранилище. Журнал — только добавление и поиск; выгрузка в SIEM —
 //! Admin API. Реализация — `tp-meta` (META-33), in-memory — `tp-testkit`.
 
@@ -40,6 +40,11 @@ pub enum AuditAction {
     Login,
     /// Чтение письма.
     Read,
+    /// Поиск по тексту писем (решение 114): IMAP `SEARCH`/`UID SEARCH` с `BODY`/`TEXT`, JMAP `Email/query` с фильтром
+    /// `text`/`body`. Строка запроса — в [`AuditObject::detail`] (до [`MAX_AUDIT_TEXT_LEN`] символов без управляющих),
+    /// папка — в [`AuditObject::mailbox`]; найденные письма и их содержимое не записываются. Поиск владельцем в своём
+    /// ящике не записывается (не входит в [`AuditAction::OWNER`]).
+    Search,
     /// Перемещение писем между папками.
     Move,
     /// Удаление писем (в корзину или окончательно).
@@ -59,7 +64,7 @@ pub enum AuditAction {
 }
 
 impl AuditAction {
-    /// Действия владельца, которые политика может включить (чтение владельцем не записывается).
+    /// Действия владельца, которые политика может включить (вход, чтение и поиск владельцем не записываются).
     pub const OWNER: [AuditAction; 5] = [
         AuditAction::Delete,
         AuditAction::Move,
@@ -76,7 +81,8 @@ pub struct AuditObject {
     pub mailbox: Option<MailboxId>,
     /// Письмо.
     pub message: Option<MessageId>,
-    /// Пояснение: Message-ID, адрес, право; содержимое писем не записывается.
+    /// Пояснение: Message-ID, адрес, право, строка запроса поиска ([`AuditAction::Search`]); содержимое писем не
+    /// записывается.
     pub detail: Option<String>,
 }
 
@@ -168,10 +174,13 @@ impl AuditPolicy {
         }
     }
 
-    /// Записывается ли действие: владелец — только действия из `owner` (чтение — никогда); не владелец — `non_owner`.
+    /// Записывается ли действие: владелец — только действия из `owner`, входящие в [`AuditAction::OWNER`] (вход,
+    /// чтение и поиск — никогда); не владелец — `non_owner`.
     pub fn records(&self, kind: AuditActorKind, action: AuditAction) -> bool {
         match kind {
-            AuditActorKind::Owner => action != AuditAction::Read && self.owner.contains(&action),
+            AuditActorKind::Owner => {
+                AuditAction::OWNER.contains(&action) && self.owner.contains(&action)
+            }
             AuditActorKind::Delegate | AuditActorKind::Admin => self.non_owner,
         }
     }
@@ -318,6 +327,14 @@ mod tests {
         assert!(all.records(AuditActorKind::Owner, AuditAction::ChangeForwarding));
         assert!(!all.records(AuditActorKind::Owner, AuditAction::Read));
         assert!(!all.records(AuditActorKind::Owner, AuditAction::Login));
+        assert!(!all.records(AuditActorKind::Owner, AuditAction::Search));
+        assert!(p.records(AuditActorKind::Delegate, AuditAction::Search));
+        let searching = AuditPolicy {
+            non_owner: true,
+            owner: [AuditAction::Search].into_iter().collect(),
+        };
+        assert!(matches!(searching.validate(), Err(Error::Invalid(_))));
+        assert!(!searching.records(AuditActorKind::Owner, AuditAction::Search));
         let quiet = AuditPolicy {
             non_owner: false,
             owner: BTreeSet::new(),
@@ -358,6 +375,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuditAction::SendOnBehalf).expect("serialize"),
             "\"send_on_behalf\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuditAction::Search).expect("serialize"),
+            "\"search\""
         );
     }
 }
