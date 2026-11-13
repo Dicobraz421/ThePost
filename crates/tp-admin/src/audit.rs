@@ -32,7 +32,7 @@ use crate::server::{Admin, ApiResult, Deps, Problem};
 pub const AUDIT_ROUTE: &str = "/api/v1/orgs/{org}/audit";
 
 /// Запись журнала аудита в ответе API и в экспорте в SIEM ([`AdminAuditRecord`] контракта).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AuditRecord {
     /// Момент (UTC).
     #[serde(with = "time::serde::rfc3339")]
@@ -85,7 +85,7 @@ impl From<&AdminAuditRecord> for AuditRecord {
 }
 
 /// Запись журнала с номером в ответе API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AuditEntry {
     /// Номер записи (возрастает в порядке добавления).
     pub seq: u64,
@@ -95,7 +95,7 @@ pub struct AuditEntry {
 }
 
 /// Страница журнала аудита в ответе API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AuditPage {
     /// Записи по возрастанию `seq`.
     pub entries: Vec<AuditEntry>,
@@ -126,7 +126,7 @@ pub(crate) async fn record(d: &Deps, record: &AdminAuditRecord) -> Result<()> {
 }
 
 /// Параметры чтения журнала аудита (условия — по «и»).
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Serialize, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct AuditParams {

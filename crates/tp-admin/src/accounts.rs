@@ -124,7 +124,7 @@ pub struct Policies {
 }
 
 /// Организация.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct Organization {
     /// Идентификатор.
     pub id: String,

@@ -36,7 +36,7 @@ use crate::content::{self, Access};
 use crate::server::{Admin, ApiResult, Caller, Problem};
 
 /// Страница списка.
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Serialize, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct PageQuery {
@@ -51,7 +51,7 @@ pub struct PageQuery {
 }
 
 /// Элемент корзины.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TrashEntry {
     /// Письмо (идентификатор сохраняется при восстановлении).
     pub message: String,
@@ -83,7 +83,7 @@ pub struct TrashEntry {
 }
 
 /// Страница корзины.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TrashPage {
     /// Действующий срок корзины ящика; `null` — значение по умолчанию конфигурации.
     #[serde(with = "duration::option")]
@@ -96,7 +96,7 @@ pub struct TrashPage {
 }
 
 /// Восстановленное письмо.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RestoredMessage {
     /// Письмо.
     pub message: String,

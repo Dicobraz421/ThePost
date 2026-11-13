@@ -21,7 +21,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Параметры поиска.
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Serialize, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryParams {
@@ -46,7 +46,7 @@ pub struct DeliveryParams {
 }
 
 /// Событие журнала доставки.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DeliveryEntry {
     /// Момент события.
     #[serde(with = "time::serde::rfc3339")]
@@ -89,7 +89,7 @@ impl From<DeliveryEvent> for DeliveryEntry {
 }
 
 /// Страница результатов.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DeliveryResults {
     /// События по возрастанию времени.
     pub events: Vec<DeliveryEntry>,

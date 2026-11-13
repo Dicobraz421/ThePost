@@ -24,7 +24,7 @@ Linux или WSL2 с Docker. Rspamd принимает Milter на воркер�
            on_failure: accept
    ```
 3. `thepost serve` с этой конфигурацией; `example.org` — принятый домен организации
-   (`thepost admin domain add example.org`), учётная запись `bob@example.org` существует.
+   (`thepost admin transport domain create example.org`), учётная запись `bob@example.org` существует.
 
 ## Сценарии
 1. Обычное письмо: `swaks --server 127.0.0.1:2525 --to bob@example.org --from a@example.net` → `250 2.0.0 OK`;

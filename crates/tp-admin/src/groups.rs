@@ -72,7 +72,7 @@ pub enum SenderRestrictionSchema {
 }
 
 /// Группа рассылки.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GroupInfo {
     /// Идентификатор.
     pub id: String,
@@ -207,7 +207,7 @@ impl GroupInfo {
 }
 
 /// Новая группа.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewGroup {
     /// Отображаемое имя.
@@ -240,13 +240,17 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 }
 
 /// Изменение группы: заданные поля заменяются, отсутствующие — без изменений.
-#[derive(Debug, Default, Deserialize, ToSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GroupPatch {
     /// Отображаемое имя (не для групп каталога).
     pub name: Option<String>,
     /// Адрес рассылки; `null` — снять (не для групп каталога).
-    #[serde(default, deserialize_with = "present")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schema(value_type = Option<String>)]
     pub address: Option<Option<String>>,
     /// Участники (не для групп каталога).
