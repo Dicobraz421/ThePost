@@ -304,10 +304,12 @@ klist -k thepost.keytab   # три принципала
 ```
 Keytab MIT Kerberos читает только из `KRB5_KTNAME`; `auth.gssapi.keytab` узел сверяет с этой переменной.
 - ВМ (Ansible): `thepost_gssapi_keytab_src` — файл на управляющей машине → `/etc/thepost/thepost.keytab` (0640
-  root:thepost), drop-in `thepost.service.d/gssapi.conf` (`Environment=KRB5_KTNAME=FILE:…`), `auth.gssapi.keytab`;
+  root:thepost), drop-in `thepost.service.d/gssapi.conf` (`Environment=KRB5_KTNAME=FILE:…` и
+  `Environment=KRB5RCACHEDIR=/var/lib/thepost/krb5rcache`), `auth.gssapi.keytab`;
   `hostname` и `realms` — `thepost_gssapi`. Без `thepost_gssapi_keytab_src` роль убирает keytab и drop-in.
 - Вручную: `sudo install -m 0640 -o root -g thepost thepost.keytab /etc/thepost/thepost.keytab`, `systemctl edit thepost`:
-  `[Service]` + `Environment=KRB5_KTNAME=FILE:/etc/thepost/thepost.keytab`, в `config.yaml` —
+  `[Service]` + `Environment=KRB5_KTNAME=FILE:/etc/thepost/thepost.keytab` и
+  `Environment=KRB5RCACHEDIR=/var/lib/thepost/krb5rcache`, в `config.yaml` —
   `auth: { gssapi: { keytab: /etc/thepost/thepost.keytab, hostname: mail.example.ru } }`.
 - Kubernetes (Helm): секрет с ключом `keytab` → `gssapi.keytabSecret` (раздел «Узел thepost (Helm)»).
 
@@ -444,4 +446,4 @@ Admin API — `127.0.0.1:8443` в поде (`kubectl port-forward`), служе�
 ключ TLS — `TLS_KEY`: секрет `thepost/tls#key`, в values — `config.tls.key`; смена ключа — повторный `bootstrap.sh`).
 Вход по Kerberos: `kubectl -n thepost create secret generic thepost-keytab --from-file=keytab=thepost.keytab` и
 `--set gssapi.keytabSecret=thepost-keytab` — чарт монтирует keytab в `/etc/thepost/krb5/thepost.keytab`, задаёт
-`KRB5_KTNAME` и `config.auth.gssapi.keytab`; `hostname` и `realms` — в `config.auth.gssapi`.
+`KRB5_KTNAME`, `KRB5RCACHEDIR` и `config.auth.gssapi.keytab`; `hostname` и `realms` — в `config.auth.gssapi`.

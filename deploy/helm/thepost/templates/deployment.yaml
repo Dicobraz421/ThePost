@@ -32,9 +32,12 @@ spec:
           args: ["serve", "--config", "/etc/thepost/config.yaml"]
           {{- if .Values.gssapi.keytabSecret }}
           # Keytab Kerberos: MIT Kerberos читает его только из KRB5_KTNAME (auth.gssapi.keytab сверяется с ней).
+          # Кэш повторов — KRB5RCACHEDIR: каталог узла в томе state, разрешённый Landlock при auth.gssapi (SYS-16).
           env:
             - name: KRB5_KTNAME
               value: "FILE:{{ include "thepost.keytab" . }}"
+            - name: KRB5RCACHEDIR
+              value: /var/lib/thepost/krb5rcache
           {{- end }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
