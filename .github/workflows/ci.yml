@@ -43,7 +43,9 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           if [ -z "$BASE" ]; then
-            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"; echo openapi=true >> "$GITHUB_OUTPUT"
+            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"
+            # Сверка схемы с копией консоли — только PR и очередь (CI-11): расхождение не валит main и артефакт release.
+            echo openapi=false >> "$GITHUB_OUTPUT"
             if [ -f console/package-lock.json ]; then echo console=true; else echo console=false; fi >> "$GITHUB_OUTPUT"
             exit 0
           fi
