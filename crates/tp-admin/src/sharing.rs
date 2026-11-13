@@ -21,10 +21,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, put};
-use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_auth::CollectionAuthorizer;
 use tp_contracts::auth::Principal;
@@ -39,6 +39,7 @@ use tp_contracts::{AccountId, Error, GroupId, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::accounts::account;
+use crate::extract::{Json, Path};
 use crate::server::{Admin, ApiResult, Problem, Refused};
 
 /// Хранилища общего доступа, представителей и ресурсов (CTR-48; реализации — `tp-meta`).

@@ -26,11 +26,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -46,6 +46,7 @@ use tp_contracts::transport::{AcceptedDomain, DomainKind};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::extract::Json;
 use crate::server::{Admin, AdminRole, ApiError, Caller, Problem};
 
 /// Маршрут обмена локального токена на сессию.

@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::Router;
+use axum::extract::State;
 use axum::routing::get;
-use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tp_contracts::TenantId;
@@ -18,6 +18,7 @@ use tp_contracts::delivery::{
 };
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::extract::{Json, Path, Query};
 use crate::server::{Admin, ApiResult, Problem};
 
 /// Параметры поиска.

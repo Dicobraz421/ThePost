@@ -14,15 +14,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::addressbook::{DynamicGroup, MailContact, MemberFilter, OrgMember, OrgUnit};
 use tp_contracts::{ContactId, Error, GroupId, OrgUnitId, Result, TenantId};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::extract::{Json, Path, Query};
 use crate::server::{Admin, ApiResult, Deps, Problem};
 
 /// Почтовый контакт.

@@ -17,6 +17,7 @@
 //!   коллекции;
 //! - [`resources`] — ресурсы (переговорные, оборудование) и правила бронирования;
 //! - [`sieve`] — правила Sieve и автоответ учётной записи, скрипт организации: проверка текста до записи;
+//! - `extract` — разбор тела, строки и пути запроса (`Json`, `Query`, `Path`): отказ — 400 problem+json с полем;
 //! - `cors` — CORS `/api/v1/*` для консоли на отдельном веб-сервере (`admin.console.cors_origins`);
 //! - [`console`] — веб-консоль: вшитая статика `console/dist` (фича `console`), маршруты SPA, заголовки безопасности;
 //! - [`init`] — первый администратор без OIDC (`thepost admin init`): локальный сокет, одноразовый токен, сессия.
@@ -30,6 +31,7 @@ mod cors;
 pub mod delivery;
 pub mod directory;
 pub mod export;
+mod extract;
 pub mod groups;
 pub mod init;
 pub mod mailboxes;
