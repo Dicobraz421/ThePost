@@ -1,6 +1,7 @@
 //! META-51: планирование встреч на PostgreSQL — наборы `tp_testkit::suite::freebusy` и `suite::itip`, сигналы
 //! входящих, RLS новых таблиц, миграция 0024 на базе прежней схемы, занятость учётных записей разных шардов.
 //! META-54: набор `suite::freebusy_recurring` (разворот повторов при запросе) и миграция 0025.
+//! META-69: набор `suite::itip::inbox_log` (журнал входящих), очистка надгробий входящих, миграция 0038.
 
 mod common;
 
@@ -162,6 +163,67 @@ async fn inbox_signals_after_commit() {
     suite::itip::signals(&meta, bus.as_ref(), scope).await;
 }
 
+/// CTR-65, META-69: журнал входящих — набор `suite::itip::inbox_log`.
+#[tokio::test]
+async fn passes_inbox_log_suite() {
+    let Some((meta, fx)) = fixture().await else {
+        return;
+    };
+    suite::itip::inbox_log(&meta, fx.owner).await;
+}
+
+/// META-69: очистка надгробий DAV убирает и надгробия входящих и поднимает границу: токен до очистки — `Conflict`,
+/// токен на границе действует; свежие надгробия (срок по умолчанию) остаются.
+#[tokio::test]
+async fn inbox_tombstones_purge_raises_floor() {
+    let Some(pool) = common::pool().await else {
+        return;
+    };
+    let meta = PgMeta::new(pool, MetaConfig::default());
+    let scope = common::account(&meta).await;
+    let a = meta
+        .inbox_put(scope, "a.ics", message("u1"))
+        .await
+        .expect("put a");
+    meta.inbox_put(scope, "b.ics", message("u2"))
+        .await
+        .expect("put b");
+    let gone = meta.inbox_delete(scope, "a.ics").await.expect("delete a");
+    meta.purge_dav_tombstones().await.expect("purge");
+    assert_eq!(
+        meta.inbox_changes(scope, a.modseq, 10)
+            .await
+            .expect("свежее надгробие")
+            .destroyed,
+        vec![a.id]
+    );
+
+    let purged = meta
+        .purge_dav_tombstones_before(OffsetDateTime::now_utc() + Duration::minutes(1))
+        .await
+        .expect("purge");
+    assert!(purged >= 1, "очищено {purged}");
+    assert_eq!(
+        meta.inbox_changes(scope, a.modseq, 10).await,
+        Err(Error::Conflict),
+        "токен до очистки"
+    );
+    let at_floor = meta
+        .inbox_changes(scope, gone, 10)
+        .await
+        .expect("на границе");
+    assert!(at_floor.destroyed.is_empty() && at_floor.created.is_empty());
+    assert_eq!(at_floor.new_state, gone);
+    assert_eq!(
+        meta.inbox_changes(scope, ModSeq::ZERO, 10)
+            .await
+            .expect("полная")
+            .created
+            .len(),
+        1
+    );
+}
+
 /// Перезапись объекта заменяет индекс занятости, удаление объекта и коллекции — убирает его строки.
 #[tokio::test]
 async fn busy_rows_follow_object() {
@@ -246,6 +308,12 @@ async fn rls_hides_other_tenants() {
     meta.inbox_put(owner, "a.ics", message("u1"))
         .await
         .expect("inbox_put");
+    meta.inbox_put(owner, "b.ics", message("u2"))
+        .await
+        .expect("inbox_put");
+    meta.inbox_delete(owner, "b.ics")
+        .await
+        .expect("inbox_delete");
     let other = common::tenant(meta.pool()).await;
     let counts = async |tenant: TenantId| -> Vec<i64> {
         let mut tx = schema::begin(meta.pool(), tenant).await.expect("begin");
@@ -254,7 +322,7 @@ async fn rls_hides_other_tenants() {
             .await
             .expect("role");
         let mut out = Vec::new();
-        for table in ["dav_busy", "dav_inbox"] {
+        for table in ["dav_busy", "dav_inbox", "dav_inbox_tombstones"] {
             let n: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT count(*) FROM {table} WHERE account_id = $1"
             )))
@@ -266,8 +334,9 @@ async fn rls_hides_other_tenants() {
         }
         // Запись в чужую организацию запрещена политикой.
         let err = sqlx::query(
-            "INSERT INTO dav_inbox (tenant_id, account_id, item_id, name, method, uid, sender, body, etag, modseq)
-             VALUES ($1, $2, $3, 'x.ics', 'REQUEST', 'u', 'a@b.example', '', '1', 1)",
+            "INSERT INTO dav_inbox (tenant_id, account_id, item_id, name, method, uid, sender, body, etag, modseq,
+                                    created_modseq)
+             VALUES ($1, $2, $3, 'x.ics', 'REQUEST', 'u', 'a@b.example', '', '1', 1, 1)",
         )
         .bind(if tenant == owner.tenant {
             other.as_uuid()
@@ -283,8 +352,8 @@ async fn rls_hides_other_tenants() {
         tx.rollback().await.expect("rollback");
         out
     };
-    assert_eq!(counts(owner.tenant).await, [1, 1]);
-    assert_eq!(counts(other).await, [0, 0]);
+    assert_eq!(counts(owner.tenant).await, [1, 1, 1]);
+    assert_eq!(counts(other).await, [0, 0, 0]);
 }
 
 /// Миграция 0024 на базе прежней схемы: календарь и событие, записанные до миграции, читаются — без занятости,
@@ -408,6 +477,115 @@ async fn migration_on_existing_db() {
         meta.state(scope, CollectionKind::Calendar).await,
         Ok(ModSeq(3))
     );
+    pool.close().await;
+    admin
+        .execute(AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
+        .await
+        .expect("drop database");
+}
+
+/// META-69: миграция 0038 на базе прежней схемы — ресурс входящих, записанный до неё, в журнале создан на своём
+/// `ModSeq`, время поступления — время миграции; перезапись — `updated`, удаление — надгробие.
+#[tokio::test]
+async fn inbox_log_migration_on_existing_db() {
+    let Some(url) = common::pg_url() else { return };
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let name = format!("tp_meta_{}", uuid::Uuid::now_v7().simple());
+    admin
+        .execute(AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .await
+        .expect("create database");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(
+            PgConnectOptions::from_str(&url)
+                .expect("url")
+                .database(&name),
+        )
+        .await
+        .expect("connect db");
+    schema::migrator_until(35)
+        .run(&pool)
+        .await
+        .expect("migrate until");
+    let pool = common::db(pool);
+    let tenant = common::tenant(&pool).await;
+    let (domain, _) = common::domain(&pool, tenant).await;
+    let scope = AccountScope {
+        tenant,
+        account: AccountId::new(),
+    };
+    let item = uuid::Uuid::now_v7();
+    let mut tx = schema::begin(&pool, tenant).await.expect("begin");
+    sqlx::query(
+        "INSERT INTO accounts (tenant_id, account_id, domain_id, login) VALUES ($1, $2, $3, 'old')",
+    )
+    .bind(tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(domain.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO dav_inbox (tenant_id, account_id, item_id, name, method, uid, sender, body, etag, modseq)
+         VALUES ($1, $2, $3, 'old.ics', 'REQUEST', 'u0', 'boss@partner.example', 'BODY', '1', 1)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(item)
+    .execute(&mut *tx)
+    .await
+    .expect("inbox");
+    sqlx::query("UPDATE mailbox_state SET modseq = 1, dav_inbox_state = 1 WHERE account_id = $1")
+        .bind(scope.account.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("state");
+    tx.commit().await.expect("commit");
+
+    let before = OffsetDateTime::now_utc() - Duration::minutes(1);
+    schema::migrate(&pool).await.expect("migrate");
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let id = tp_contracts::dav::DavObjectId::from_uuid(item);
+    let inbox = meta.inbox_list(scope).await.expect("inbox_list");
+    assert_eq!(inbox.state, ModSeq(1));
+    assert_eq!(inbox.items.len(), 1);
+    assert!(inbox.items[0].received_at >= before, "время миграции");
+    assert_eq!(meta.inbox_state(scope).await, Ok(ModSeq(1)));
+    let all = meta
+        .inbox_changes(scope, ModSeq::ZERO, 10)
+        .await
+        .expect("changes");
+    assert_eq!((all.created, all.new_state), (vec![id], ModSeq(1)));
+
+    let put = meta
+        .inbox_put(scope, "old.ics", message("u0"))
+        .await
+        .expect("inbox_put");
+    assert_eq!((put.id, put.modseq), (id, ModSeq(2)));
+    assert_eq!(
+        meta.inbox_list(scope).await.expect("inbox_list").items[0].received_at,
+        inbox.items[0].received_at,
+        "перезапись не меняет время поступления"
+    );
+    let upd = meta
+        .inbox_changes(scope, ModSeq(1), 10)
+        .await
+        .expect("changes");
+    assert_eq!((upd.created, upd.updated), (Vec::new(), vec![id]));
+    let gone = meta
+        .inbox_delete(scope, "old.ics")
+        .await
+        .expect("inbox_delete");
+    let del = meta
+        .inbox_changes(scope, ModSeq(1), 10)
+        .await
+        .expect("changes");
+    assert_eq!((del.destroyed, del.new_state), (vec![id], gone));
     pool.close().await;
     admin
         .execute(AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
