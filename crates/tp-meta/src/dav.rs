@@ -16,20 +16,28 @@
 //! их тела, повторы разворачивает calcard вне транзакции ([`crate::busy`]). Входящие
 //! планирования — `dav_inbox`: номера изменений из того же счётчика, но состояние календарей они не меняют
 //! (`mailbox_state.dav_inbox_state`).
+//!
+//! Книга GAL организации (CTR-60) — в основной БД, в тех же таблицах, под служебной «учётной записью» организации
+//! (`gal_scope`: идентификатор — идентификатор организации) со своей строкой `mailbox_state` (счётчик `ModSeq`
+//! книги, границы надгробий) и единственной коллекцией — адресной книгой `gal`. Её строки читаются по коллекции:
+//! коллекции нет среди своих — она ищется среди книги GAL организации (`PgMeta::open_visible`); запись
+//! пользователя в неё — `Forbidden`. [`DavStore::sync_gal`] заменяет набор одной транзакцией: неизменные карточки не
+//! трогаются, исчезнувшие — в надгробия, остальные — записью с новым `ModSeq` и ETag.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection};
+use sqlx::{FromRow, PgConnection, Postgres, Transaction};
 use time::OffsetDateTime;
 use tp_contracts::config::duration;
 use tp_contracts::dav::{
     CardSearch, Collection, CollectionId, CollectionKind, Component, DavLimits, DavObject,
-    DavObjectId, DavStore, DeleteOutcome, GalCard, MoveOutcome, Moved, ObjectIndex, ObjectRef,
-    Precondition, Put, PutOutcome, Span, TimeRange, dav_changed, valid_name,
+    DavObjectId, DavStore, DeleteOutcome, GAL_COLLECTION_NAME, GalCard, MoveOutcome, Moved,
+    ObjectIndex, ObjectRef, Precondition, Put, PutOutcome, Span, TimeRange, dav_changed,
+    gal_changed, valid_name, validate_gal,
 };
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::schedule::{
@@ -323,6 +331,152 @@ async fn require_collection(
     fetch_collection(tx, scope, id)
         .await?
         .ok_or(Error::NotFound)
+}
+
+/// Служебная «учётная запись» книги GAL организации `tenant` в основной БД: строки книги и её счётчик `ModSeq`.
+/// Идентификатор — идентификатор организации: среди учётных записей каталога его нет.
+fn gal_scope(tenant: TenantId) -> AccountScope {
+    AccountScope {
+        tenant,
+        account: AccountId::from_uuid(*tenant.as_uuid()),
+    }
+}
+
+/// Книга GAL организации `tenant` (транзакция основной БД), если есть.
+async fn fetch_gal(tx: &mut PgConnection, tenant: TenantId) -> Result<Option<Collection>> {
+    let scope = gal_scope(tenant);
+    let row: Option<CollectionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLLECTION_COLUMNS} FROM dav_collections
+         WHERE tenant_id = $1 AND account_id = $2 AND kind = $3 AND name = $4"
+    )))
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(kind_str(CollectionKind::AddressBook))
+    .bind(GAL_COLLECTION_NAME)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    row.map(CollectionRow::into_collection).transpose()
+}
+
+/// Вставляет коллекцию `collection` учётной записи `scope` с номером создания `ms`.
+async fn insert_collection(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    collection: &Collection,
+    ms: ModSeq,
+) -> Result<()> {
+    let components: Vec<&str> = collection.components.iter().map(|c| c.as_str()).collect();
+    sqlx::query(
+        "INSERT INTO dav_collections (tenant_id, account_id, collection_id, kind, name, display_name,
+                                      description, color, sort_order, timezone, components,
+                                      created_modseq, props_modseq, modseq, transparent,
+                                      is_default, subscribed, visible, alerts_with_time,
+                                      alerts_without_time)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14, $15, $16, $17,
+                 $18)",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(collection.id.as_uuid())
+    .bind(kind_str(collection.kind))
+    .bind(&collection.name)
+    .bind(&collection.display_name)
+    .bind(&collection.description)
+    .bind(&collection.color)
+    .bind(i64::from(collection.order))
+    .bind(&collection.timezone)
+    .bind(&components)
+    .bind(arg(ms)?)
+    .bind(collection.transparent)
+    .bind(collection.is_default)
+    .bind(collection.subscribed)
+    .bind(collection.visible)
+    .bind(&collection.alerts_with_time)
+    .bind(&collection.alerts_without_time)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Записывает ресурс `name` коллекции `collection` с номером `ms` (ETag — он же) и индексом занятости:
+/// `existing` — перезапись прежнего объекта (идентификатор сохраняется), `None` — новый. Счётчики коллекции и
+/// учётной записи не меняет. Возвращает идентификатор объекта.
+#[allow(clippy::too_many_arguments)]
+async fn store_object(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    collection: CollectionId,
+    existing: Option<Uuid>,
+    name: &str,
+    body: &str,
+    index: &ObjectIndex,
+    ms: ModSeq,
+) -> Result<DavObjectId> {
+    let etag = ms.to_string();
+    let (start, end) = match index.span {
+        Some(s) => (Some(s.start), s.end),
+        None => (None, None),
+    };
+    let id = match existing {
+        Some(id) => {
+            sqlx::query(
+                "UPDATE dav_objects SET uid = $4, etag = $5, component = $6, span_start = $7,
+                                        span_end = $8, body = $9, modseq = $10, schedule_tag = $11,
+                                        search = $12, search_pending = false, recurring = $13
+                 WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(id)
+            .bind(&index.uid)
+            .bind(&etag)
+            .bind(index.component.as_str())
+            .bind(start)
+            .bind(end)
+            .bind(body)
+            .bind(arg(ms)?)
+            .bind(&index.schedule_tag)
+            .bind(&index.search.strings)
+            .bind(index.recurring)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            DavObjectId::from_uuid(id)
+        }
+        None => {
+            let id = DavObjectId::new();
+            sqlx::query(
+                "INSERT INTO dav_objects (tenant_id, account_id, object_id, collection_id, name, uid,
+                                          etag, component, span_start, span_end, body,
+                                          created_modseq, placed_modseq, modseq, schedule_tag,
+                                          search, recurring)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14, $15)",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(id.as_uuid())
+            .bind(collection.as_uuid())
+            .bind(name)
+            .bind(&index.uid)
+            .bind(&etag)
+            .bind(index.component.as_str())
+            .bind(start)
+            .bind(end)
+            .bind(body)
+            .bind(arg(ms)?)
+            .bind(&index.schedule_tag)
+            .bind(&index.search.strings)
+            .bind(index.recurring)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            id
+        }
+    };
+    replace_busy(tx, scope, collection, id, existing.is_some(), &index.busy).await?;
+    Ok(id)
 }
 
 /// Снимает признак коллекции по умолчанию с коллекции вида `kind`, кроме `keep`: её изменение свойств с номером
@@ -650,7 +804,122 @@ fn page<T>(
     Ok(out)
 }
 
+/// Изменения объектов коллекций вида `kind` учётной записи `scope` после `since` по идентификаторам (JMAP
+/// `/changes`): полный ответ — до состояния вида.
+async fn object_changes(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    kind: CollectionKind,
+    since: ModSeq,
+    limit: usize,
+) -> Result<Changes<DavObjectId>> {
+    let mut rows: Vec<ChangeRow<Uuid>> = Vec::new();
+    if since <= ModSeq(i64::MAX as u64) {
+        rows = sqlx::query_as(
+            "SELECT o.object_id, o.modseq, o.created_modseq > $4, false
+             FROM dav_objects o JOIN dav_collections c USING (tenant_id, account_id, collection_id)
+             WHERE o.tenant_id = $1 AND o.account_id = $2 AND c.kind = $3 AND o.modseq > $4
+             UNION ALL
+             SELECT t.object_id, t.modseq, false, true FROM dav_tombstones t
+             WHERE $4 > 0 AND t.tenant_id = $1 AND t.account_id = $2 AND t.kind = $3
+               AND t.object_id IS NOT NULL AND t.modseq > $4
+               -- Надгробие перенесённого объекта — не удаление: объект жив в другой коллекции.
+               AND NOT EXISTS (SELECT 1 FROM dav_objects l
+                               WHERE l.tenant_id = $1 AND l.account_id = $2 AND l.object_id = t.object_id)
+             ORDER BY 2 LIMIT $5",
+        )
+        .bind(scope.tenant.as_uuid())
+        .bind(scope.account.as_uuid())
+        .bind(kind_str(kind))
+        .bind(arg(since)?)
+        .bind(fetch_limit(limit))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    let complete = kind_state(tx, scope, kind).await?;
+    check_since(tx, scope, since, Floor::Kind(kind)).await?;
+    let rows = rows
+        .into_iter()
+        .map(|(id, m, c, d)| (DavObjectId::from_uuid(id), m, c, d))
+        .collect();
+    page(rows, since, limit, complete)
+}
+
+/// Объекты учётной записи `scope` с идентификаторами `ids` (транзакция чтения на пуле `pool`).
+async fn objects_with_ids(
+    pool: &crate::pool::DbPool,
+    scope: AccountScope,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, DavObject>> {
+    let mut tx = begin(pool, scope.tenant).await?;
+    let rows: Vec<ObjectRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {OBJECT_COLUMNS} FROM {OBJECT_FROM}
+         WHERE tenant_id = $1 AND account_id = $2 AND object_id = ANY($3)"
+    )))
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    crate::commits::commit(tx).await?;
+    rows.into_iter()
+        .map(|r| Ok((r.object_id, r.into_object()?)))
+        .collect()
+}
+
 impl PgMeta {
+    /// Книга GAL организации `tenant` (основная БД), если есть.
+    async fn gal_book(&self, tenant: TenantId) -> Result<Option<Collection>> {
+        let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+        let gal = fetch_gal(&mut tx, tenant).await?;
+        crate::commits::commit(tx).await?;
+        Ok(gal)
+    }
+
+    /// Транзакция чтения коллекции `id`, видимой учётной записи `scope`, с областью строк коллекции и самой
+    /// коллекцией: своя — на шарде учётной записи; иначе книга GAL организации — в основной БД ([`gal_scope`]).
+    /// Нет ни той, ни другой — `NotFound`.
+    async fn open_visible(
+        &self,
+        scope: AccountScope,
+        id: CollectionId,
+    ) -> Result<(Transaction<'static, Postgres>, AccountScope, Collection)> {
+        let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
+        if let Some(c) = fetch_collection(&mut tx, scope, id).await? {
+            return Ok((tx, scope, c));
+        }
+        crate::commits::commit(tx).await?;
+        let gal = gal_scope(scope.tenant);
+        let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, scope.tenant).await?;
+        let c = require_collection(&mut tx, gal, id).await?;
+        Ok((tx, gal, c))
+    }
+
+    /// Своя коллекция `id` для записи; нет — книга GAL организации `Forbidden`, иначе `NotFound`.
+    async fn own_collection(
+        &self,
+        tx: &mut PgConnection,
+        scope: AccountScope,
+        id: CollectionId,
+    ) -> Result<Collection> {
+        if let Some(c) = fetch_collection(tx, scope, id).await? {
+            return Ok(c);
+        }
+        Err(
+            if self
+                .gal_book(scope.tenant)
+                .await?
+                .is_some_and(|g| g.id == id)
+            {
+                Error::Forbidden
+            } else {
+                Error::NotFound
+            },
+        )
+    }
+
     async fn dav_signal(
         &self,
         scope: AccountScope,
@@ -769,9 +1038,17 @@ impl DavStore for PgMeta {
             .await
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            rows.into_iter()
+            let mut out = rows
+                .into_iter()
                 .map(CollectionRow::into_collection)
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            if kind == CollectionKind::AddressBook
+                && let Some(gal) = self.gal_book(scope.tenant).await?
+            {
+                out.push(gal);
+                out.sort_by(|a, b| (a.order, a.name.as_bytes()).cmp(&(b.order, b.name.as_bytes())));
+            }
+            Ok(out)
         })
         .await
     }
@@ -785,7 +1062,10 @@ impl DavStore for PgMeta {
             let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
             let c = fetch_collection(&mut tx, scope, id).await?;
             crate::commits::commit(tx).await?;
-            Ok(c)
+            match c {
+                Some(c) => Ok(Some(c)),
+                None => Ok(self.gal_book(scope.tenant).await?.filter(|g| g.id == id)),
+            }
         })
         .await
     }
@@ -810,7 +1090,13 @@ impl DavStore for PgMeta {
             .await
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
-            row.map(CollectionRow::into_collection).transpose()
+            match row {
+                Some(row) => row.into_collection().map(Some),
+                None if kind == CollectionKind::AddressBook && name == GAL_COLLECTION_NAME => {
+                    self.gal_book(scope.tenant).await
+                }
+                None => Ok(None),
+            }
         })
         .await
     }
@@ -821,6 +1107,9 @@ impl DavStore for PgMeta {
         collection: Collection,
     ) -> Result<ModSeq> {
         collection.validate()?;
+        if collection.is_gal() {
+            return Err(Error::Conflict);
+        }
         let limit = i64::try_from(self.limits().max_collections).unwrap_or(i64::MAX);
         let (cleared, modseq) = self
             .once(async {
@@ -854,38 +1143,7 @@ impl DavStore for PgMeta {
                     return Err(Error::QuotaExceeded);
                 }
                 let (cleared, ms) = default_switch(&mut tx, scope, &collection, cur).await?;
-                let components: Vec<&str> =
-                    collection.components.iter().map(|c| c.as_str()).collect();
-                sqlx::query(
-                    "INSERT INTO dav_collections (tenant_id, account_id, collection_id, kind, name, display_name,
-                                                  description, color, sort_order, timezone, components,
-                                                  created_modseq, props_modseq, modseq, transparent,
-                                                  is_default, subscribed, visible, alerts_with_time,
-                                                  alerts_without_time)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14, $15, $16, $17,
-                             $18)",
-                )
-                .bind(scope.tenant.as_uuid())
-                .bind(scope.account.as_uuid())
-                .bind(collection.id.as_uuid())
-                .bind(kind_str(collection.kind))
-                .bind(&collection.name)
-                .bind(&collection.display_name)
-                .bind(&collection.description)
-                .bind(&collection.color)
-                .bind(i64::from(collection.order))
-                .bind(&collection.timezone)
-                .bind(&components)
-                .bind(arg(ms)?)
-                .bind(collection.transparent)
-                .bind(collection.is_default)
-                .bind(collection.subscribed)
-                .bind(collection.visible)
-                .bind(&collection.alerts_with_time)
-                .bind(&collection.alerts_without_time)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+                insert_collection(&mut tx, scope, &collection, ms).await?;
                 advance(&mut tx, scope, collection.kind, ms).await?;
                 crate::commits::commit(tx).await?;
                 Ok((cleared, ms))
@@ -909,7 +1167,7 @@ impl DavStore for PgMeta {
             .once(async {
                 let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
                 let cur = lock_modseq(&mut tx, scope).await?;
-                let now = require_collection(&mut tx, scope, collection.id).await?;
+                let now = self.own_collection(&mut tx, scope, collection.id).await?;
                 if now.kind != collection.kind || now.name != collection.name {
                     return Err(Error::invalid("вид и имя коллекции не меняются"));
                 }
@@ -960,7 +1218,7 @@ impl DavStore for PgMeta {
             .once(async {
                 let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
                 let cur = lock_modseq(&mut tx, scope).await?;
-                let c = require_collection(&mut tx, scope, id).await?;
+                let c = self.own_collection(&mut tx, scope, id).await?;
                 let kind = kind_str(c.kind);
                 // Объекты — в надгробия, каждый со своим ModSeq по порядку имён; коллекция — последней.
                 let n = sqlx::query(
@@ -1017,8 +1275,7 @@ impl DavStore for PgMeta {
         name: &str,
     ) -> Result<Option<DavObject>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, _) = self.open_visible(scope, collection).await?;
             let mut out = select_objects(&mut tx, scope, collection, "name = $4", None, |q| {
                 q.bind(name)
             })
@@ -1036,8 +1293,7 @@ impl DavStore for PgMeta {
         uid: &str,
     ) -> Result<Option<DavObject>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, _) = self.open_visible(scope, collection).await?;
             let mut out = select_objects(&mut tx, scope, collection, "uid = $4", None, |q| {
                 q.bind(uid)
             })
@@ -1054,8 +1310,7 @@ impl DavStore for PgMeta {
         collection: CollectionId,
     ) -> Result<Vec<ObjectRef>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, _) = self.open_visible(scope, collection).await?;
             let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
                 "SELECT object_id, name, etag FROM dav_objects
                  WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3
@@ -1087,8 +1342,7 @@ impl DavStore for PgMeta {
         names: &[String],
     ) -> Result<Vec<DavObject>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, _) = self.open_visible(scope, collection).await?;
             let found = select_objects(&mut tx, scope, collection, "name = ANY($4)", None, |q| {
                 q.bind(names)
             })
@@ -1116,22 +1370,18 @@ impl DavStore for PgMeta {
         self.idempotent(|| {
             let raw = raw.clone();
             async move {
-                let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-                let rows: Vec<ObjectRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                    "SELECT {OBJECT_COLUMNS} FROM {OBJECT_FROM}
-                     WHERE tenant_id = $1 AND account_id = $2 AND object_id = ANY($3)"
-                )))
-                .bind(scope.tenant.as_uuid())
-                .bind(scope.account.as_uuid())
-                .bind(&raw)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(db_err)?;
-                crate::commits::commit(tx).await?;
-                let found: HashMap<Uuid, DavObject> = rows
-                    .into_iter()
-                    .map(|r| Ok((r.object_id, r.into_object()?)))
-                    .collect::<Result<_>>()?;
+                let pool = self.read_db(scope).await?.pool;
+                let mut found = objects_with_ids(&pool, scope, &raw).await?;
+                // Не найденные среди своих — карточки книги GAL организации (основная БД).
+                let rest: Vec<Uuid> = raw
+                    .iter()
+                    .filter(|id| !found.contains_key(id))
+                    .copied()
+                    .collect();
+                if !rest.is_empty() {
+                    let main = self.read_pool(ShardId::MAIN).await?;
+                    found.extend(objects_with_ids(&main, gal_scope(scope.tenant), &rest).await?);
+                }
                 Ok(raw.iter().filter_map(|id| found.get(id).cloned()).collect())
             }
         })
@@ -1145,8 +1395,7 @@ impl DavStore for PgMeta {
         range: TimeRange,
     ) -> Result<Vec<DavObject>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, _) = self.open_visible(scope, collection).await?;
             // Условие ObjectIndex::may_overlap: без интервала — всегда; иначе start < range.end и end ≥ range.start.
             let out = select_objects(
                 &mut tx,
@@ -1182,7 +1431,7 @@ impl DavStore for PgMeta {
             .once(async move {
                 let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
                 let cur = lock_modseq(&mut tx, scope).await?;
-                let c = require_collection(&mut tx, scope, collection).await?;
+                let c = self.own_collection(&mut tx, scope, collection).await?;
                 if !valid_name(name) {
                     return Err(Error::invalid(format!(
                         "недопустимое имя ресурса: {name:?}"
@@ -1248,69 +1497,17 @@ impl DavStore for PgMeta {
                     return Err(Error::QuotaExceeded);
                 }
                 let ms = cur.next();
-                let etag = ms.to_string();
-                let (start, end) = match index.span {
-                    Some(s) => (Some(s.start), s.end),
-                    None => (None, None),
-                };
-                let id = match &existing {
-                    Some((id, _)) => {
-                        sqlx::query(
-                            "UPDATE dav_objects SET uid = $4, etag = $5, component = $6, span_start = $7,
-                                                    span_end = $8, body = $9, modseq = $10, schedule_tag = $11,
-                                                    search = $12, search_pending = false, recurring = $13
-                             WHERE tenant_id = $1 AND account_id = $2 AND object_id = $3",
-                        )
-                        .bind(scope.tenant.as_uuid())
-                        .bind(scope.account.as_uuid())
-                        .bind(id)
-                        .bind(&index.uid)
-                        .bind(&etag)
-                        .bind(index.component.as_str())
-                        .bind(start)
-                        .bind(end)
-                        .bind(body)
-                        .bind(arg(ms)?)
-                        .bind(&index.schedule_tag)
-                        .bind(&index.search.strings)
-                        .bind(index.recurring)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
-                        DavObjectId::from_uuid(*id)
-                    }
-                    None => {
-                        let id = DavObjectId::new();
-                        sqlx::query(
-                            "INSERT INTO dav_objects (tenant_id, account_id, object_id, collection_id, name, uid,
-                                                      etag, component, span_start, span_end, body,
-                                                      created_modseq, placed_modseq, modseq, schedule_tag,
-                                                      search, recurring)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $12, $13, $14, $15)",
-                        )
-                        .bind(scope.tenant.as_uuid())
-                        .bind(scope.account.as_uuid())
-                        .bind(id.as_uuid())
-                        .bind(collection.as_uuid())
-                        .bind(name)
-                        .bind(&index.uid)
-                        .bind(&etag)
-                        .bind(index.component.as_str())
-                        .bind(start)
-                        .bind(end)
-                        .bind(body)
-                        .bind(arg(ms)?)
-                        .bind(&index.schedule_tag)
-                        .bind(&index.search.strings)
-                        .bind(index.recurring)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
-                        id
-                    }
-                };
-                replace_busy(&mut tx, scope, collection, id, existing.is_some(), &index.busy)
-                    .await?;
+                let id = store_object(
+                    &mut tx,
+                    scope,
+                    collection,
+                    existing.as_ref().map(|e| e.0),
+                    name,
+                    body,
+                    index,
+                    ms,
+                )
+                .await?;
                 sqlx::query(
                     "UPDATE dav_collections SET modseq = $4, object_count = object_count + $5
                      WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3",
@@ -1329,7 +1526,7 @@ impl DavStore for PgMeta {
                     c.kind,
                     PutOutcome::Stored(Put {
                         id,
-                        etag,
+                        etag: ms.to_string(),
                         modseq: ms,
                         created: existing.is_none(),
                     }),
@@ -1354,7 +1551,7 @@ impl DavStore for PgMeta {
             .once(async move {
                 let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
                 let cur = lock_modseq(&mut tx, scope).await?;
-                let c = require_collection(&mut tx, scope, collection).await?;
+                let c = self.own_collection(&mut tx, scope, collection).await?;
                 let existing: Option<(Uuid, String)> = sqlx::query_as(
                     "SELECT object_id, etag FROM dav_objects
                      WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3 AND name = $4",
@@ -1436,8 +1633,21 @@ impl DavStore for PgMeta {
             .once(async move {
                 let mut tx = begin(&self.box_pool(scope).await?, scope.tenant).await?;
                 let cur = lock_modseq(&mut tx, scope).await?;
-                let src = require_collection(&mut tx, scope, from).await?;
-                let dst = require_collection(&mut tx, scope, to).await?;
+                let src = fetch_collection(&mut tx, scope, from).await?;
+                let dst = fetch_collection(&mut tx, scope, to).await?;
+                let (src, dst) = match (src, dst) {
+                    (Some(src), Some(dst)) => (src, dst),
+                    (src, dst) => {
+                        // Обе видны (своя или книга GAL) — книга GAL среди них: `Forbidden`.
+                        let gal = self.gal_book(scope.tenant).await?.map(|g| g.id);
+                        let seen = |own: bool, id: CollectionId| own || gal == Some(id);
+                        return Err(if seen(src.is_some(), from) && seen(dst.is_some(), to) {
+                            Error::Forbidden
+                        } else {
+                            Error::NotFound
+                        });
+                    }
+                };
                 let existing: Option<(Uuid, String, String, String)> = sqlx::query_as(
                     "SELECT object_id, etag, component, uid FROM dav_objects
                      WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3 AND name = $4",
@@ -1590,8 +1800,7 @@ impl DavStore for PgMeta {
     ) -> Result<Vec<DavObject>> {
         let needle = &needle.trim().to_lowercase();
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, _) = self.open_visible(scope, collection).await?;
             // Условие CardSearch::matches: вхождение подстроки (strpos — без шаблонов LIKE).
             let out = select_objects(
                 &mut tx,
@@ -1616,8 +1825,7 @@ impl DavStore for PgMeta {
         limit: usize,
     ) -> Result<Changes<String>> {
         self.idempotent(|| async move {
-            let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            let c = require_collection(&mut tx, scope, collection).await?;
+            let (mut tx, scope, c) = self.open_visible(scope, collection).await?;
             let mut rows: Vec<ChangeRow<String>> = Vec::new();
             if since <= ModSeq(i64::MAX as u64) {
                 // Существующие ресурсы после since и последние надгробия имён, которых сейчас нет.
@@ -1700,38 +1908,9 @@ impl DavStore for PgMeta {
     ) -> Result<Changes<DavObjectId>> {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_db(scope).await?.pool, scope.tenant).await?;
-            let mut rows: Vec<ChangeRow<Uuid>> = Vec::new();
-            if since <= ModSeq(i64::MAX as u64) {
-                rows = sqlx::query_as(
-                    "SELECT o.object_id, o.modseq, o.created_modseq > $4, false
-                     FROM dav_objects o JOIN dav_collections c USING (tenant_id, account_id, collection_id)
-                     WHERE o.tenant_id = $1 AND o.account_id = $2 AND c.kind = $3 AND o.modseq > $4
-                     UNION ALL
-                     SELECT t.object_id, t.modseq, false, true FROM dav_tombstones t
-                     WHERE $4 > 0 AND t.tenant_id = $1 AND t.account_id = $2 AND t.kind = $3
-                       AND t.object_id IS NOT NULL AND t.modseq > $4
-                       -- Надгробие перенесённого объекта — не удаление: объект жив в другой коллекции.
-                       AND NOT EXISTS (SELECT 1 FROM dav_objects l
-                                       WHERE l.tenant_id = $1 AND l.account_id = $2 AND l.object_id = t.object_id)
-                     ORDER BY 2 LIMIT $5",
-                )
-                .bind(scope.tenant.as_uuid())
-                .bind(scope.account.as_uuid())
-                .bind(kind_str(kind))
-                .bind(arg(since)?)
-                .bind(fetch_limit(limit))
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            }
-            let complete = kind_state(&mut tx, scope, kind).await?;
-            check_since(&mut tx, scope, since, Floor::Kind(kind)).await?;
+            let out = object_changes(&mut tx, scope, kind, since, limit).await?;
             crate::commits::commit(tx).await?;
-            let rows = rows
-                .into_iter()
-                .map(|(id, m, c, d)| (DavObjectId::from_uuid(id), m, c, d))
-                .collect();
-            page(rows, since, limit, complete)
+            Ok(out)
         })
         .await
     }
@@ -1903,15 +2082,153 @@ impl DavStore for PgMeta {
         ))
     }
 
-    // Книга GAL в PostgreSQL — META-63; до неё — только чтобы собирался workspace (CTR-60).
     async fn sync_gal(
         &self,
         tenant: TenantId,
         display_name: &str,
-        cards: Vec<GalCard>,
+        mut cards: Vec<GalCard>,
     ) -> Result<ModSeq> {
-        let _ = (tenant, display_name, cards);
-        Err(Error::internal("книга GAL в PostgreSQL — META-63"))
+        validate_gal(display_name, &cards, &self.limits())?;
+        // Номера изменений — по порядку имён (побайтно), как у надгробий.
+        cards.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+        let cards = &cards;
+        let count = i32::try_from(cards.len()).map_err(|_| Error::QuotaExceeded)?;
+        // Полный набор по значению: повтор после обрыва во время COMMIT находит записанное и ничего не меняет.
+        let (id, state, changed) = self
+            .rewrite(|| async move {
+                let scope = gal_scope(tenant);
+                let mut tx = begin(&self.pool, tenant).await?;
+                ensure_state(&mut tx, scope).await?;
+                let before = lock_modseq(&mut tx, scope).await?;
+                let mut ms = before;
+                let book = match fetch_gal(&mut tx, tenant).await? {
+                    Some(book) => book,
+                    None => {
+                        ms = ms.next();
+                        let book = Collection {
+                            display_name: display_name.to_owned(),
+                            ..Collection::new(CollectionKind::AddressBook, GAL_COLLECTION_NAME)
+                        };
+                        insert_collection(&mut tx, scope, &book, ms).await?;
+                        book
+                    }
+                };
+                if book.display_name != display_name {
+                    ms = ms.next();
+                    sqlx::query(
+                        "UPDATE dav_collections SET display_name = $4, props_modseq = $5, modseq = $5
+                         WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .bind(book.id.as_uuid())
+                    .bind(display_name)
+                    .bind(arg(ms)?)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                }
+                let existing = select_objects(&mut tx, scope, book.id, "true", None, |q| q).await?;
+                let wanted: HashSet<&str> = cards.iter().map(|c| c.name.as_str()).collect();
+                // Исчезнувшие — в надгробия, каждая со своим ModSeq по порядку имён.
+                let gone: Vec<&str> = existing
+                    .iter()
+                    .map(|o| o.name.as_str())
+                    .filter(|n| !wanted.contains(n))
+                    .collect();
+                if !gone.is_empty() {
+                    sqlx::query(
+                        "WITH gone AS (
+                             DELETE FROM dav_objects
+                             WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3 AND name = ANY($4)
+                             RETURNING object_id, name
+                         )
+                         INSERT INTO dav_tombstones (tenant_id, account_id, modseq, kind, collection_id, object_id,
+                                                     name)
+                         SELECT $1, $2, $5 + row_number() OVER (ORDER BY name COLLATE \"C\"), $6, $3, object_id,
+                                name
+                         FROM gone",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .bind(book.id.as_uuid())
+                    .bind(&gone)
+                    .bind(arg(ms)?)
+                    .bind(kind_str(CollectionKind::AddressBook))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    ms = ModSeq(ms.0 + gone.len() as u64);
+                }
+                // Неизменные (то же тело и индекс) не трогаются: ETag и ModSeq прежние.
+                let by_name: HashMap<&str, &DavObject> =
+                    existing.iter().map(|o| (o.name.as_str(), o)).collect();
+                let write: Vec<(&GalCard, Option<&DavObject>)> = cards
+                    .iter()
+                    .filter_map(|card| match by_name.get(card.name.as_str()) {
+                        Some(o) if o.body == card.body && o.index == card.index => None,
+                        prev => Some((card, prev.copied())),
+                    })
+                    .collect();
+                // UID переходит между карточками набора: прежние UID перезаписываемых освобождаются заранее
+                // (уникальный индекс проверяется построчно).
+                let freed: Vec<Uuid> = write
+                    .iter()
+                    .filter_map(|(card, prev)| {
+                        prev.filter(|o| o.index.uid != card.index.uid)
+                            .map(|o| *o.id.as_uuid())
+                    })
+                    .collect();
+                if !freed.is_empty() {
+                    sqlx::query(
+                        "UPDATE dav_objects SET uid = object_id::text
+                         WHERE tenant_id = $1 AND account_id = $2 AND object_id = ANY($3)",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .bind(&freed)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                }
+                for (card, prev) in write {
+                    ms = ms.next();
+                    store_object(
+                        &mut tx,
+                        scope,
+                        book.id,
+                        prev.map(|o| *o.id.as_uuid()),
+                        &card.name,
+                        &card.body,
+                        &card.index,
+                        ms,
+                    )
+                    .await?;
+                }
+                let changed = ms != before;
+                if changed {
+                    sqlx::query(
+                        "UPDATE dav_collections SET modseq = $4, object_count = $5
+                         WHERE tenant_id = $1 AND account_id = $2 AND collection_id = $3",
+                    )
+                    .bind(scope.tenant.as_uuid())
+                    .bind(scope.account.as_uuid())
+                    .bind(book.id.as_uuid())
+                    .bind(arg(ms)?)
+                    .bind(count)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    advance(&mut tx, scope, CollectionKind::AddressBook, ms).await?;
+                }
+                crate::commits::commit(tx).await?;
+                Ok((book.id, if changed { ms } else { book.state }, changed))
+            })
+            .await?;
+        if changed {
+            self.signal(gal_changed(tenant, id, state)).await;
+        }
+        Ok(state)
     }
 
     async fn gal_changes(
@@ -1920,8 +2237,20 @@ impl DavStore for PgMeta {
         since: ModSeq,
         limit: usize,
     ) -> Result<Changes<DavObjectId>> {
-        let _ = (tenant, since, limit);
-        Err(Error::internal("книга GAL в PostgreSQL — META-63"))
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
+            let out = object_changes(
+                &mut tx,
+                gal_scope(tenant),
+                CollectionKind::AddressBook,
+                since,
+                limit,
+            )
+            .await?;
+            crate::commits::commit(tx).await?;
+            Ok(out)
+        })
+        .await
     }
 }
 

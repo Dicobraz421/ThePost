@@ -164,12 +164,33 @@ impl Env {
 
     /// Окружение без хранилищ Sieve и DAV (capability `vacationresponse`, `sieve`, `contacts` не объявлены).
     pub async fn bare() -> Self {
-        Self::build(JmapConfig::default(), Vec::new(), None, false, false).await
+        Self::build(
+            JmapConfig::default(),
+            Vec::new(),
+            None,
+            false,
+            false,
+            Default::default(),
+        )
+        .await
     }
 
     /// Окружение с хранилищами, но без планирования встреч (`Jmap::with_schedule` не вызван).
     pub async fn unscheduled() -> Self {
-        Self::build(JmapConfig::default(), Vec::new(), None, true, false).await
+        Self::build(
+            JmapConfig::default(),
+            Vec::new(),
+            None,
+            true,
+            false,
+            Default::default(),
+        )
+        .await
+    }
+
+    /// Окружение с пределами Sieve `limits` (`Jmap::with_sieve_limits`).
+    pub async fn with_sieve_limits(limits: tp_sieve::Limits) -> Self {
+        Self::build(JmapConfig::default(), Vec::new(), None, true, true, limits).await
     }
 
     /// Учётная запись `login` организации: вошедший для [`Env::request_as`].
@@ -201,7 +222,7 @@ impl Env {
         caps: Vec<Arc<dyn JmapCapability>>,
         signer: Option<Arc<dyn crate::ProfileSigner>>,
     ) -> Self {
-        Self::build(cfg, caps, signer, true, true).await
+        Self::build(cfg, caps, signer, true, true, Default::default()).await
     }
 
     async fn build(
@@ -210,6 +231,7 @@ impl Env {
         signer: Option<Arc<dyn crate::ProfileSigner>>,
         stores: bool,
         schedule: bool,
+        sieve_limits: tp_sieve::Limits,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let blobs = MemBlobStore::new(clock.clone());
@@ -295,6 +317,7 @@ impl Env {
         .expect("jmap")
         .with_profile_signer(signer)
         .with_sieve(stores.then(|| Arc::new(sieve.clone()) as Arc<dyn SieveStore>))
+        .with_sieve_limits(sieve_limits)
         .with_dav(stores.then(|| Arc::new(dav.clone()) as Arc<dyn DavStore>))
         .with_freebusy(
             stores.then(|| Arc::new(dav.clone()) as Arc<dyn tp_contracts::schedule::FreeBusy>),

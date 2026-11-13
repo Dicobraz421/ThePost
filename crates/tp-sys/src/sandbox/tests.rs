@@ -1,10 +1,9 @@
 //! Подпроцесс в тестах — этот же тестовый бинарник, запущенный на тест [`worker_entry`].
 
 use std::hint::black_box;
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use super::*;
+use crate::test_logs::Logs;
 
 const TEST_WORKER_ENV: &str = "TP_SANDBOX_TEST_WORKER";
 
@@ -105,40 +104,10 @@ async fn timeout_kills_worker_and_pool_recovers() {
     assert_recovers(&pool).await;
 }
 
-/// Журнал тестового подписчика `tracing`.
-#[derive(Debug, Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
-
-impl Logs {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
-    }
-}
-
-impl Write for Logs {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn worker_failure_is_logged() {
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
     // Однопоточный рантайм теста: подписчик потока видит события пула.
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Logs::capture();
     let pool = pool(SandboxConfig {
         timeout_ms: 300,
         ..config()
