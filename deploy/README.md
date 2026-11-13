@@ -154,7 +154,7 @@ Compose и Ansible его не копируют, а подставляют зн�
 | `http.admin.listen` | `127.0.0.1:8443` | — | `thepost_admin_listen` |
 | `secrets.url`, `secrets.tls.ca_file` | `localhost:8200`, `/etc/thepost/pki` | `openbao-tls:8200`, том `tls` | `thepost_secrets_url`, `thepost_internal_ca_file` |
 | `secrets.auth.approle` | `role_id` — `/etc/thepost/openbao`, `secret_id` — учётные данные systemd | `secret_id` — том `openbao-approle` | `thepost_secrets_role_id_file` |
-| `tls`, `acme` | цепочка `/etc/thepost/tls`, ключ — секрет `thepost/tls#key` | том `tls` | `thepost_tls_mode` (`acme` — секция `acme`, цепочка `/var/lib/thepost/tls`), `thepost_tls_names`, `thepost_acme_email` |
+| `tls`, `acme` | цепочка `/etc/thepost/tls`, ключ — секрет `thepost/tls#key` | том `tls` | `thepost_tls_mode` |
 | `blob.gc.window` | по умолчанию | — | `thepost_blob_gc_window` |
 | `maintenance`, `dav`, `http.dav` | период очистки, лимиты DAV | — | `thepost_maintenance`, `thepost_dav`, `thepost_dav_listen` |
 
@@ -257,20 +257,7 @@ systemd-analyze security thepost.service   # не хуже 2.0 (ожидаетс
 ```
 Сокеты (`FileDescriptorName=`): `smtp` 25, `submissions` 465, `submission` 587, `imap` 143, `imaps` 993, `https` 443,
 `managesieve` 4190; `http` 80 — только проверки встроенного ACME (`acme.enabled`; `systemctl enable --now
-thepost-http.socket`). Встроенный ACME вручную — каталоги `sudo install -d -o thepost -g thepost -m 0750
-/var/lib/thepost/{tls,acme}` и в `config.yaml`:
-```yaml
-acme:
-  enabled: true
-  domains: [mail.example.ru]
-  contact: ["mailto:admin@example.ru"]
-  state_dir: /var/lib/thepost/acme
-tls:
-  cert_file: /var/lib/thepost/tls/fullchain.pem   # цепочку пишет узел; ключ — новой версией секрета tls.key
-  key: { secret: "thepost/tls#key" }
-```
-Первый выпуск — до запуска протоколов: если порт 80 недоступен снаружи или DNS имени не указывает на ВМ, узел не
-стартует (`acme: сертификат … не выпущен`).
+thepost-http.socket`).
 Узел берёт сокет systemd по адресу слушателя (`0.0.0.0:<порт>` или `[::]:<порт>` совпадает с `ListenStream=<порт>`),
 иначе открывает свой (порт ниже 1024 без сокета не откроется — capabilities у процесса нет); перезапуск `thepost` не
 закрывает сокеты: соединения ждут в очереди.
