@@ -1,0 +1,55 @@
+# Доска Project v2 «ThePost — план-график» (org Dicobraz421, project 3) ведётся сама: scripts/board_sync.py
+# сверяет её с PR и таблицей волн docs/PLAN.md. Токен — GitHub App (секреты BOARD_APP_ID и BOARD_APP_KEY):
+# встроенный GITHUB_TOKEN к проектам организации доступа не имеет. Без секретов шаги пропускаются.
+# pull_request_target: выгружается и исполняется только main, код PR не выгружается.
+name: Board sync
+
+on:
+  pull_request_target:
+    types: [opened, reopened, closed]
+  push:
+    branches: [main]
+    paths: [docs/PLAN.md]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: board-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HAS_APP: ${{ secrets.BOARD_APP_ID != '' && secrets.BOARD_APP_KEY != '' }}
+    steps:
+      - name: Проверка секретов
+        if: env.HAS_APP != 'true'
+        run: echo "::notice::нет секретов BOARD_APP_ID и BOARD_APP_KEY (GitHub App доски) — сверка доски пропущена"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.HAS_APP == 'true'
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/board_sync.py
+            docs/PLAN.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        if: env.HAS_APP == 'true'
+        id: app
+        with:
+          client-id: ${{ secrets.BOARD_APP_ID }}
+          private-key: ${{ secrets.BOARD_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-organization-projects: write
+          permission-pull-requests: read
+      - name: Сверка доски
+        if: env.HAS_APP == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 -I scripts/board_sync.py --plan docs/PLAN.md --apply
