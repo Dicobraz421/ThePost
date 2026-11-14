@@ -864,11 +864,11 @@ impl QueueStore for NoPostpone {
     async fn list(
         &self,
         tenant: tp_contracts::TenantId,
-        filter: &tp_contracts::QueueFilter,
+        filter: &tp_contracts::queue::QueueFilter,
         after: Option<tp_contracts::QueueId>,
         limit: usize,
         now: OffsetDateTime,
-    ) -> Result<Vec<tp_contracts::QueueItem>> {
+    ) -> Result<Vec<tp_contracts::queue::QueueItem>> {
         self.0.list(tenant, filter, after, limit, now).await
     }
 
@@ -1264,11 +1264,11 @@ impl QueueStore for Counted {
     async fn list(
         &self,
         tenant: tp_contracts::TenantId,
-        filter: &tp_contracts::QueueFilter,
+        filter: &tp_contracts::queue::QueueFilter,
         after: Option<tp_contracts::QueueId>,
         limit: usize,
         now: OffsetDateTime,
-    ) -> Result<Vec<tp_contracts::QueueItem>> {
+    ) -> Result<Vec<tp_contracts::queue::QueueItem>> {
         self.queue.list(tenant, filter, after, limit, now).await
     }
 
