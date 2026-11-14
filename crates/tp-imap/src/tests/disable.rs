@@ -119,6 +119,7 @@ async fn lost_signal_reconciled_with_account_store() {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await

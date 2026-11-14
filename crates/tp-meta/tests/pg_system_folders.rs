@@ -141,6 +141,7 @@ async fn raw_account_with_inbox_filled_on_login() {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -186,6 +187,7 @@ async fn raw_account_with_inbox_filled_on_login() {
             aliases: Vec::new(),
             kind: AccountKind::User,
             hidden_from_gal: false,
+            resource_type: None,
         },
     )
     .await

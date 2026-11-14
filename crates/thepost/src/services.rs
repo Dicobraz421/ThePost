@@ -1559,6 +1559,7 @@ mod tests {
                     aliases: Vec::new(),
                     kind: AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
@@ -1790,6 +1791,7 @@ mod tests {
                     aliases: Vec::new(),
                     kind: tp_contracts::meta::AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
@@ -2050,6 +2052,7 @@ mod tests {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -2202,6 +2205,7 @@ mod tests {
                     aliases: Vec::new(),
                     kind: AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await

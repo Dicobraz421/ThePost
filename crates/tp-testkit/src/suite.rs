@@ -59,7 +59,8 @@ use tp_contracts::membership::{Membership, NodeId, NodeInfo, SiteId};
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
     Envelope, ExistingContent, MailboxStore, MessageMeta, MessageQuery, MessageStore, NewMailbox,
-    NewMessage, Policy, PolicyResolver, PolicyStore, PolicyTarget, SpecialUse, account_disabled,
+    NewMessage, Policy, PolicyResolver, PolicyStore, PolicyTarget, ResourceType, SpecialUse,
+    account_disabled,
 };
 use tp_contracts::queue::{
     DsnParams, OutMessage, OutRcpt, Outbound, QueueStore, RcptStatus, SubmitStatus,
@@ -2450,6 +2451,7 @@ pub async fn account_external_id(
         aliases: Vec::new(),
         kind: AccountKind::User,
         hidden_from_gal: false,
+        resource_type: None,
     };
     assert_eq!(
         accounts
@@ -2607,6 +2609,71 @@ pub async fn account_external_id(
 
 // ---------- AccountStore: list ----------
 
+/// Набор проверок типа ресурса бронирования (CTR-88, решение 121): ресурс без типа читается как
+/// [`ResourceType::Room`], [`ResourceType::Equipment`] сохраняется и читается (`get`, `by_login`), тип у пользователя —
+/// `Error::Invalid` (учётная запись не меняется), смена вида ресурса на пользователя снимает тип.
+pub async fn account_resource_type(accounts: &dyn AccountStore, fx: &ExternalIdFixture) {
+    let run = AccountId::new();
+    let login = format!("room-{run}@{}", fx.domain_name);
+    let upsert = |kind, resource_type| AccountUpsert {
+        domain: fx.domain,
+        login: login.clone(),
+        display_name: "Переговорная «Байкал»".into(),
+        external_id: None,
+        enabled: true,
+        aliases: Vec::new(),
+        kind,
+        hidden_from_gal: false,
+        resource_type,
+    };
+    let room = accounts
+        .upsert(fx.tenant, upsert(AccountKind::Resource, None))
+        .await
+        .expect("ресурс без типа");
+    assert_eq!(
+        room.resource_type,
+        Some(ResourceType::Room),
+        "по умолчанию — помещение"
+    );
+    let equipment = accounts
+        .upsert(
+            fx.tenant,
+            upsert(AccountKind::Resource, Some(ResourceType::Equipment)),
+        )
+        .await
+        .expect("оборудование");
+    assert_eq!(equipment.id, room.id);
+    assert_eq!(equipment.resource_type, Some(ResourceType::Equipment));
+    assert_eq!(
+        accounts.get(fx.tenant, room.id).await,
+        Ok(Some(equipment.clone()))
+    );
+    assert_eq!(
+        accounts.by_login(fx.tenant, &login).await,
+        Ok(Some(equipment.clone()))
+    );
+    assert!(matches!(
+        accounts
+            .upsert(
+                fx.tenant,
+                upsert(AccountKind::User, Some(ResourceType::Room))
+            )
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        accounts.get(fx.tenant, room.id).await,
+        Ok(Some(equipment)),
+        "отказ не меняет учётную запись"
+    );
+    let user = accounts
+        .upsert(fx.tenant, upsert(AccountKind::User, None))
+        .await
+        .expect("смена вида");
+    assert_eq!((user.kind, user.resource_type), (AccountKind::User, None));
+    assert_eq!(accounts.get(fx.tenant, room.id).await, Ok(Some(user)));
+}
+
 /// Данные набора [`account_list`]: организация `tenant` без учётных записей и её домен (`domain_name` — имя для
 /// адресов входа), другая организация `foreign_tenant` и её домен.
 #[derive(Debug, Clone)]
@@ -2657,6 +2724,7 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                     aliases: Vec::new(),
                     kind: AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
@@ -2675,6 +2743,7 @@ pub async fn account_list(accounts: &dyn AccountStore, fx: &AccountListFixture) 
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -2773,6 +2842,7 @@ pub async fn account_by_ids(accounts: &dyn AccountStore, fx: &AccountListFixture
         aliases: Vec::new(),
         kind: AccountKind::User,
         hidden_from_gal: false,
+        resource_type: None,
     };
     let mut made = Vec::new();
     for n in ["ids-a", "ids-b"] {
@@ -2821,6 +2891,7 @@ pub async fn account_installation_admin(accounts: &dyn AccountStore, fx: &Accoun
         aliases: Vec::new(),
         kind: AccountKind::User,
         hidden_from_gal: false,
+        resource_type: None,
     };
     let a = accounts
         .upsert(fx.tenant, upsert(fx.domain, "root-a"))
@@ -2895,6 +2966,7 @@ pub async fn account_by_address(
                 aliases: vec![addr("Addr-Sales")],
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -4639,6 +4711,7 @@ pub async fn account_state(
         aliases: Vec::new(),
         kind: AccountKind::User,
         hidden_from_gal: false,
+        resource_type: None,
     };
     let scope = |account| AccountScope { tenant: t, account };
     let until = OffsetDateTime::now_utc()

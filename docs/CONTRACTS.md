@@ -104,6 +104,12 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   `AccountUpsert::kind` и заменяется при обновлении; правила бронирования ресурса — раздел Sharing.
   Скрыта из книги «Организация» (CTR-83) — поле `Account::hidden_from_gal: bool`, задаётся `AccountUpsert::hidden_from_gal` и
   заменяется при обновлении: нет в GAL, вход и приём почты — как обычно. Синхронизация каталога переносит `DirAccount::hidden_from_gal`.
+  Тип ресурса бронирования (CTR-88, решение 121) — поле `Account::resource_type: Option<ResourceType::{Room, Equipment}>` (serde `room`,
+  `equipment`; по умолчанию `Room`): у ресурса всегда `Some`, у пользователя — `None`. Задаётся `AccountUpsert::resource_type` и заменяется
+  при обновлении по правилу `meta::account_resource_type(kind, requested)`: у ресурса без типа — `Room`, тип у пользователя — `Invalid`,
+  смена вида на пользователя снимает тип. Клиентам — CalDAV `CUTYPE` `ROOM`/`RESOURCE` (DAV-38), JMAP `Principal.type`
+  `location`/`resource` (JMAP-45); правила бронирования от типа не зависят. In-memory — `MemMetadata`; набор `suite::account_resource_type`.
+  `PgMeta` проверяет правило, а хранение типа — META-81 (до неё ресурс читается как `Room`); Admin API — ADM-47.
   Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
   отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
@@ -797,8 +803,8 @@ SRS 4.4, 4.5; APP-I «Политики общего доступа к кален
 владельца (CalDAV `calendar-proxy-read`/`-write`) и планирование от его имени (`SENT-BY`); `Delegate::rights()` — `READ` или `WRITE`
 плюс `schedule`. `DelegateStore`: `delegates(owner)`, `set_delegate(owner, Delegate)` (сам себе — `Invalid`), `remove_delegate(owner,
 delegate)`, `delegations(delegate) -> Vec<Delegation { owner, level, schedule_on_behalf }>` (`calendar-proxy-*-for`).
-Ресурсы (переговорные) — учётные записи вида `meta::AccountKind::Resource`: вид — поле `Account::kind`, задаётся `AccountUpsert::kind`
-(раздел Metadata), отдельного метода нет. `ResourceStore` — правила бронирования: `booking_policy(scope) -> Option<BookingPolicy>`
+Ресурсы (переговорные) — учётные записи вида `meta::AccountKind::Resource`: вид — поле `Account::kind`, задаётся `AccountUpsert::kind`,
+тип (помещение или оборудование, CTR-88) — `Account::resource_type` (раздел Metadata), отдельного метода нет. `ResourceStore` — правила бронирования: `booking_policy(scope) -> Option<BookingPolicy>`
 (`None` — не заданы или не ресурс), `set_booking_policy(scope, Option<_>)` (учётная запись не ресурс — `Invalid`; вид правила не
 меняют), `resources(tenant)` — учётные записи вида `Resource`.
 `BookingPolicy { auto_accept, allow_conflicts, max_duration: Option<_>, horizon: Option<_>, bookers: Bookers::{Internal, Only { accounts,
@@ -1151,6 +1157,12 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   По сравнению с карточкой: реализации в той же волне (правило владельца «старое рядом с новым не оставлять»); скрытая учётная запись
   остаётся в `accounts_since` с признаком, а не пропадает из выгрузки — как у LDAP (AUTH-16): из книги её убирает построение GAL
   (DAV-27), ссылки `DirOrg::manager` на неё остаются. `PATCH` признака в Admin API и консоль — отдельные волны.
+- 2026-11-14 — CTR-88 (волна contracts-59, решение 121): `meta::ResourceType::{Room, Equipment}` и поля `Account::resource_type`,
+  `AccountUpsert::resource_type` — тип ресурса бронирования; правило `meta::account_resource_type` (ресурс без типа — `Room`, тип у
+  пользователя — `Invalid`). `MemMetadata` хранит тип; набор `suite::account_resource_type`. `PgMeta` проверяет правило и читает ресурс
+  как `Room` — хранение в БД (миграция) META-81; Admin API — ADM-47, CalDAV — DAV-38, JMAP — JMAP-45. Несовместимо: новые обязательные
+  поля `Account`, `AccountUpsert`; все места сборки в репозитории (`tp-admin`, `tp-auth`, `tp-meta`, `tp-testkit`, тесты `tp-imap`,
+  `tp-smtp`, `tp-dav`, `tp-jmap`, `thepost`) дополнены: пересборка из `Account` переносит тип, прочие — `None`.
 - 2026-11-14 — ADM-41 (x/admin-27, решение 117, решение владельца 14.11 «Переделать роль»): `AccountStore::grant_installation_admin`,
   `is_installation_admin` — роль администратора установки явной записью вместо признака «действующий пароль приложения с подписью
   `thepost admin init`». Без реализации по умолчанию: `PgMeta` (таблица `installation_admins`, миграция 0040 переносит роль учётной

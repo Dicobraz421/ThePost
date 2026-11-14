@@ -31,6 +31,7 @@ async fn account_like(meta: &PgMeta, owner: AccountScope, kind: AccountKind) -> 
                 aliases: Vec::new(),
                 kind,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await

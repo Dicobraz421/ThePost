@@ -108,6 +108,7 @@ async fn account(meta: &PgMeta, pool: &DbPool) -> AccountScope {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await

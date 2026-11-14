@@ -384,6 +384,7 @@ impl DirectorySync {
             kind: tp_contracts::meta::AccountKind::User,
             // Признак каталога (LDAP — `msExchHideFromAddressLists`, AUTH-16) — с учётной записью (CTR-83).
             hidden_from_gal: a.hidden_from_gal,
+            resource_type: None,
         };
         let account = match self.stores.accounts.upsert(t, upsert).await {
             Ok(acc) => acc,

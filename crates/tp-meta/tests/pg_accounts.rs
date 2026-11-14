@@ -124,6 +124,7 @@ async fn disabling_publishes_account_disabled() {
         aliases: Vec::new(),
         kind: AccountKind::User,
         hidden_from_gal: false,
+        resource_type: None,
     };
 
     let a = meta.upsert(tenant, data(true)).await.expect("create");

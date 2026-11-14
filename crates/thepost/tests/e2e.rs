@@ -631,6 +631,7 @@ async fn mvp_mail_flow() {
                 aliases: vec![format!("al@{domain}")],
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -971,6 +972,7 @@ async fn mvp_mail_flow() {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -1717,6 +1719,7 @@ async fn meeting_scheduling() {
                     aliases: Vec::new(),
                     kind: tp_contracts::meta::AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
@@ -1927,6 +1930,7 @@ async fn sharing_delegates_and_booking() {
                     aliases: Vec::new(),
                     kind,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
@@ -2563,6 +2567,7 @@ async fn gal_without_ldap() {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await

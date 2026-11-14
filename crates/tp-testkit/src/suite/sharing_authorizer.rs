@@ -220,6 +220,7 @@ pub async fn sharing_authorizer(authz: &dyn SharingAuthorizer, fx: &SharingAutho
                     aliases: Vec::new(),
                     kind: AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await

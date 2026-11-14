@@ -36,6 +36,7 @@ async fn create(
             aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
             kind: AccountKind::User,
             hidden_from_gal: false,
+            resource_type: None,
         },
     )
     .await
@@ -255,6 +256,7 @@ async fn accounts_groups_and_cursors() {
             aliases: o.aliases,
             kind: o.kind,
             hidden_from_gal: true,
+            resource_type: o.resource_type,
         },
     )
     .await

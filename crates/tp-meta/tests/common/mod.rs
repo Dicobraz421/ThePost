@@ -250,6 +250,7 @@ pub async fn account(meta: &PgMeta) -> tp_contracts::meta::AccountScope {
                 aliases: Vec::new(),
                 kind: AccountKind::User,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -415,6 +416,7 @@ impl TwoShards {
                     aliases: Vec::new(),
                     kind: tp_contracts::meta::AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await

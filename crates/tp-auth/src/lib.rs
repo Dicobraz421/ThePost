@@ -278,6 +278,7 @@ pub(crate) mod testutil {
                         aliases: Vec::new(),
                         kind: AccountKind::User,
                         hidden_from_gal: false,
+                        resource_type: None,
                     },
                 )
                 .await
