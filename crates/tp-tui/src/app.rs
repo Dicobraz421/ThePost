@@ -1782,6 +1782,7 @@ fn submit(m: &mut Main, bus: &mut Bus, mut f: Box<Form>) -> Vec<Effect> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::theme::{Brand, Mode};
     use serde_json::json;
 
     pub(crate) fn key(code: KeyCode) -> KeyEvent {
@@ -1800,7 +1801,7 @@ pub(crate) mod tests {
     /// Вошедший интерфейс с открытым списком учётных записей.
     pub(crate) fn with_accounts() -> App {
         let mut app = App::new(
-            Theme { mono: false },
+            Theme::new(Mode::Dark, Brand::default()),
             LoginForm::new("https://node:9443".into(), false),
         );
         let fx = app.on_login(Ok((who(), "node:9443".into())));
@@ -1845,7 +1846,7 @@ pub(crate) mod tests {
     #[test]
     fn login_by_password() {
         let mut app = App::new(
-            Theme { mono: true },
+            Theme::new(Mode::Mono, Brand::default()),
             LoginForm::new("https://node:9443".into(), true),
         );
         for c in "admin@it-task.ru".chars() {

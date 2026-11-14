@@ -5,7 +5,7 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Widget};
 use serde_json::Value;
 
@@ -40,7 +40,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// Отрисовать интерфейс в буфер.
 pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
-    let t = app.theme;
+    let t = &app.theme;
     buf.set_style(area, t.style(Role::Screen));
     if area.width < WIDTH || area.height < HEIGHT {
         put(
@@ -67,7 +67,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
 
 struct Painter<'a> {
     buf: &'a mut Buffer,
-    t: Theme,
+    t: &'a Theme,
     w: u16,
 }
 
@@ -93,18 +93,35 @@ impl Painter<'_> {
             .set_style(Rect::new(x0, y, x1.saturating_sub(x0) + 1, 1), st);
     }
 
+    /// Строка меню: градиент бренда, пункты и название бренда с версией (жирным) справа.
     fn menu(&mut self) {
         let w = self.w;
-        self.fill(0, w - 1, 0, Role::Menu);
-        self.put(
+        for x in 0..w {
+            self.buf.set_style(Rect::new(x, 0, 1, 1), self.t.menu(x, w));
+        }
+        let plain = Style::default();
+        put(
+            self.buf,
             1,
             0,
             "Установка  Организация  Вид  Сервис  Справка",
-            Role::Menu,
+            plain,
+            w - 1,
         );
-        let brand = format!("IT TASK · The Post {}", env!("CARGO_PKG_VERSION"));
+        let brand = format!(
+            "{} · The Post {}",
+            self.t.brand().name,
+            env!("CARGO_PKG_VERSION")
+        );
         let x = w.saturating_sub(brand.chars().count() as u16 + 1);
-        self.put(x, 0, &brand, Role::Menu);
+        put(
+            self.buf,
+            x,
+            0,
+            &brand,
+            plain.add_modifier(Modifier::BOLD),
+            w - x,
+        );
     }
 
     fn panel(&mut self, area: Rect, active: bool, title: &str) {
@@ -135,13 +152,30 @@ impl Painter<'_> {
         self.put(area.x + area.width - 1, ROW_SEP, r, role);
     }
 
+    /// Знак и название бренда над формой входа; без графики — только название.
+    fn brand(&mut self) {
+        let t = self.t;
+        let name = &t.brand().name;
+        let nw = name.chars().count() as u16;
+        match t.mark() {
+            Some(mark) => {
+                let s = mark.size();
+                let x = self.w.saturating_sub(s.width + 2 + nw) / 2;
+                t.render_mark(mark, Rect::new(x, 1, s.width, s.height), self.buf);
+                self.put(x + s.width + 2, 1 + s.height / 2, name, Role::Name);
+            }
+            None => self.put(self.w.saturating_sub(nw) / 2, 3, name, Role::Name),
+        }
+    }
+
     fn login(mut self, f: &LoginForm) -> Self {
         let w = self.w;
         self.buf
             .set_style(Rect::new(0, 1, w, ROW_STATUS - 1), self.s(Role::Panel));
+        self.brand();
         let (bw, bh) = (58u16, 12u16);
         let x0 = (w - bw) / 2;
-        let y0 = 5;
+        let y0 = 6;
         let area = Rect::new(x0, y0, bw, bh);
         Block::bordered()
             .border_type(BorderType::Double)
@@ -932,6 +966,7 @@ mod tests {
     use super::*;
     use crate::app::LoginForm;
     use crate::app::tests::{call, key, ok, section, with_accounts, with_members};
+    use crate::theme::{Brand, Mode};
     use crossterm::event::KeyCode;
     use serde_json::json;
 
@@ -1017,7 +1052,7 @@ mod tests {
     #[test]
     fn login_screen() {
         let mut app = App::new(
-            Theme { mono: false },
+            Theme::new(Mode::Dark, Brand::default()),
             LoginForm::new("https://node:9443".into(), false),
         );
         for c in "admin".chars() {
@@ -1040,15 +1075,117 @@ mod tests {
         assert!(rows[23].starts_with("1Помощь"));
     }
 
-    /// Монохром (`NO_COLOR`): ни одного цвета, выделение — инверсией.
+    const MODES: [Mode; 5] = [Mode::Dark, Mode::Light, Mode::C256, Mode::C16, Mode::Mono];
+
+    /// 80×24 в каждом из пяти режимов: раскладка та же, знаки состояний на месте, цвета — только своего
+    /// режима (в монохроме — ни одного); строка меню — градиент в truecolor и 256, сплошная в 16 цветах,
+    /// инверсия в монохроме.
     #[test]
-    fn monochrome() {
-        let mut app = with_accounts();
-        app.theme = Theme { mono: true };
-        let (_, buf) = screen(&app);
-        for cell in buf.content() {
-            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+    fn five_modes() {
+        for mode in MODES {
+            let mut app = with_accounts();
+            app.theme = Theme::new(mode, Brand::default());
+            let (rows, buf) = screen(&app);
+            assert!(rows[0].contains("IT TASK · The Post"), "{mode:?}");
+            assert_eq!(rows[1].chars().nth(30), Some('╔'), "{mode:?}");
+            assert!(rows[3].contains('●'), "{mode:?}: {}", rows[3]);
+            assert!(rows[21].starts_with(" ●"), "{mode:?}: {}", rows[21]);
+            let (left, right) = (buf[(0, 0)].bg, buf[(79, 0)].bg);
+            let sel = buf[(40, 3)].style();
+            match mode {
+                Mode::Dark | Mode::Light => {
+                    assert_eq!(left, Color::Rgb(0xE4, 0x10, 0x7F));
+                    assert_eq!(right, Color::Rgb(0x17, 0x7C, 0xAA));
+                    assert_eq!(sel.bg, Some(Color::Rgb(0xE4, 0x10, 0x7F)));
+                }
+                Mode::C256 => {
+                    assert_eq!(left, Color::Indexed(162));
+                    assert!(matches!(right, Color::Indexed(_)) && right != left);
+                }
+                Mode::C16 => assert_eq!((left, right), (Color::Blue, Color::Blue)),
+                Mode::Mono => {
+                    assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+                    assert!(sel.add_modifier.contains(Modifier::REVERSED));
+                }
+            }
+            for cell in buf.content() {
+                let ok = |c: Color| match mode {
+                    Mode::Dark | Mode::Light => matches!(c, Color::Rgb(..) | Color::Reset),
+                    Mode::C256 => matches!(c, Color::Indexed(16..) | Color::Reset),
+                    Mode::C16 => !matches!(c, Color::Rgb(..) | Color::Indexed(_)),
+                    Mode::Mono => c == Color::Reset,
+                };
+                assert!(ok(cell.fg) && ok(cell.bg), "{mode:?}: {cell:?}");
+            }
         }
+    }
+
+    /// Экран входа: знак бренда полублоками и название; в 16 цветах и монохроме — только название IT TASK,
+    /// жирное, белое или чёрное по фону режима.
+    #[test]
+    fn login_brand() {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        for mode in MODES {
+            let theme = Theme::new(mode, Brand::default()).with_mark(&picker);
+            let app = App::new(theme, LoginForm::new("https://node:9443".into(), false));
+            let (rows, buf) = screen(&app);
+            let top = rows[1..5].join(
+                "
+",
+            );
+            assert!(
+                rows.join(
+                    "
+"
+                )
+                .contains(" Вход в Admin API ")
+            );
+            let blocks = top.contains('▀') || top.contains('▄');
+            assert_eq!(
+                blocks,
+                mode.graphics(),
+                "{mode:?}
+{top}"
+            );
+            let y = (1..5)
+                .find(|&y| rows[y].contains("IT TASK"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{mode:?}: нет названия
+{top}"
+                    )
+                });
+            let x = rows[y].chars().position(|c| c == 'I').unwrap_or_default();
+            let cell = &buf[(x as u16, y as u16)];
+            assert!(cell.modifier.contains(Modifier::BOLD), "{mode:?}");
+            let want = match mode {
+                Mode::Dark => Color::Rgb(0xFF, 0xFF, 0xFF),
+                Mode::Light => Color::Rgb(0x16, 0x16, 0x16),
+                Mode::C256 => Color::Indexed(231),
+                Mode::C16 => Color::White,
+                Mode::Mono => Color::Reset,
+            };
+            assert_eq!(cell.fg, want, "{mode:?}");
+        }
+    }
+
+    /// Бренд заказчика (решение 122): его название в меню и на входе, градиент от его акцента.
+    #[test]
+    fn customer_brand() {
+        let brand = Brand {
+            name: "ACME".into(),
+            mark: None,
+            primary: crate::theme::Rgb(0x00, 0x33, 0x99),
+            accent: crate::theme::Rgb(0xCC, 0x00, 0x00),
+        };
+        let app = App::new(
+            Theme::new(Mode::Dark, brand),
+            LoginForm::new("https://node:9443".into(), false),
+        );
+        let (rows, buf) = screen(&app);
+        assert!(rows[0].contains("ACME · The Post"), "{}", rows[0]);
+        assert!(rows[3].contains("ACME"), "{}", rows[3]);
+        assert_eq!(buf[(0, 0)].bg, Color::Rgb(0xCC, 0x00, 0x00));
     }
 
     /// Форма с неверным значением: ошибка под полем.
@@ -1182,7 +1319,7 @@ mod tests {
         let dir = Dir::new();
         let node = dir.node("{\"domain\": \"it-task.ru\"}\n");
         let mut app = App::new(
-            Theme { mono: false },
+            Theme::new(Mode::Dark, Brand::default()),
             LoginForm::new("https://node:9443".into(), false),
         );
         app.node = true;
@@ -1305,7 +1442,7 @@ mod tests {
         let dir = Dir::new();
         let node = dir.node("# thepost: managed-by=ansible\n{\"domain\": \"it-task.ru\"}\n");
         let mut app = App::new(
-            Theme { mono: false },
+            Theme::new(Mode::Dark, Brand::default()),
             LoginForm::new("https://node:9443".into(), false),
         );
         app.node = true;
