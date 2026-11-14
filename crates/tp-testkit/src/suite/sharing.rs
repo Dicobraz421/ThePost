@@ -10,7 +10,7 @@ use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore};
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::sharing::{
     ANYONE, Bookers, BookingPolicy, CollectionAcl, CollectionAclEntry, CollectionRights, DayOfWeek,
-    Delegate, DelegateLevel, DelegateStore, Delegation, ResourceStore, ShareChangedBy,
+    Delegate, DelegateLevel, DelegateStore, Delegation, MAX_NOTICES, ResourceStore, ShareChangedBy,
     ShareNotification, ShareNotificationFilter, ShareNotificationStore, SharedCollection,
     SharedObjectType, SharingPolicy, SharingPolicyStore, SharingScope, WorkingHours,
 };
@@ -605,7 +605,8 @@ pub async fn sharing_policy_store(
 /// Набор проверок `ShareNotificationStore` (CTR-86): уведомление видно только получателю, по (`created`, `id`);
 /// повтор идентификатора — `Conflict`, права без изменения — `Invalid`; изменения по состоянию (записанное и удалённое
 /// после `since` не входит, `limit`, `has_more`, состояние из будущего — `Conflict`); удалённое не возвращается; срок
-/// хранения удаляет старые у всех получателей и попадает в изменения. `recipient`, `other` — новые учётные записи
+/// хранения удаляет старые у всех получателей и попадает в изменения; сверх `MAX_NOTICES` запись вытесняет старшее
+/// (CTR-90), вытесненное — в `destroyed`. `recipient`, `other` — новые учётные записи
 /// без уведомлений (разных организаций или одной).
 pub async fn share_notifications(
     store: &dyn ShareNotificationStore,
@@ -768,4 +769,44 @@ pub async fn share_notifications(
         Ok(0),
         "повтор — нечего удалять"
     );
+
+    // Предел (CTR-90): `MAX_NOTICES` записей, затем ещё одна вытесняет старшую. Время — позже срока хранения выше:
+    // параллельный прогон набора на той же БД их не удалит.
+    let full: Vec<_> = (0..MAX_NOTICES)
+        .map(|i| {
+            notice(
+                100 + i64::try_from(i).expect("i64"),
+                SharedObjectType::Calendar,
+                o1,
+                CollectionRights::READ,
+            )
+        })
+        .collect();
+    for n in &full {
+        store.record(other, n.clone()).await.expect("record");
+    }
+    let base = 2 + u64::try_from(MAX_NOTICES).expect("u64");
+    assert_eq!(store.notification_state(other).await, Ok(base));
+    let last = notice(
+        100_000,
+        SharedObjectType::Calendar,
+        o1,
+        CollectionRights::READ,
+    );
+    assert_eq!(
+        store.record(other, last.clone()).await,
+        Ok(base + 2),
+        "запись и вытеснение"
+    );
+    let list = store.notifications(other).await.expect("notifications");
+    assert_eq!(list.len(), MAX_NOTICES);
+    assert_eq!(list.first(), full.get(1), "старшее вытеснено");
+    assert_eq!(list.last(), Some(&last));
+    assert_eq!(store.notification(other, full[0].id).await, Ok(None));
+    let c = store
+        .notification_changes(other, base, 10)
+        .await
+        .expect("changes evict");
+    assert_eq!((c.created, c.destroyed), (vec![last.id], vec![full[0].id]));
+    assert_eq!((c.new_state, c.has_more), (base + 2, false));
 }

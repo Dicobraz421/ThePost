@@ -11,7 +11,8 @@
 //! - [`ShareNotificationStore`] — каталог (META-83, CTR-86, миграция 0042): `share_notifications`, состояние
 //!   получателя `share_notification_state` и журнал состояний `share_notification_log` для `changes`; удаление
 //!   учётной записи-получателя удаляет их внешними ключами. Срок хранения убирает и историю удалённых уведомлений
-//!   старше срока (граница `floor`: `since` ниже — `Conflict`).
+//!   старше срока (граница `floor`: `since` ниже — `Conflict`). Сверх `MAX_NOTICES` запись вытесняет старшие
+//!   (CTR-90) без новой миграции: выборка по первичному ключу получателя.
 
 use std::collections::BTreeMap;
 
@@ -23,7 +24,7 @@ use tp_contracts::dav::CollectionId;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::sharing::{
     BookingPolicy, CollectionAcl, CollectionAclEntry, CollectionRights, Delegate, DelegateLevel,
-    DelegateStore, Delegation, ResourceStore, ShareChangedBy, ShareNotification,
+    DelegateStore, Delegation, MAX_NOTICES, ResourceStore, ShareChangedBy, ShareNotification,
     ShareNotificationChanges, ShareNotificationStore, SharedCollection, SharedObjectType,
     SharingPolicy, SharingPolicyStore, validate_identifier,
 };
@@ -599,8 +600,52 @@ async fn log_notice(
     Ok(())
 }
 
-/// Таблицы миграции 0042. Запись — состояние получателя первым (блокировка строки), затем уведомление; удаление
-/// и срок хранения — уведомление первым, затем состояние: порядок блокировок без взаимного ожидания.
+/// Вытеснение сверх [`MAX_NOTICES`] (CTR-90) в транзакции записи после шага `state`: старшие по (`created`, `id`)
+/// удаляются шагами журнала, как при удалении. Состояние получателя уже заблокировано, поэтому уведомления,
+/// заблокированные удалением или сроком хранения (они ждут это состояние), пропускаются (`SKIP LOCKED`) и не
+/// считаются: их удалит тот, кто держит; ожидание здесь замкнуло бы круг. Возвращает последнее состояние.
+async fn evict_notices(tx: &mut PgConnection, scope: AccountScope, state: i64) -> Result<i64> {
+    let keep = i64::try_from(MAX_NOTICES).unwrap_or(i64::MAX);
+    let mut evicted: Vec<(Uuid, OffsetDateTime)> = sqlx::query_as(
+        "DELETE FROM share_notifications n USING (
+             SELECT notification_id FROM share_notifications
+             WHERE tenant_id = $1 AND account_id = $2
+             ORDER BY created DESC, notification_id DESC
+             OFFSET $3
+             FOR UPDATE SKIP LOCKED
+         ) o
+         WHERE n.tenant_id = $1 AND n.account_id = $2 AND n.notification_id = o.notification_id
+         RETURNING n.notification_id, n.created",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(keep)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if evicted.is_empty() {
+        return Ok(state);
+    }
+    evicted.sort_unstable_by_key(|(id, created)| (*created, *id));
+    let mut state = state;
+    for (id, created) in evicted {
+        state = bump_notice_state(tx, scope).await?;
+        log_notice(
+            tx,
+            scope,
+            state,
+            ShareNotificationId::from_uuid(id),
+            false,
+            created,
+        )
+        .await?;
+    }
+    Ok(state)
+}
+
+/// Таблицы миграции 0042. Запись — состояние получателя первым (блокировка строки), затем уведомление (вытеснение
+/// не ждёт чужих блокировок, [`evict_notices`]); удаление и срок хранения — уведомление первым, затем состояние:
+/// порядок блокировок без взаимного ожидания.
 #[async_trait]
 impl ShareNotificationStore for PgMeta {
     /// Повтор после обрыва во время COMMIT ответил бы `Conflict` — один раз.
@@ -643,6 +688,7 @@ impl ShareNotificationStore for PgMeta {
                 return Err(Error::Conflict);
             }
             log_notice(&mut tx, recipient, state, n.id, true, n.created).await?;
+            let state = evict_notices(&mut tx, recipient, state).await?;
             crate::commits::commit(tx).await?;
             to_u64(state)
         })
