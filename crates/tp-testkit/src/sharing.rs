@@ -27,8 +27,9 @@ use tp_contracts::auth::Principal;
 use tp_contracts::dav::CollectionId;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::sharing::{
-    CollectionRights, Delegate, Delegation, ShareNotification, ShareNotificationChanges,
-    ShareNotificationStore, SharedCollection, SharingAuthorizer, validate_identifier,
+    CollectionRights, Delegate, Delegation, MAX_NOTICES, ShareNotification,
+    ShareNotificationChanges, ShareNotificationStore, SharedCollection, SharingAuthorizer,
+    validate_identifier,
 };
 use tp_contracts::{AccountId, Error, Result, ShareNotificationId};
 
@@ -214,7 +215,20 @@ impl ShareNotificationStore for MemShareNotifications {
         }
         let id = notification.id;
         n.items.insert(id, notification);
-        Ok(n.change(id, true))
+        let mut state = n.change(id, true);
+        // Сверх предела — старшие по (`created`, `id`), как удаление.
+        while n.items.len() > MAX_NOTICES {
+            let oldest = n
+                .items
+                .values()
+                .map(|x| (x.created, x.id))
+                .min()
+                .map(|(_, id)| id)
+                .expect("уведомлений больше предела");
+            n.items.remove(&oldest);
+            state = n.change(oldest, false);
+        }
+        Ok(state)
     }
 
     async fn notifications(&self, scope: AccountScope) -> Result<Vec<ShareNotification>> {
