@@ -1,4 +1,4 @@
-# DEP-56: Rspamd — баллы за признак ответа и аномалии; ключи меток и BATV в поставке
+# DEP-56: Rspamd — балл за признак ответа; ключи меток и BATV в поставке
 
 lane: deploy
 deps: [SMTP-51]
@@ -9,8 +9,8 @@ checks: [lint]
 manual: no
 
 ## Сделать
-- Роль `rspamd`: правило `multimap` по заголовку узла — `THEPOST_REPLY` (−4, как `REPLY` модуля `replies`) и
-  `THEPOST_REPLY_ANOMALY` (+3); веса — переменными роли. Модуль Rspamd `replies` не включаем: признак ставит узел,
+- Роль `rspamd`: правило `multimap` по заголовку узла — `THEPOST_REPLY` (−4, как `REPLY` модуля `replies`); вес —
+  переменной роли. Аномалий здесь нет: их балл применяет узел по каталогу признаков (решение 126, SMTP-52). Модуль Rspamd `replies` не включаем: признак ставит узел,
   второй таблицы Message-ID в Redis нет.
 - Ключи метки Message-ID и BATV — создание в OpenBao при установке (как ключи DKIM), ротация — задачей роли
   `thepost`; секции `smtp.reply` и `smtp.batv` в шаблоне `config.yaml` (BATV по умолчанию `log`, затем `enforce`).
