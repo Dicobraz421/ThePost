@@ -745,7 +745,10 @@ impl Services {
                 resources: Arc::new(self.meta.clone()),
                 policy: Arc::new(self.meta.clone()),
                 collections: Arc::new(self.meta.clone()),
-            }))
+            })
+            // Очередь исходящей почты (ADM-45): список записей и повтор доставки — `QueueStore` поверх `PgMeta`
+            // (META-82); без этого `GET /orgs/{org}/queue` и `POST …/retry` отвечают 503.
+            .with_queue(Arc::new(self.meta.clone())))
     }
 
     /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»
