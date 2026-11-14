@@ -12,8 +12,9 @@
 //!
 //! Применённое сообщение во входящих CalDAV не остаётся; при `dav.schedule_keep_processed` оно хранится для ленты
 //! уведомлений JMAP с именем [`PROCESSED_PREFIX`] и удаляется по сроку ([`ItipInbox::purge_processed`]). Защита:
-//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REPLY` — только от адреса
-//! участника события и только организатору; меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
+//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REQUEST` и `ADD` — только
+//! получателю из `ATTENDEE` сообщения (DAV-41), `REPLY` — только от адреса участника события и только организатору;
+//! меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
 //!
@@ -148,6 +149,28 @@ pub(crate) async fn find_uid(
         }
     }
     Ok(None)
+}
+
+/// Объект `existing` можно заменить приглашением `it` (`REQUEST`): у него тот же организатор, `SEQUENCE` приглашения
+/// не меньше. Возвращает разобранный объект; иначе — причина отказа. Проверка — до любого изменения календаря
+/// получателя, в том числе до снятия прежней брони ресурса ([`crate::booking`], DAV-40).
+pub(crate) fn replaceable(
+    existing: &DavObject,
+    it: &Itip,
+) -> std::result::Result<ICalendar, &'static str> {
+    let Some((ical, m)) = ICalendar::parse(&existing.body)
+        .ok()
+        .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
+    else {
+        return Err("чужой UID организатора");
+    };
+    if m.organizer != it.meeting.organizer {
+        return Err("чужой UID организатора");
+    }
+    if it.meeting.sequence < m.sequence {
+        return Err("устаревший SEQUENCE");
+    }
+    Ok(ical)
 }
 
 fn hash(parts: &[&str]) -> String {
@@ -336,23 +359,9 @@ impl ItipInbox {
         attempt: usize,
         forced: Option<&ICalendarParticipationStatus>,
     ) -> Result<Step> {
-        let old = match existing {
-            None => None,
-            Some(o) => {
-                let Some((ical, m)) = ICalendar::parse(&o.body)
-                    .ok()
-                    .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
-                else {
-                    return ignored("чужой UID организатора");
-                };
-                if m.organizer != it.meeting.organizer {
-                    return ignored("чужой UID организатора");
-                }
-                if it.meeting.sequence < m.sequence {
-                    return ignored("устаревший SEQUENCE");
-                }
-                Some(ical)
-            }
+        let old = match existing.map(|o| replaceable(o, it)).transpose() {
+            Ok(old) => old,
+            Err(reason) => return ignored(reason),
         };
         let mut msg = it.ical.clone();
         if let Some(root) = msg.components.first_mut() {
@@ -656,6 +665,13 @@ impl ItipDelivery for ItipInbox {
         };
         if !sender_ok {
             return refuse("отправитель не организатор и не участник");
+        }
+        // Получателя нет среди участников (DAV-41): в календарь не кладётся — иначе любой внешний отправитель с DMARC
+        // pass вносил бы события в чужие календари; письмо остаётся письмом.
+        if matches!(it.method, ItipMethod::Request | ItipMethod::Add)
+            && it.meeting.attendee(&to).is_none()
+        {
+            return refuse("получатель не участник встречи");
         }
         let booked = match (&self.booking, it.method) {
             (Some(b), ItipMethod::Request) => {
