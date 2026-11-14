@@ -12,7 +12,7 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 280/314 | 389/434 | в работе, 90 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 282/324 | 391/445 | в работе, 88 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
 | Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 94/106 | 157/178 | в работе, 88 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 1/2 | 1/2 | в работе, 50 % карточек | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
@@ -126,7 +126,12 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
      живом Kerberos, после `ci-10`).
    - 4.2б Текстовый интерфейс и единая канва управления (решение 118): `deps-14` (DEPS-14), `admin-30` (ADM-44,
      общий клиент) → `tui-01` (TUI-01, TUI-02) → `tui-02` (TUI-03, TUI-04, после `deploy-41`/DEP-55), `app-65` (TUI-05),
-     `ci-14` (CI-16) → `docs-08` (DOC-08).
+     `ci-14` (CI-16) → `docs-08` (DOC-08). Фирменный стиль IT Task и мышь (решение 119): `design-01` (DES-01, токены
+     и контраст в CI) → `tui-03` (TUI-06, тема и пять режимов, после `tui-01`), `console-10` (UI-19, тема antd и шрифты
+     без CDN); `deps-15` (DEPS-15, `ratatui-image`) → `tui-04` (TUI-07, мышь и плавный курсор, после `tui-03`). Раздел
+     «Очередь»: `contracts-57` (CTR-85) → `admin-31` (ADM-45) → `console-11` (UI-20). Хвосты: `contracts-58` (CTR-86
+     хранилище `ShareNotification`, CTR-87 `contacts_since` без тела по умолчанию), `app-66` (APP-69, представители в
+     доставке).
    - 4.3 Встречи: `contracts-34` (CTR-47) → `meta-32`, `dav-04` (RFC 6638, iMIP, занятость), `smtp-13`, `jmap-18` → `app-27`;
      хвосты — `app-36` (APP-38, подключения в узле) после `dav-07`, `jmap-20`, `admin-13`, `app-26`;
      `meta-35` (META-54, разворот повторов) — после `meta-32` (META-51) и `contracts-42` (CTR-59), решение 59;
@@ -584,14 +589,24 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ deploy-39 | DEP-53 | A | sys-11 | 2 |
 | ✅ docs-06 | DOC-06 | A | admin-25 | 1 |
 | ✅ deploy-40 | DEP-54 | A | deploy-29 | 1 |
-| deps-14 (ветка `x/deps-14`) | DEPS-14 | B | — | 1 |
+| ✅ deps-14 (ветка `x/deps-14`) | DEPS-14 | B | — | 1 |
 | admin-30 (ветка `x/admin-30`) | ADM-44 | B | — | 1 |
 | tui-01 | TUI-01, TUI-02 | A | deps-14, admin-30 | 1 |
-| deploy-41 | DEP-55 | A | — | 1 |
+| ✅ deploy-41 | DEP-55 | A | — | 1 |
 | tui-02 | TUI-03, TUI-04 | A | tui-01, deploy-41 | 1 |
 | app-65 | TUI-05 | A | tui-01 | 1 |
 | ci-14 (ветка `x/ci-14`) | CI-16 | B | tui-01 | 1 |
 | docs-08 | DOC-08 | A | tui-02 | 1 |
+| design-01 (ветка `x/design-01`) | DES-01 | B | — | 1 |
+| deps-15 (ветка `x/deps-15`) | DEPS-15 | B | deps-14 | 1 |
+| tui-03 | TUI-06 | A | tui-01, design-01 | 1 |
+| tui-04 | TUI-07 | A | tui-03, deps-15 | 1 |
+| console-10 | UI-19 | A | design-01 | 1 |
+| contracts-57 (ветка `x/contracts-57`) | CTR-85 | B | — | 1 |
+| admin-31 | ADM-45 | A | contracts-57 | 1 |
+| console-11 | UI-20 | A | admin-31 | 1 |
+| contracts-58 (ветка `x/contracts-58`) | CTR-86, CTR-87 | B | — | 1 |
+| app-66 (ветка `x/app-66`) | APP-69 | B | — | 1 |
 | ✅ app-47 | APP-54 | A | — | 2 |
 | ✅ contracts-46 (ветка `x/contracts-46`) | CTR-25, CTR-67, CTR-68, CTR-70 | B | contracts-37 | 1 |
 | ✅ contracts-51 (ветка `x/contracts-51`) | CTR-79 | B | contracts-46 | 1 |
