@@ -13,7 +13,7 @@
 //!
 //! Ищутся включённые учётные записи организации вошедшего (`AccountStore::list` порциями `dav.gal_page_size`), не больше
 //! `dav.principal_search_scan` записей; найденных — не больше `dav.principal_search_results`, остальное — `507` с
-//! `number-of-matches-within-limits`. Без общего доступа и планирования учётных записей нет — пустой ответ.
+//! `number-of-matches-within-limits`. Без планирования учётных записей нет — пустой ответ.
 
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -164,13 +164,9 @@ impl Query {
     }
 }
 
-/// Учётные записи: из общего доступа или планирования.
+/// Учётные записи организации (планирование).
 fn accounts<'a>(cx: &'a Cx<'_>) -> Option<&'a dyn AccountStore> {
-    match (&cx.dav.sharing, &cx.dav.schedule) {
-        (Some(s), _) => Some(s.accounts.as_ref()),
-        (None, Some(s)) => Some(s.accounts.as_ref()),
-        (None, None) => None,
-    }
+    cx.dav.accounts()
 }
 
 /// Найденные учётные записи (не больше `q.limit`) и признак, что найдено больше.

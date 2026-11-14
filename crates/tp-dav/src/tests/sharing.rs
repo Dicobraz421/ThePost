@@ -26,7 +26,7 @@ use tp_testkit::{
 
 use super::{Resp, basic, event};
 use crate::{
-    BookingDeps, DavConfig, Deps, ItipInbox, ScheduleDeps, SharingDeps, itip, router_shared,
+    BookingDeps, DavConfig, Deps, ItipInbox, ScheduleDeps, SharingStores, itip, router_shared,
 };
 
 const ALICE: &str = "alice@example.org";
@@ -111,6 +111,7 @@ impl Share {
             Deps {
                 auth: Arc::new(auth),
                 store: Arc::new(store.clone()),
+                sharing: Some(Arc::new(authz.clone())),
             },
             Some(ScheduleDeps {
                 accounts: Arc::new(meta.clone()),
@@ -119,11 +120,9 @@ impl Share {
                 freebusy: Arc::new(store.clone()),
                 group_store: Arc::new(groups.clone()),
             }),
-            Some(SharingDeps {
-                authz: Arc::new(authz.clone()),
+            Some(SharingStores {
                 acl: Arc::new(store.clone()),
                 delegates: Arc::new(meta.clone()),
-                accounts: Arc::new(meta.clone()),
             }),
             cfg,
         );

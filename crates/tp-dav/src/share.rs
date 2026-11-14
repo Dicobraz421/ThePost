@@ -1,7 +1,8 @@
 //! Общий доступ к календарям и адресным книгам (DAV-17; SRS 4.4, 4.5; CONTRACTS.md#Sharing).
 //!
 //! Права на чужие коллекции проверяет только [`SharingAuthorizer`] (CTR-84): CalDAV и CardDAV права не вычисляют.
-//! Без [`SharingDeps`] ([`crate::router_with`]) доступ — только к своим ресурсам, как до общего доступа.
+//! Без [`crate::Deps::sharing`] (или без планирования — учётных записей) доступ — только к своим ресурсам, как до
+//! общего доступа; выдача прав `POST` и `cs:invite` — при хранилищах [`SharingStores`] ([`crate::router_shared`]).
 //!
 //! - Доступ к ресурсу чужой учётной записи (логин в URL — не вошедший; [`access`]): принципалы организации — чтение
 //!   свойств и отчёты; дом коллекций владельца — `PROPFIND` с коллекциями, на которые есть права; коллекция и объекты —
@@ -36,23 +37,29 @@ use crate::path::{self, Target};
 use crate::server::{Cx, Dav, precondition, status};
 use crate::xml::{CS, DAV, Element, href, text};
 
-/// Зависимости общего доступа ([`crate::router_shared`]).
+/// Хранилища общего доступа ([`crate::router_shared`]): записи прав и представители. Права проверяет только
+/// [`crate::Deps::sharing`]; хранилища нужны для записи (`POST` sharing, `PROPPATCH` групп представителей) и
+/// списков (`cs:invite`, `group-member-set`).
 #[derive(Clone)]
-pub struct SharingDeps {
-    /// Проверка прав на коллекции (CTR-84; узел — `Services::collections`).
-    pub authz: Arc<dyn SharingAuthorizer>,
+pub struct SharingStores {
     /// Записи прав на коллекции: выдача и отзыв (`POST` sharing), список выданных (`cs:invite`).
     pub acl: Arc<dyn CollectionAcl>,
     /// Представители учётных записей (`calendar-proxy-read`, `calendar-proxy-write`; DAV-18).
     pub delegates: Arc<dyn DelegateStore>,
-    /// Учётные записи: владелец по логину из URL, получатели прав, поиск принципалов (DAV-19).
-    pub accounts: Arc<dyn AccountStore>,
 }
 
-impl std::fmt::Debug for SharingDeps {
+impl std::fmt::Debug for SharingStores {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharingDeps").finish_non_exhaustive()
+        f.debug_struct("SharingStores").finish_non_exhaustive()
     }
+}
+
+/// Общий доступ запроса ([`Dav::sharing`]): права, учётные записи и, если подключены, хранилища.
+#[derive(Clone, Copy)]
+pub(crate) struct Sharing<'a> {
+    pub authz: &'a dyn SharingAuthorizer,
+    pub accounts: &'a dyn AccountStore,
+    pub stores: Option<&'a SharingStores>,
 }
 
 /// Доступ запроса к ресурсу: владелец и права вошедшего.
@@ -98,7 +105,7 @@ pub(crate) async fn access(
         });
     };
     let forbidden = || Box::new(status(StatusCode::FORBIDDEN));
-    let Some(sharing) = &dav.sharing else {
+    let Some(sharing) = dav.sharing() else {
         return Err(forbidden());
     };
     let owner = match sharing.accounts.by_login(principal.tenant, login).await {
@@ -228,7 +235,7 @@ pub(crate) struct Shared {
 /// Общие с вошедшим коллекции вида `kind` для его дома ([`SharingAuthorizer::shared_with`]) по владельцу и имени.
 /// Без общего доступа — пусто; удалённые коллекции и отключённые владельцы пропускаются.
 pub(crate) async fn shared(cx: &Cx<'_>, kind: CollectionKind) -> Result<Vec<Shared>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(Vec::new());
     };
     let list = sharing.authz.shared_with(cx.principal).await?;
@@ -283,7 +290,7 @@ pub(crate) fn display_name(a: &Account) -> String {
 
 /// Коллекции `list` владельца в его доме, открытом чужому вошедшему: только с правами, с правами по каждой.
 pub(crate) async fn foreign_home(cx: &Cx<'_>, list: Vec<Collection>) -> Result<Vec<Shared>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -310,13 +317,16 @@ pub(crate) async fn foreign_home(cx: &Cx<'_>, list: Vec<Collection>) -> Result<V
 /// Значение `cs:invite` коллекции `coll` владельца: получатели прав (имя входа — `mailto:`, группа и `anyone` — как
 /// есть) с уровнем `cs:read` или `cs:read-write`. Без общего доступа или не владельцу — `None`.
 pub(crate) async fn invite(cx: &Cx<'_>, coll: CollectionId) -> Result<Option<String>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(None);
     };
     if !cx.own() {
         return Ok(None);
     }
-    let entries = sharing.acl.collection_acl(cx.scope, coll).await?;
+    let Some(stores) = sharing.stores else {
+        return Ok(None);
+    };
+    let entries = stores.acl.collection_acl(cx.scope, coll).await?;
     Ok(Some(invite_xml(&entries)))
 }
 
@@ -420,7 +430,10 @@ pub(crate) async fn login_of(
 /// `POST` на коллекцию: выдача и отзыв прав. Все получатели проверяются до записи: неизвестный — 409, нет права
 /// выдавать или политика не допускает — 403; ничего не записано.
 pub(crate) async fn post(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Response> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
+        return Ok(crate::server::not_allowed());
+    };
+    let Some(stores) = sharing.stores else {
         return Ok(crate::server::not_allowed());
     };
     let Target::Collection(kind, _, name) = target else {
@@ -442,8 +455,7 @@ pub(crate) async fn post(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Res
     }
     let mut grants = Vec::with_capacity(list.len());
     for s in list {
-        let Some(account) = login_of(sharing.accounts.as_ref(), cx.scope.tenant, &s.href).await?
-        else {
+        let Some(account) = login_of(sharing.accounts, cx.scope.tenant, &s.href).await? else {
             return Ok(status(StatusCode::CONFLICT));
         };
         if account.id == cx.scope.account {
@@ -470,7 +482,7 @@ pub(crate) async fn post(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Res
         grants.push((account.login, s.rights));
     }
     for (login, rights) in grants {
-        sharing
+        stores
             .acl
             .set_collection_acl(cx.scope, coll.id, &login, rights)
             .await?;

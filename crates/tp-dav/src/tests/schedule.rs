@@ -101,6 +101,7 @@ impl Sched {
             Deps {
                 auth: Arc::new(auth),
                 store: Arc::new(store.clone()),
+                sharing: None,
             },
             Some(ScheduleDeps {
                 accounts: Arc::new(meta.clone()),

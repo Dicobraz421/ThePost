@@ -114,7 +114,10 @@ async fn unknown_method_and_created_ids() {
 #[tokio::test]
 async fn session_object() {
     let env = Env::new().await;
-    let s = env.jmap.session(&env.principal, "https://mail.example.org");
+    let s = env
+        .jmap
+        .session(&env.principal, "https://mail.example.org")
+        .await;
     let core = &s["capabilities"]["urn:ietf:params:jmap:core"];
     assert_eq!(core["maxCallsInRequest"], 16);
     assert_eq!(core["maxObjectsInGet"], 500);
@@ -132,7 +135,9 @@ async fn session_object() {
     assert_eq!(s["username"], "user@example.org");
     assert_eq!(
         s["state"],
-        env.jmap.session(&env.principal, "https://mail.example.org")["state"]
+        env.jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await["state"]
     );
 }
 
@@ -164,7 +169,7 @@ impl JmapCapability for Echo {
 #[tokio::test]
 async fn module_capability() {
     let env = Env::with(JmapConfig::default(), vec![Arc::new(Echo("urn:x:foo"))]).await;
-    let s = env.jmap.session(&env.principal, "");
+    let s = env.jmap.session(&env.principal, "").await;
     assert_eq!(s["capabilities"]["urn:x:foo"], json!({"maxFoo": 3}));
     assert_eq!(s["primaryAccounts"]["urn:x:foo"], env.account());
     let resp = env

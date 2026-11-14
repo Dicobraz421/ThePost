@@ -1,4 +1,4 @@
-//! JMAP Core, Mail, Submission, Push, Sieve, Calendars, Contacts (SRS 4.2–4.4).
+//! JMAP Core, Mail, Submission, Push, Sieve, Calendars, Tasks, Contacts (SRS 4.2–4.4).
 //!
 //! - [`core`] — сессия, запрос API, ссылки на результаты, ошибки, лимиты, аутентификация, capability модулей (RFC 8620);
 //! - `mailbox` — Mailbox/get, changes, query, queryChanges, set (RFC 8621 §2);
@@ -22,6 +22,10 @@
 //! - `calendar_query` — CalendarEvent/query, queryChanges: интервал по индексу и развёртке повторов calcard,
 //!   `expandRecurrences`;
 //! - `calendars` — Calendar/get, changes, set (draft-ietf-jmap-calendars) поверх `DavStore`, [`Jmap::with_dav`];
+//! - `tasks` — TaskList/get, changes, set и Task/get, changes, query, queryChanges, set (draft-ietf-jmap-tasks,
+//!   JMAP-33) поверх коллекций `VTODO` того же `DavStore`, что у CalDAV;
+//! - `sharing` — общий доступ к календарям и адресным книгам (JMAP-32): аккаунты владельцев, `shareWith`,
+//!   `myRights`, ShareNotification/get, changes, query, queryChanges, set ([`Jmap::with_sharing`]);
 //! - `contact_card` — ContactCard/get, changes, query, queryChanges, set, copy: vCard в `DavStore`, JSContact —
 //!   calcard, индекс — `tp_dav::index`;
 //! - `contacts` — AddressBook/get, changes, set (RFC 9610) поверх `DavStore`, [`Jmap::with_dav`];
@@ -61,8 +65,10 @@ mod push;
 mod scheduling;
 mod sender_lists;
 mod settings;
+mod sharing;
 mod sieve;
 pub mod submission;
+mod tasks;
 #[cfg(test)]
 mod testenv;
 mod vacation;
@@ -71,11 +77,12 @@ use serde_json::{Map, Value};
 
 pub use crate::autoconfig::sign::{ProfileSigner, SignatureAlgorithm, SigningKey};
 pub use crate::core::{Deps, Jmap, JmapConfig, MethodError, Problem};
+pub use crate::sharing::SharingDeps;
 
 use crate::core::error::MethodResult;
 use crate::core::{
     AVAILABILITY, CALENDARS, CONTACTS, CORE, Ctx, MAIL, ORG_CHART, PRINCIPALS, SENDER_LISTS,
-    SETTINGS, SIEVE, SUBMISSION, VACATION,
+    SETTINGS, SIEVE, SUBMISSION, TASKS, VACATION,
 };
 
 /// Встроенные методы и их capability.
@@ -127,6 +134,19 @@ pub(crate) const METHODS: &[(&str, &str)] = &[
     ("Principal/get", PRINCIPALS),
     ("Principal/query", PRINCIPALS),
     ("Principal/getAvailability", AVAILABILITY),
+    ("ShareNotification/get", PRINCIPALS),
+    ("ShareNotification/changes", PRINCIPALS),
+    ("ShareNotification/query", PRINCIPALS),
+    ("ShareNotification/queryChanges", PRINCIPALS),
+    ("ShareNotification/set", PRINCIPALS),
+    ("TaskList/get", TASKS),
+    ("TaskList/changes", TASKS),
+    ("TaskList/set", TASKS),
+    ("Task/get", TASKS),
+    ("Task/changes", TASKS),
+    ("Task/query", TASKS),
+    ("Task/queryChanges", TASKS),
+    ("Task/set", TASKS),
     ("Calendar/get", CALENDARS),
     ("Calendar/changes", CALENDARS),
     ("Calendar/set", CALENDARS),
@@ -200,6 +220,19 @@ pub(crate) async fn call_builtin(
         "Principal/get" => principal::get(ctx, args).await,
         "Principal/query" => principal::query(ctx, args).await,
         "Principal/getAvailability" => principal::get_availability(ctx, args).await,
+        "ShareNotification/get" => sharing::notification_get(ctx, args).await,
+        "ShareNotification/changes" => sharing::notification_changes(ctx, args).await,
+        "ShareNotification/query" => sharing::notification_query(ctx, args).await,
+        "ShareNotification/queryChanges" => sharing::notification_query_changes(ctx, args).await,
+        "ShareNotification/set" => sharing::notification_set(ctx, args).await,
+        "TaskList/get" => tasks::list_get(ctx, args).await,
+        "TaskList/changes" => tasks::list_changes(ctx, args).await,
+        "TaskList/set" => tasks::list_set(ctx, args).await,
+        "Task/get" => tasks::get(ctx, args).await,
+        "Task/changes" => tasks::changes(ctx, args).await,
+        "Task/query" => tasks::query(ctx, args).await,
+        "Task/queryChanges" => tasks::query_changes(ctx, args).await,
+        "Task/set" => tasks::set(ctx, args).await,
         "Calendar/get" => calendars::get(ctx, args).await,
         "Calendar/changes" => calendars::changes(ctx, args).await,
         "Calendar/set" => calendars::set(ctx, args).await,

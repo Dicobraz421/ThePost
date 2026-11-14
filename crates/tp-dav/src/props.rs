@@ -136,7 +136,7 @@ pub(crate) fn cutype(kind: AccountKind) -> &'static str {
 /// Принципал владельца ресурса запроса; своему — с представительствами ([`crate::proxy::proxy_for`]).
 pub(crate) async fn principal_view(cx: &Cx<'_>) -> Result<PrincipalView> {
     let account = cx.account().await?;
-    let proxy_for = if cx.own() && cx.dav.sharing.is_some() {
+    let proxy_for = if cx.own() && cx.dav.sharing().is_some() {
         Some(crate::proxy::proxy_for(cx).await?)
     } else {
         None
@@ -426,7 +426,7 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
         }
         Res::Collection(c, invite) => {
             collection_props(cx, c, &path::principal(login), &mut v);
-            if cx.dav.sharing.is_some() && cx.own() && !c.is_gal() {
+            if cx.dav.sharing().is_some_and(|s| s.stores.is_some()) && cx.own() && !c.is_gal() {
                 v.push(p(
                     CS,
                     "allowed-sharing-modes",
@@ -726,7 +726,7 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         Target::Principal(_) => {
             let view = principal_view(cx).await?;
             emit(cx, &mut ms, &Res::Principal(&view), &want);
-            if depth1 && cx.own() && cx.dav.sharing.is_some() {
+            if depth1 && cx.own() && cx.dav.sharing().is_some() {
                 for write in [false, true] {
                     crate::proxy::emit_group(cx, &mut ms, write, &want).await?;
                 }

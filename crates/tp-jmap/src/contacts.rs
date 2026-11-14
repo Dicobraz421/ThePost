@@ -1,8 +1,9 @@
 //! JMAP Contacts — адресные книги (RFC 9610 §2; JMAP-25): `AddressBook/get`, `/changes`, `/set` поверх
 //! [`DavStore`] (вид [`CollectionKind::AddressBook`]) — те же коллекции, что у CardDAV.
 //!
-//! `name` — отображаемое имя коллекции, сегмент URL новой книги — её `id`. `myRights` — права владельца; общий
-//! доступ (`shareWith`) — JMAP-32. Книга по умолчанию (`isDefault`) — назначенная (`onSuccessSetIsDefault`,
+//! `name` — отображаемое имя коллекции, сегмент URL новой книги — её `id`. `myRights` и `shareWith` — права субъекта
+//! и учётных записей по `CollectionAcl` (JMAP-32, `crate::sharing`): свойства, права и удаление книги — при праве
+//! `admin`, в чужом аккаунте книга не создаётся. Книга по умолчанию (`isDefault`) — назначенная (`onSuccessSetIsDefault`,
 //! [`Collection::is_default`]), иначе правило [`default_of`]; `isSubscribed` — [`Collection::subscribed`] (JMAP-36).
 //! Состояние — [`State`] (общее для `AddressBook` и `ContactCard`); push — по `DavChanged`.
 //!
@@ -27,15 +28,19 @@ use crate::core::request::{
     ChangesArgs, GetArgs, SetArgs, SetOutcome, changes_response, map_changes, object, parse_args,
     parse_state, select, state_string,
 };
+use crate::sharing::{
+    ObjectType, book_rights, commit_share, prepare_share, share_with, split_share,
+};
 
 pub(crate) const KIND: CollectionKind = CollectionKind::AddressBook;
 
 /// Сегмент URL книги по умолчанию.
 const DEFAULT_NAME: &str = tp_contracts::dav::DEFAULT_COLLECTION_NAME;
 
-/// Значение capability учётной записи: карточка — в одной книге (объект CardDAV).
-pub(crate) fn account_capability() -> Value {
-    json!({ "maxAddressBooksPerCard": 1, "mayCreateAddressBook": true })
+/// Значение capability аккаунта: карточка — в одной книге (объект CardDAV); `may_create` — свой аккаунт (в чужом
+/// книги не создаются).
+pub(crate) fn account_capability(may_create: bool) -> Value {
+    json!({ "maxAddressBooksPerCard": 1, "mayCreateAddressBook": may_create })
 }
 
 /// Книга по умолчанию среди `books` — правило контракта [`default_of`]: назначенная, иначе прежнее правило.
@@ -100,22 +105,30 @@ pub(crate) async fn state(store: &dyn DavStore, scope: AccountScope) -> MethodRe
     Ok(State::load(store, scope).await?.to_string())
 }
 
-/// Права на книгу: книга GAL — только чтение.
-fn rights(gal: bool) -> Value {
-    json!({ "mayRead": true, "mayWrite": !gal, "mayShare": false, "mayDelete": !gal })
+/// `myRights` книги для вызова: книга GAL — только чтение.
+fn rights(ctx: &Ctx<'_>, b: &Collection) -> Value {
+    book_rights(
+        ctx.access.rights(b.id),
+        ctx.jmap.sharing.is_some(),
+        b.is_gal(),
+    )
 }
 
-fn book_object(b: &Collection, default: Option<CollectionId>) -> Map<String, Value> {
-    object(json!({
+async fn book_object(
+    ctx: &Ctx<'_>,
+    b: &Collection,
+    default: Option<CollectionId>,
+) -> MethodResult<Map<String, Value>> {
+    Ok(object(json!({
         "id": b.id.to_string(),
         "name": b.display_name,
         "description": b.description,
         "sortOrder": b.order,
         "isDefault": default == Some(b.id),
         "isSubscribed": b.subscribed,
-        "shareWith": null,
-        "myRights": rights(b.is_gal()),
-    }))
+        "shareWith": share_with(ctx, ObjectType::AddressBook, b).await?,
+        "myRights": rights(ctx, b),
+    })))
 }
 
 /// `AddressBook/get`.
@@ -124,17 +137,20 @@ pub(crate) async fn get(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: GetArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     ctx.check_get_limit(a.ids.as_ref())?;
     let store = ctx.jmap.dav_store()?;
     let st = state(store.as_ref(), ctx.scope).await?;
-    let books = store.list_collections(ctx.scope, KIND).await?;
+    let mut books = store.list_collections(ctx.scope, KIND).await?;
     let default = default_book(&books);
+    books.retain(|b| ctx.access.sees(b.id));
     let (mut list, mut not_found) = (Vec::new(), Vec::new());
     let props = a.properties.as_deref();
     match &a.ids {
         None => {
-            list.extend(books.iter().map(|b| select(book_object(b, default), props)));
+            for b in &books {
+                list.push(select(book_object(ctx, b, default).await?, props));
+            }
         }
         Some(ids) => {
             let mut seen: Vec<&str> = Vec::new();
@@ -145,7 +161,7 @@ pub(crate) async fn get(
                 }
                 seen.push(id);
                 match books.iter().find(|b| b.id.to_string() == id) {
-                    Some(b) => list.push(select(book_object(b, default), props)),
+                    Some(b) => list.push(select(book_object(ctx, b, default).await?, props)),
                     None => not_found.push(id.to_owned()),
                 }
             }
@@ -166,7 +182,7 @@ pub(crate) async fn changes(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: ChangesArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
     let since = State::parse(&a.since_state)?;
     let store = ctx.jmap.dav_store()?;
@@ -175,6 +191,9 @@ pub(crate) async fn changes(
         .await
         .map_err(changes_error)?;
     let mut c = map_changes(c, ToString::to_string);
+    if !ctx.access.is_own() {
+        crate::sharing::retain_collections(ctx, store.as_ref(), &mut c, |_| true).await?;
+    }
     let gal = gal_book(store.as_ref(), ctx.scope).await?;
     let gal_state = gal.as_ref().map_or(ModSeq::ZERO, |b| b.state);
     if since.gal > gal_state {
@@ -184,7 +203,8 @@ pub(crate) async fn changes(
         own: c.new_state,
         gal: gal_state,
     };
-    if let Some(b) = gal.filter(|b| b.state > since.gal) {
+    // Книга GAL — только в своём аккаунте.
+    if let Some(b) = gal.filter(|b| b.state > since.gal && ctx.access.sees(b.id)) {
         let taken = c.created.len() + c.updated.len() + c.destroyed.len();
         if c.has_more || taken >= limit {
             // Книга GAL — на следующей странице.
@@ -241,7 +261,6 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
                 c.subscribed = *b;
                 true
             }
-            ("shareWith", Value::Null) => true,
             _ => false,
         };
         if !ok {
@@ -283,6 +302,10 @@ pub(crate) async fn set_default(
     out: &mut SetOutcome,
 ) -> MethodResult<()> {
     if !out.not_created.is_empty() || !out.not_updated.is_empty() || !out.not_destroyed.is_empty() {
+        return Ok(());
+    }
+    // Коллекция по умолчанию — своя: в чужом аккаунте не назначается.
+    if !ctx.access.is_own() {
         return Ok(());
     }
     let Some(id) = want.and_then(|w| CollectionId::from_str(ctx.resolve_id(w)).ok()) else {
@@ -328,8 +351,8 @@ fn report_default(out: &mut SetOutcome, id: CollectionId, is_default: bool) {
     }
 }
 
-/// `AddressBook/set`: создание, изменение (имя, описание, порядок, подписка), удаление (`onDestroyRemoveContents`),
-/// книга по умолчанию (`onSuccessSetIsDefault`).
+/// `AddressBook/set`: создание, изменение (имя, описание, порядок, подписка, `shareWith`), удаление
+/// (`onDestroyRemoveContents`), книга по умолчанию (`onSuccessSetIsDefault`).
 pub(crate) async fn set(
     ctx: &mut Ctx<'_>,
     args: Map<String, Value>,
@@ -340,7 +363,7 @@ pub(crate) async fn set(
     let mut base = args;
     base.retain(|k, _| !k.starts_with("on"));
     let a: SetArgs = parse_args(base)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     a.check_limit(ctx.jmap.cfg.max_objects_in_set)?;
     let store = ctx.jmap.dav_store()?.clone();
     let old = state(store.as_ref(), ctx.scope).await?;
@@ -349,15 +372,29 @@ pub(crate) async fn set(
     }
     let mut out = SetOutcome::default();
     for (cid, v) in a.create.unwrap_or_default() {
+        if !ctx.access.is_own() {
+            out.not_created
+                .insert(cid, set_error("forbidden", None, &[]));
+            continue;
+        }
+        let (props, share) = split_share(&v);
         let mut c = Collection::new(KIND, DEFAULT_NAME);
         c.name = c.id.to_string();
-        if let Err(e) = apply_props(&mut c, &v, true) {
+        if let Err(e) = apply_props(&mut c, &Value::Object(props), true) {
             out.not_created.insert(cid, e);
             continue;
         }
+        let grants = match prepare_share(ctx, ObjectType::AddressBook, c.id, &share).await? {
+            Ok(g) => g,
+            Err(e) => {
+                out.not_created.insert(cid, e);
+                continue;
+            }
+        };
         let (id, subscribed) = (c.id, c.subscribed);
-        match store.create_collection(ctx.scope, c).await {
+        match store.create_collection(ctx.scope, c.clone()).await {
             Ok(_) => {
+                commit_share(ctx, ObjectType::AddressBook, &c, grants).await?;
                 ctx.created.insert(cid.clone(), id.to_string());
                 let books = store.list_collections(ctx.scope, KIND).await?;
                 out.created.insert(
@@ -366,8 +403,8 @@ pub(crate) async fn set(
                         "id": id.to_string(),
                         "isDefault": default_book(&books) == Some(id),
                         "isSubscribed": subscribed,
-                        "shareWith": null,
-                        "myRights": rights(false),
+                        "shareWith": share_with(ctx, ObjectType::AddressBook, &c).await?,
+                        "myRights": rights(ctx, &c),
                     }),
                 );
             }
@@ -385,23 +422,35 @@ pub(crate) async fn set(
                 .filter(|c| c.kind == KIND),
             Err(_) => None,
         };
-        let Some(mut c) = cur else {
+        let Some(mut c) = cur.filter(|c| ctx.access.sees(c.id)) else {
             out.not_updated.insert(id, set_error("notFound", None, &[]));
             continue;
         };
-        if c.is_gal() {
+        if c.is_gal() || !ctx.access.admins(c.id) {
             out.not_updated
                 .insert(id, set_error("forbidden", None, &[]));
             continue;
         }
-        if let Err(e) = apply_props(&mut c, &patch, false) {
+        let (props, share) = split_share(&patch);
+        if let Err(e) = apply_props(&mut c, &Value::Object(props.clone()), false) {
             out.not_updated.insert(id, e);
             continue;
         }
-        match store.update_collection(ctx.scope, c).await {
-            Ok(_) => out.updated.insert(id, Value::Null),
-            Err(e) => out.not_updated.insert(id, store_error(e)?),
+        let grants = match prepare_share(ctx, ObjectType::AddressBook, c.id, &share).await? {
+            Ok(g) => g,
+            Err(e) => {
+                out.not_updated.insert(id, e);
+                continue;
+            }
         };
+        if !props.is_empty()
+            && let Err(e) = store.update_collection(ctx.scope, c.clone()).await
+        {
+            out.not_updated.insert(id, store_error(e)?);
+            continue;
+        }
+        commit_share(ctx, ObjectType::AddressBook, &c, grants).await?;
+        out.updated.insert(id, Value::Null);
     }
     for id in a.destroy.unwrap_or_default() {
         let rid = ctx.resolve_id(&id).to_owned();
@@ -412,12 +461,12 @@ pub(crate) async fn set(
                 .filter(|c| c.kind == KIND),
             Err(_) => None,
         };
-        let Some(c) = cur else {
+        let Some(c) = cur.filter(|c| ctx.access.sees(c.id)) else {
             out.not_destroyed
                 .insert(id, set_error("notFound", None, &[]));
             continue;
         };
-        if c.is_gal() {
+        if c.is_gal() || !ctx.access.admins(c.id) {
             out.not_destroyed
                 .insert(id, set_error("forbidden", None, &[]));
             continue;
@@ -504,7 +553,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn session_lists_capability() {
         let env = Env::new().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let acc = env.account();
         assert!(s["capabilities"][USING[1]].is_object(), "{s}");
         assert_eq!(

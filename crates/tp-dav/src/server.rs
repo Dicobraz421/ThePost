@@ -3,7 +3,7 @@
 //! Вход — `Authorization: Basic` (пароль приложения) или `Bearer` (OAuth 2.0) через [`Authenticator`], как в JMAP;
 //! без данных или с неверными — 401 с `WWW-Authenticate: Basic realm="dav"`. `OPTIONS` отвечает без входа
 //! (клиенты узнают возможности сервера до запроса пароля). Логин в URL не совпадает с вошедшим — доступ к чужим
-//! ресурсам по правам общего доступа ([`crate::share`], [`router_shared`]); без него — 403. Глобальная адресная книга
+//! ресурсам по правам общего доступа ([`Deps::sharing`], [`crate::share`]); без него — 403. Глобальная адресная книга
 //! ([`crate::gal`]) — только чтение: запись в неё — 403 `need-privileges` до обращения к хранилищу.
 //!
 //! `/.well-known/caldav` и `/.well-known/carddav` перенаправляет на `/dav/` `tp-jmap` (секция `jmap.autoconfig`,
@@ -24,14 +24,13 @@ use base64::engine::general_purpose::STANDARD;
 use tp_contracts::Error;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::dav::DavStore;
-use tp_contracts::meta::Account;
-use tp_contracts::meta::AccountScope;
-use tp_contracts::sharing::CollectionRights;
+use tp_contracts::meta::{Account, AccountScope, AccountStore};
+use tp_contracts::sharing::{CollectionRights, SharingAuthorizer};
 
 use crate::config::DavConfig;
 use crate::path::Target;
 use crate::schedule::{self, ScheduleDeps};
-use crate::share::{self, SharingDeps};
+use crate::share::{self, Sharing, SharingStores};
 use crate::xml::{self, Element};
 use crate::{gal, principals, props, proxy, resource, sync};
 
@@ -39,7 +38,7 @@ use crate::{gal, principals, props, proxy, resource, sync};
 pub const DAV_HEADER: &str =
     "1, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol";
 
-/// Значение заголовка `DAV` с общим доступом ([`router_shared`]): представители (`calendar-proxy`), выдача прав
+/// Значение заголовка `DAV` с общим доступом ([`Deps::sharing`]): представители (`calendar-proxy`), выдача прав
 /// CalendarServer (`calendarserver-sharing`), поиск принципалов (`calendarserver-principal-search`).
 pub const DAV_HEADER_SHARING: &str = concat!(
     "1, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol, ",
@@ -58,12 +57,16 @@ pub struct Deps {
     pub auth: Arc<dyn Authenticator>,
     /// Календари и контакты.
     pub store: Arc<dyn DavStore>,
+    /// Единый слой прав на коллекции (CTR-84) для общего доступа и представителей (DAV-17, DAV-18); `None` —
+    /// только свои коллекции. Узел подключает тот же слой, что у JMAP и Admin API.
+    pub sharing: Option<Arc<dyn SharingAuthorizer>>,
 }
 
 impl fmt::Debug for Deps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deps")
             .field("limits", &self.store.limits())
+            .field("sharing", &self.sharing.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -75,8 +78,25 @@ pub(crate) struct Dav {
     pub cfg: DavConfig,
     /// Планирование встреч; `None` — объекты хранятся без рассылки iTIP.
     pub schedule: Option<ScheduleDeps>,
-    /// Общий доступ; `None` — только свои ресурсы.
-    pub sharing: Option<SharingDeps>,
+    /// Хранилища общего доступа: выдача прав и представители; `None` — только чтение прав.
+    pub stores: Option<SharingStores>,
+}
+
+impl Dav {
+    /// Общий доступ: права — [`Deps::sharing`], учётные записи — планирования ([`ScheduleDeps::accounts`]); без
+    /// любого из них — `None` (только свои ресурсы).
+    pub(crate) fn sharing(&self) -> Option<Sharing<'_>> {
+        Some(Sharing {
+            authz: self.d.sharing.as_deref()?,
+            accounts: self.schedule.as_ref()?.accounts.as_ref(),
+            stores: self.stores.as_ref(),
+        })
+    }
+
+    /// Учётные записи организации (планирование); без планирования — `None`.
+    pub(crate) fn accounts(&self) -> Option<&dyn AccountStore> {
+        self.schedule.as_ref().map(|s| s.accounts.as_ref())
+    }
 }
 
 impl Dav {
@@ -99,29 +119,29 @@ pub fn router_with(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> R
     build(d, schedule, None, cfg)
 }
 
-/// Маршруты DAV с планированием `schedule` и общим доступом `sharing` (DAV-17…19, [`crate::share`]): чужие
-/// календари и адресные книги по правам [`SharingDeps::authz`], выдача прав `POST`, представители
-/// `calendar-proxy` ([`crate::proxy`]), поиск принципалов ([`crate::principals`]).
+/// Маршруты DAV с планированием `schedule` и хранилищами общего доступа `stores` (DAV-17, DAV-18,
+/// [`crate::share`]): права на чужие коллекции — по [`Deps::sharing`] (как у [`router_with`]), а `stores` добавляют
+/// выдачу прав `POST` (`cs:invite`) и состав групп представителей `calendar-proxy` ([`crate::proxy`]).
 pub fn router_shared(
     d: Deps,
     schedule: Option<ScheduleDeps>,
-    sharing: Option<SharingDeps>,
+    stores: Option<SharingStores>,
     cfg: DavConfig,
 ) -> Router {
-    build(d, schedule, sharing, cfg)
+    build(d, schedule, stores, cfg)
 }
 
 fn build(
     d: Deps,
     schedule: Option<ScheduleDeps>,
-    sharing: Option<SharingDeps>,
+    stores: Option<SharingStores>,
     cfg: DavConfig,
 ) -> Router {
     let dav = Arc::new(Dav {
         d,
         cfg,
         schedule,
-        sharing,
+        stores,
     });
     Router::new()
         .route("/dav", any(handle))
@@ -159,12 +179,10 @@ impl Cx<'_> {
         self.scope.account == self.principal.account
     }
 
-    /// Учётная запись владельца — из планирования или общего доступа; без них — `None`.
+    /// Учётная запись владельца — из планирования; без него — `None`.
     pub(crate) async fn account(&self) -> tp_contracts::Result<Option<Account>> {
-        let accounts = match (&self.dav.schedule, &self.dav.sharing) {
-            (Some(s), _) => s.accounts.as_ref(),
-            (None, Some(s)) => s.accounts.as_ref(),
-            (None, None) => return Ok(None),
+        let Some(accounts) = self.dav.accounts() else {
+            return Ok(None);
         };
         accounts.get(self.scope.tenant, self.scope.account).await
     }
@@ -221,7 +239,7 @@ pub(crate) async fn read(body: Body, limit: usize) -> Result<Bytes, StatusCode> 
 async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     if parts.method == Method::OPTIONS {
-        return options(dav.sharing.is_some());
+        return options(dav.sharing().is_some());
     }
     // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`); без соединения — неизвестен.
     let peer = parts

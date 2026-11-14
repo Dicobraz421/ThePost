@@ -12,8 +12,8 @@
 //! Планирование встреч (DAV-13…16, RFC 6638; [`router_with`] с [`ScheduleDeps`]): рассылка iTIP после `PUT` и
 //! `DELETE`, `schedule-inbox` и `schedule-outbox`, `Schedule-Tag`, запрос занятости.
 //!
-//! Общий доступ (DAV-17…19; [`router_shared`] с [`SharingDeps`]): чужие календари и адресные книги по правам
-//! `SharingAuthorizer` (CTR-84), выдача прав `POST` (CalendarServer sharing), представители `calendar-proxy`, поиск
+//! Общий доступ (DAV-17…19; права — [`Deps::sharing`], хранилища — [`router_shared`] с [`SharingStores`]): чужие
+//! календари и адресные книги по правам `SharingAuthorizer` (CTR-84), выдача прав `POST` (CalendarServer sharing), представители `calendar-proxy`, поиск
 //! принципалов и переговорных; бронирование ресурсов при приёме iTIP — [`ItipInbox::with_booking`].
 //!
 //! - [`config`] — секция `dav` ([`DavConfig`]);
@@ -61,4 +61,4 @@ pub use imip::ImipSender;
 pub use path::PREFIX;
 pub use schedule::ScheduleDeps;
 pub use server::{ALLOW, DAV_HEADER, DAV_HEADER_SHARING, Deps, router, router_shared, router_with};
-pub use share::SharingDeps;
+pub use share::SharingStores;

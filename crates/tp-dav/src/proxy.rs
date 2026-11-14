@@ -44,7 +44,7 @@ fn level(write: bool) -> DelegateLevel {
 
 /// Логины учётных записей `ids` организации вошедшего по идентификатору (отключённые и удалённые пропускаются).
 async fn logins(cx: &Cx<'_>, ids: &[AccountId]) -> Result<BTreeMap<AccountId, String>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(BTreeMap::new());
     };
     if ids.is_empty() {
@@ -62,7 +62,7 @@ async fn logins(cx: &Cx<'_>, ids: &[AccountId]) -> Result<BTreeMap<AccountId, St
 
 /// Владельцы, представителем которых является вошедший: логин и запись (`calendar-proxy-*-for`).
 pub(crate) async fn proxy_for(cx: &Cx<'_>) -> Result<Vec<(String, bool)>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(Vec::new());
     };
     let list = sharing.authz.delegations(cx.principal).await?;
@@ -79,10 +79,13 @@ pub(crate) async fn proxy_for(cx: &Cx<'_>) -> Result<Vec<(String, bool)>> {
 
 /// Логины представителей владельца ресурса запроса уровня `write`.
 pub(crate) async fn members(cx: &Cx<'_>, write: bool) -> Result<Vec<String>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(Vec::new());
     };
-    let list = sharing.delegates.delegates(cx.scope).await?;
+    let Some(stores) = sharing.stores else {
+        return Ok(Vec::new());
+    };
+    let list = stores.delegates.delegates(cx.scope).await?;
     let ids: Vec<AccountId> = list
         .iter()
         .filter(|d| d.level == level(write))
@@ -114,7 +117,7 @@ pub(crate) async fn proppatch(cx: &Cx<'_>, target: &Target, body: Body) -> Resul
     let Target::Proxy(_, write) = target else {
         return Ok(status(StatusCode::FORBIDDEN));
     };
-    if cx.dav.sharing.is_none() {
+    if cx.dav.sharing().is_none_or(|s| s.stores.is_none()) {
         return Ok(status(StatusCode::FORBIDDEN));
     }
     let write = *write;
@@ -173,7 +176,7 @@ pub(crate) async fn proppatch(cx: &Cx<'_>, target: &Target, body: Body) -> Resul
 /// Учётные записи из значения `group-member-set` (`None` у удаления — пустой состав); неизвестная ссылка или
 /// владелец — `None`.
 async fn resolve(cx: &Cx<'_>, value: Option<&Element>) -> Result<Option<Vec<AccountId>>> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Ok(None);
     };
     let Some(value) = value else {
@@ -181,9 +184,7 @@ async fn resolve(cx: &Cx<'_>, value: Option<&Element>) -> Result<Option<Vec<Acco
     };
     let mut ids = Vec::new();
     for h in value.children.iter().filter(|c| c.is(DAV, "href")) {
-        let Some(a) =
-            share::login_of(sharing.accounts.as_ref(), cx.scope.tenant, h.trimmed()).await?
-        else {
+        let Some(a) = share::login_of(sharing.accounts, cx.scope.tenant, h.trimmed()).await? else {
             return Ok(None);
         };
         if a.id == cx.scope.account || !a.enabled {
@@ -199,11 +200,14 @@ async fn resolve(cx: &Cx<'_>, value: Option<&Element>) -> Result<Option<Vec<Acco
 /// Состав группы уровня `write` — `ids`: новые и сменившие уровень назначаются, прежние этого уровня вне списка
 /// отзываются. Права проверяются для всех до записи.
 async fn apply(cx: &Cx<'_>, write: bool, ids: &[AccountId]) -> Result<()> {
-    let Some(sharing) = &cx.dav.sharing else {
+    let Some(sharing) = cx.dav.sharing() else {
         return Err(Error::Forbidden);
     };
     let lvl = level(write);
-    let current = sharing.delegates.delegates(cx.scope).await?;
+    let Some(stores) = sharing.stores else {
+        return Err(Error::Forbidden);
+    };
+    let current = stores.delegates.delegates(cx.scope).await?;
     let mut set = Vec::new();
     for id in ids {
         let prev = current.iter().find(|d| d.delegate == *id);
@@ -230,10 +234,10 @@ async fn apply(cx: &Cx<'_>, write: bool, ids: &[AccountId]) -> Result<()> {
         return Err(Error::Forbidden);
     }
     for d in set {
-        sharing.delegates.set_delegate(cx.scope, d).await?;
+        stores.delegates.set_delegate(cx.scope, d).await?;
     }
     for id in remove {
-        sharing.delegates.remove_delegate(cx.scope, id).await?;
+        stores.delegates.remove_delegate(cx.scope, id).await?;
     }
     tracing::info!(write, "DAV: представители изменены");
     Ok(())
