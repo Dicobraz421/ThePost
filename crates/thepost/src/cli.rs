@@ -528,10 +528,10 @@ mod tests {
     fn help_snapshots() {
         let args = ["thepost", "admin", "account", "--help"];
         let plain = help(Theme::PLAIN, &args);
-        snapshot("help/plain", &plain, HELP_PLAIN);
         let ansi = help(Theme::ANSI16, &args);
-        snapshot("help/ansi16", &ansi, HELP_ANSI16);
         assert_eq!(style::strip(&ansi), plain);
+        snapshot("help/ansi16", &ansi, HELP_ANSI16);
+        snapshot("help/plain", &plain, HELP_PLAIN);
     }
 
     /// Ошибка разбора аргументов — «error:» в роли `err`.
@@ -737,7 +737,31 @@ mod tests {
         );
     }
 
-    const HELP_PLAIN: &str = "";
+    const HELP_PLAIN: &str = r#"Учётные записи
+
+Использование: thepost admin account [OPTIONS] <КОМАНДА>
+
+Команды:
+  create   Новая локальная учётная запись в принятом домене; пароль — `app-password create`
+  list     Учётные записи по возрастанию имени входа (страницы Admin API — по ссылке Link rel="next"); --login — поиск одной
+  get      Учётная запись по идентификатору или имени входа
+  block    Блокировка входа локальной учётной записи: новый вход запрещён, открытые сеансы не разрываются. Запись каталога блокируется в каталоге (ответ 409)
+  unblock  Снятие блокировки входа локальной учётной записи
+  rename   Смена отображаемого имени локальной учётной записи (у записи каталога — 409)
+  set      Псевдонимы и скрытие из книги «Организация» локальной учётной записи (у записи каталога — 409, их ведёт каталог). Нужен хотя бы один ключ
+
+Параметры:
+  -c, --config <CONFIG>    Путь к config.yaml (по умолчанию — THEPOST_CONFIG или /etc/thepost/config.yaml)
+      --url <URL>          Адрес Admin API (по умолчанию — THEPOST_ADMIN_URL или http.admin.listen из config.yaml)
+      --token <TOKEN>      Токен: сессия tps_… или токен OIDC (по умолчанию — THEPOST_ADMIN_TOKEN; ключ виден в списке процессов)
+      --org <ORG>          Организация, UUID (по умолчанию — THEPOST_ADMIN_ORG или организация администратора)
+      --json               Вывод — ответ Admin API в JSON
+      --ca-file <CA_FILE>  Корневые сертификаты (PEM) для проверки TLS Admin API
+      --insecure           Не проверять сертификат TLS (как curl -k) — только для loopback узла с сертификатом на другое имя
+      --timeout <TIMEOUT>  Предельное время запроса, секунд [по умолчанию: 30]
+      --color <COLOR>      Цвет вывода: auto — только на терминал (учитывает NO_COLOR, CLICOLOR_FORCE, TERM=dumb), always, never [значения: auto, always, never] [по умолчанию: auto]
+  -h, --help               Справка
+"#;
 
     const HELP_ANSI16: &str = "";
 
