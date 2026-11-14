@@ -12,8 +12,9 @@
 //!
 //! Применённое сообщение во входящих CalDAV не остаётся; при `dav.schedule_keep_processed` оно хранится для ленты
 //! уведомлений JMAP с именем [`PROCESSED_PREFIX`] и удаляется по сроку ([`ItipInbox::purge_processed`]). Защита:
-//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REPLY` — только от адреса
-//! участника события и только организатору; меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
+//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REQUEST` и `ADD` — только
+//! получателю из `ATTENDEE` сообщения (DAV-41), `REPLY` — только от адреса участника события и только организатору;
+//! меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
 //!
@@ -664,6 +665,13 @@ impl ItipDelivery for ItipInbox {
         };
         if !sender_ok {
             return refuse("отправитель не организатор и не участник");
+        }
+        // Получателя нет среди участников (DAV-41): в календарь не кладётся — иначе любой внешний отправитель с DMARC
+        // pass вносил бы события в чужие календари; письмо остаётся письмом.
+        if matches!(it.method, ItipMethod::Request | ItipMethod::Add)
+            && it.meeting.attendee(&to).is_none()
+        {
+            return refuse("получатель не участник встречи");
         }
         let booked = match (&self.booking, it.method) {
             (Some(b), ItipMethod::Request) => {
