@@ -847,6 +847,20 @@ object_type, owner }::matches`. Записывает вызывающий, из�
 изменившимися правами; удаление учётной записи удаляет её уведомления. Все методы обязательные; in-memory — `MemShareNotifications`; набор
 `suite::sharing::share_notifications`; PostgreSQL — `PgMeta` (META-83, миграция 0042).
 
+## Branding
+Решение 122; CTR-91. Код — `branding.rs`. Брендинг заказчика вместо IT TASK в веб-консоли и текстовом интерфейсе. `BrandColor` — цвет
+`#RRGGBB` (`FromStr` в любом регистре, `Display` и serde строкой — верхний регистр, иное — `Invalid`; `from_rgb`, `rgb`). `BrandLogo { hash:
+BlobHash, size, width, height }` — знак PNG в BLOB по пути `path()` = `branding/<hash>.png` (`BlobStore::put_raw`: путь по содержимому
+неизменяем, новый знак — новый путь); формат и размеры по содержимому проверяет вызывающий. `Branding { product_name, primary, accent,
+logo: Option<BrandLogo> }`, `validate()` — название 1–`MAX_PRODUCT_NAME` (64) символов без управляющих, знак 1 байт–`MAX_LOGO_SIZE`
+(256 КБ), стороны 1–`MAX_LOGO_SIDE` (1024); иначе `Invalid`. `BrandingScope::{Installation, Org(TenantId)}`. `BrandingStore`:
+`branding(scope) -> Option` — свой набор уровня (без подстановки установки); `set_branding(scope, &Branding)` — замена набора уровня
+целиком (`validate()`; неверный — `Invalid`, прежний остаётся); `reset_branding(scope) -> Option` — удаляет и возвращает прежний (знак из
+BLOB удаляет вызывающий, если `logo_in_use` ложно); `effective_branding(Option<TenantId>) -> Option` — ближайший заданный уровень целиком:
+свой набор организации, иначе установки, иначе `None` (встроенный IT TASK, `design/tokens.toml`); `None` на входе — уровень установки;
+`logo_in_use(hash)` — знак упомянут хоть одним уровнем. Права уровней, журнал аудита, контраст и цвета ролей — Admin API (ADM-48), не
+контракт. Все методы обязательные; in-memory — `MemBranding`; набор `suite::branding`; PostgreSQL — `PgMeta` (META-84, миграция 0043).
+
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
 секция `sieve` крейта `tp-sieve`; `Role` не меняется. `SieveStore` (по `AccountScope`; текст проверяет вызывающий): `limits() ->
@@ -1196,3 +1210,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   получателей и лиза уже в `queue`, `queue_rcpts`). In-memory — `MemQueue` (хранит конечный статус получателя); набор
   `suite::lifecycle::queue_list`. По сравнению с карточкой: оба метода принимают `now` (время передаёт вызывающий, как у `claim`);
   `retry` возвращает `bool` (`false` — запись под лизой); `MemQueue` реализует методы в этой волне — иначе набору не на чем пройти.
+- 2026-11-14 — CTR-91 (x/contracts-62, решение 122): `branding::{BrandingStore, Branding, BrandColor, BrandLogo, BrandingScope,
+  MAX_PRODUCT_NAME, MAX_LOGO_SIZE, MAX_LOGO_SIDE}` — брендинг заказчика по уровням установки и организации; раздел «Branding». In-memory —
+  `MemBranding`; набор `suite::branding`. PostgreSQL — META-84, Admin API — ADM-48.
