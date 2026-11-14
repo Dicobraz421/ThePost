@@ -862,6 +862,13 @@
 | [CTR-90](CTR-90.md) | вытеснение старых `ShareNotification` сверх предела в хранилище | contracts | B | contracts-61 | todo | CTR-86,META-83 |
 | [DAV-39](DAV-39.md) | удалить `tp_dav::router_with`, тесты — на `router_shared` | dav | A | dav-18 | ready | — |
 | [APP-73](APP-73.md) | e2e узла — ответ ресурса внешнему организатору письмом iMIP | app | A | app-70 | todo | APP-71 |
+| [CTR-91](CTR-91.md) | брендинг заказчика в контракте — `BrandingStore`, уровни установки и организации | contracts | B | contracts-62 | ready | — |
+| [META-84](META-84.md) | брендинг заказчика в PostgreSQL — миграция 0043 и `BrandingStore` в `PgMeta` | meta | A | meta-57 | todo | CTR-91 |
+| [ADM-48](ADM-48.md) | брендинг заказчика в Admin API — чтение, запись, сброс, знак, контраст, открытый маршрут | admin | B | admin-34 | todo | CTR-91,DES-01,ADM-44 |
+| [APP-75](APP-75.md) | узел — брендинг заказчика (`BrandingStore` и BLOB в Admin API) | app | A | app-71 | todo | META-84,ADM-48 |
+| [UI-22](UI-22.md) | консоль — брендинг заказчика: тема из действующего брендинга, знак на входе и в шапке, настройка | console | A | console-13 | todo | UI-19,ADM-48 |
+| [TUI-08](TUI-08.md) | текстовый интерфейс — тема поверх действующего брендинга, знак на экране входа | tui | A | tui-05 | todo | TUI-06,ADM-48 |
+| [DOC-10](DOC-10.md) | INSTALL — брендинг заказчика | docs | A | docs-10 | todo | ADM-48 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
@@ -877,6 +884,7 @@
 | [ADM-41](ADM-41.md) | вход администратора по паролю | admin | B | — |
 | [ADM-42](ADM-42.md) | псевдонимы и скрытие из книги «Организация» учётной записи без LDAP — Admin API, CLI, консоль | admin | B | — |
 | [ADM-43](ADM-43.md) | организация должна существовать; ошибки разбора запроса — 400 problem+json | admin | B | — |
+| [APP-74](APP-74.md) | узел — очередь исходящей почты подключена к Admin API | app | A | META-82,ADM-45 |
 | [AUTH-09](AUTH-09.md) | пароли приложений на контракте AppPasswordStore | auth | A | CTR-22 |
 | [CTR-22](CTR-22.md) | контракт AppPasswordStore (пароли приложений) | contracts | B | CTR-19,AUTH-02 |
 | [CTR-84](CTR-84.md) | контракт проверки прав на коллекции — `SharingAuthorizer` | contracts | B | CTR-48 |
