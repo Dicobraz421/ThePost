@@ -39,6 +39,18 @@ impl BrandingStore for MemBranding {
         })
     }
 
+    async fn org_brandings(&self) -> Result<Vec<(TenantId, Branding)>> {
+        let mut out: Vec<(TenantId, Branding)> = lock(&self.state)
+            .iter()
+            .filter_map(|(scope, b)| match scope {
+                BrandingScope::Org(t) => Some((*t, b.clone())),
+                BrandingScope::Installation => None,
+            })
+            .collect();
+        out.sort_by_key(|(t, _)| *t);
+        Ok(out)
+    }
+
     async fn logo_in_use(&self, hash: &BlobHash) -> Result<bool> {
         Ok(lock(&self.state)
             .values()

@@ -868,11 +868,13 @@ Vec<ContrastIssue { theme (None — CLI), fg, bg, fg_color, bg_color, contrast, 
 тема) или белым (тёмная) с шагом 1 % до порогов своих пар; остальные роли — с `parent` как есть. `BrandingScope::{Installation,
 Org(TenantId)}`. `BrandingLevels { installation?, org? }::effective() -> EffectiveBranding { product_name?, logo?, palette }` — каждое
 поле с ближайшего уровня (организация → установка → встроенное); цвета — установка поверх IT TASK, затем организация поверх итога; уровень
-без цветов цвета не меняет. `BrandingStore`: `branding(scope) -> Option` — свой набор уровня; `set_branding(scope, &Branding)` — замена
+без цветов цвета не меняет; со страховкой отрисовки `Palette::guarded(parent)` (`Branding::safe_palette_over`): пара ниже порога берёт обе
+роли с уровня выше. Проверка при сохранении (без страховки) — `BrandingLevels::contrast_issues()` (организация поверх действующих цветов
+установки) и `installation_change_issues(installation?, &[(TenantId, Branding)]) -> Vec<OrgContrastIssue { org?, issue }>` (сам набор
+установки — `org: None`, и действующая палитра каждой организации поверх него). `BrandingStore`: `branding(scope) -> Option` — свой набор уровня; `set_branding(scope, &Branding)` — замена
 целиком (`validate()`; неверный — `Invalid`, прежний остаётся); `reset_branding(scope) -> Option` — удаляет и возвращает прежний (знак из
 BLOB удаляет вызывающий, если `logo_in_use` ложно); `branding_levels(Option<TenantId>) -> BrandingLevels` — оба уровня одним чтением
-(`None` — только установка); `logo_in_use(hash)`. Права уровней, журнал аудита и отказ по контрасту действующего набора (`effective()`
-поверх текущего уровня выше, `contrast_issues`) — Admin API (ADM-48). Все методы обязательные; in-memory — `MemBranding`; набор
+(`None` — только установка); `org_brandings() -> Vec<(TenantId, Branding)>` — свои наборы всех организаций по возрастанию; `logo_in_use(hash)`. Права уровней, журнал аудита и отказ по контрасту — Admin API (ADM-48). Все методы обязательные; in-memory — `MemBranding`; набор
 `suite::branding`; PostgreSQL — `PgMeta` (META-84, миграция 0043).
 
 ## Sieve
@@ -1225,7 +1227,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `suite::lifecycle::queue_list`. По сравнению с карточкой: оба метода принимают `now` (время передаёт вызывающий, как у `claim`);
   `retry` возвращает `bool` (`false` — запись под лизой); `MemQueue` реализует методы в этой волне — иначе набору не на чем пройти.
 - 2026-11-14 — CTR-91 (x/contracts-62, решение 122): `branding::{BrandingStore, Branding, BrandingLevels, EffectiveBranding,
-  BrandingScope, BrandColor, BrandLogo, Theme, Role, CliRole, Palette, ContrastPair, ContrastIssue, CONTRAST, CLI_BACKGROUNDS,
+  BrandingScope, BrandColor, BrandLogo, Theme, Role, CliRole, Palette, ContrastPair, ContrastIssue, OrgContrastIssue,
+  installation_change_issues, CONTRAST, CLI_BACKGROUNDS,
   CLI_MIN_CONTRAST, MAX_PRODUCT_NAME, MAX_LOGO_SIZE, MAX_LOGO_SIDE}` — брендинг заказчика: все роли `design/tokens.toml`, обязательных
-  полей нет, незаданное — с уровня выше (организация → установка → IT TASK), вывод ролей из основного цвета, контраст без исключений;
+  полей нет, незаданное — с уровня выше (организация → установка → IT TASK), вывод ролей из основного цвета, контраст без исключений, проверка смены установки по организациям, страховка
+  отрисовки;
   раздел «Branding». In-memory — `MemBranding`; набор `suite::branding`. PostgreSQL — META-84, Admin API — ADM-48.

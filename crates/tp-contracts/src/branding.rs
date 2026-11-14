@@ -5,8 +5,10 @@
 //! уровня выше — организация → установка → встроенный IT TASK ([`Palette::it_task`], `design/tokens.toml`);
 //! итог — [`BrandingLevels::effective`]. Цвета — основной цвет и роли `design/tokens.toml`: [`Role`] — отдельно для
 //! светлой и тёмной темы, [`CliRole`] — подсветка вывода CLI; незаданные роли уровня с основным цветом выводятся из
-//! него ([`Branding::palette_over`]). Контраст пар [`CONTRAST`] — [`Palette::contrast_issues`]: порог 4,5 у текста и
-//! 3 у рамок и заливок, без исключений. Байты знака — в BLOB по пути [`BrandLogo::path`] (`BlobStore::put_raw`), в
+//! него ([`Branding::palette_over`]); фоны, текст и цвета состояний — с уровня выше. Контраст пар [`CONTRAST`] —
+//! [`Palette::contrast_issues`]: порог 4,5 у текста и 3 у рамок и заливок, без исключений; проверка при сохранении —
+//! [`BrandingLevels::contrast_issues`] и [`installation_change_issues`], страховка отрисовки —
+//! [`Branding::safe_palette_over`]. Байты знака — в BLOB по пути [`BrandLogo::path`] (`BlobStore::put_raw`), в
 //! хранилище — только описание. Реализация — `tp-meta` (META-84), in-memory — `tp-testkit`.
 
 use std::collections::BTreeMap;
@@ -530,6 +532,50 @@ impl Palette {
             .unwrap_or_else(|| role.it_task())
     }
 
+    /// Страховка отрисовки: пара [`CONTRAST`] ниже порога (данные старой версии, уровень выше изменился) берёт обе
+    /// роли с `parent`, пока нарушений не останется или роли пары не станут как у `parent`; роль CLI ниже порога — с
+    /// `parent`. Клиент без своих расчётов (текстовый интерфейс) зовёт с `parent` = [`Palette::it_task`]. Чистая
+    /// функция; палитра без нарушений не меняется.
+    pub fn guarded(self, parent: &Palette) -> Palette {
+        let mut p = self;
+        for theme in Theme::ALL {
+            loop {
+                let mut changed = false;
+                for pair in CONTRAST {
+                    for bg in pair.bg {
+                        if p.role(theme, pair.fg).contrast(p.role(theme, *bg)) >= pair.min {
+                            continue;
+                        }
+                        for r in [pair.fg, *bg] {
+                            let up = parent.role(theme, r);
+                            if p.role(theme, r) != up {
+                                let map = match theme {
+                                    Theme::Light => &mut p.light,
+                                    Theme::Dark => &mut p.dark,
+                                };
+                                map.insert(r, up);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        for role in CliRole::ALL {
+            let c = p.cli_role(role);
+            if CLI_BACKGROUNDS
+                .iter()
+                .any(|bg| c.contrast(*bg) < CLI_MIN_CONTRAST)
+            {
+                p.cli.insert(role, parent.cli_role(role));
+            }
+        }
+        p
+    }
+
     /// Пары [`CONTRAST`] обеих тем и роли CLI на [`CLI_BACKGROUNDS`] ниже порога — в порядке тем, пар и фонов.
     pub fn contrast_issues(&self) -> Vec<ContrastIssue> {
         let mut out = Vec::new();
@@ -779,6 +825,12 @@ impl Branding {
         }
         self.logo.as_ref().map_or(Ok(()), BrandLogo::validate)
     }
+
+    /// [`Branding::palette_over`] со страховкой отрисовки [`Palette::guarded`]. Чистая функция; у палитры без
+    /// нарушений — то же, что `palette_over`.
+    pub fn safe_palette_over(&self, parent: &Palette) -> Palette {
+        self.palette_over(parent).guarded(parent)
+    }
 }
 
 /// Наборы уровней для одной организации ([`BrandingStore::branding_levels`]).
@@ -791,9 +843,10 @@ pub struct BrandingLevels {
 }
 
 impl BrandingLevels {
-    /// Действующий брендинг: название и знак — с ближайшего уровня, где они заданы (организация → установка →
-    /// встроенные); цвета — [`Branding::palette_over`] установки поверх [`Palette::it_task`], затем организации
-    /// поверх итога (уровень без цветов их не меняет).
+    /// Действующий брендинг для отрисовки: название и знак — с ближайшего уровня, где они заданы (организация →
+    /// установка → встроенные); цвета — [`Branding::safe_palette_over`] установки поверх [`Palette::it_task`], затем
+    /// организации поверх итога (уровень без цветов их не меняет). Пара ниже порога берётся с уровня выше —
+    /// нечитаемой палитры не бывает.
     pub fn effective(&self) -> EffectiveBranding {
         let mut out = EffectiveBranding {
             product_name: None,
@@ -808,11 +861,76 @@ impl BrandingLevels {
                 out.logo = level.logo;
             }
             if level.has_colors() {
-                out.palette = level.palette_over(&out.palette);
+                out.palette = level.safe_palette_over(&out.palette);
             }
         }
         out
     }
+
+    /// Проверка при сохранении нижнего заданного уровня — чистая функция: пары ниже порога у
+    /// [`Branding::palette_over`] организации поверх действующих цветов установки (без организации — установки
+    /// поверх IT TASK), без страховки отрисовки. Уровень без цветов нарушений не добавляет.
+    pub fn contrast_issues(&self) -> Vec<ContrastIssue> {
+        let it = Palette::it_task();
+        let (level, parent) = match (&self.installation, &self.org) {
+            (inst, Some(org)) => {
+                let parent = inst
+                    .as_ref()
+                    .filter(|i| i.has_colors())
+                    .map_or_else(|| it.clone(), |i| i.safe_palette_over(&it));
+                (org, parent)
+            }
+            (Some(inst), None) => (inst, it),
+            (None, None) => return Vec::new(),
+        };
+        if !level.has_colors() {
+            return Vec::new();
+        }
+        level.palette_over(&parent).contrast_issues()
+    }
+}
+
+/// Нарушение контраста при смене набора установки ([`installation_change_issues`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrgContrastIssue {
+    /// Организация, чья действующая палитра ломается; `None` — сам набор установки.
+    pub org: Option<TenantId>,
+    /// Пара.
+    pub issue: ContrastIssue,
+}
+
+/// Проверка нового набора установки `installation` — чистая функция: нарушения самого набора поверх IT TASK и
+/// действующей палитры каждой организации из `orgs` (свои наборы, [`BrandingStore::org_brandings`]) поверх него
+/// ([`BrandingLevels::contrast_issues`]). Пусто — смену можно сохранять.
+pub fn installation_change_issues(
+    installation: Option<&Branding>,
+    orgs: &[(TenantId, Branding)],
+) -> Vec<OrgContrastIssue> {
+    let own = BrandingLevels {
+        installation: installation.cloned(),
+        org: None,
+    };
+    let mut out: Vec<OrgContrastIssue> = own
+        .contrast_issues()
+        .into_iter()
+        .map(|issue| OrgContrastIssue { org: None, issue })
+        .collect();
+    for (tenant, org) in orgs {
+        let levels = BrandingLevels {
+            installation: installation.cloned(),
+            org: Some(org.clone()),
+        };
+        out.extend(
+            levels
+                .contrast_issues()
+                .into_iter()
+                .map(|issue| OrgContrastIssue {
+                    org: Some(*tenant),
+                    issue,
+                }),
+        );
+    }
+    out
 }
 
 /// Действующий брендинг ([`BrandingLevels::effective`]).
@@ -837,8 +955,8 @@ pub enum BrandingScope {
 }
 
 /// Хранилище брендинга по уровням. Права (администратор установки или организации), проверка контраста
-/// ([`BrandingLevels::effective`], [`Palette::contrast_issues`]) и журнал аудита — у вызывающего (Admin API); байты
-/// знака пишет и удаляет вызывающий.
+/// ([`BrandingLevels::contrast_issues`], [`installation_change_issues`]) и журнал аудита — у вызывающего (Admin API);
+/// байты знака пишет и удаляет вызывающий.
 #[async_trait]
 pub trait BrandingStore: Send + Sync + 'static {
     /// Свой набор уровня; не задан — `None` (без подстановки уровня выше).
@@ -854,6 +972,9 @@ pub trait BrandingStore: Send + Sync + 'static {
     /// Наборы установки и организации `tenant` одним чтением (`tenant` = `None` — только установка: экран входа без
     /// известной организации); действующий брендинг — [`BrandingLevels::effective`].
     async fn branding_levels(&self, tenant: Option<TenantId>) -> Result<BrandingLevels>;
+
+    /// Свои наборы всех организаций по возрастанию идентификатора — для [`installation_change_issues`].
+    async fn org_brandings(&self) -> Result<Vec<(TenantId, Branding)>>;
 
     /// Знак `hash` упомянут хоть одним уровнем.
     async fn logo_in_use(&self, hash: &BlobHash) -> Result<bool>;

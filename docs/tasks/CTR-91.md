@@ -22,10 +22,13 @@ manual: no
   заливках, CLI `head`, `json_key`, `accent`, `json_bool`) выводятся из него с подгонкой до порогов; прочие — с уровня
   выше; уровень без цветов — цвета уровня выше целиком.
 - `BrandingLevels { installation, org }::effective()` — каждое поле с ближайшего уровня: организация → установка →
-  IT TASK; `Palette::contrast_issues()` — пары ниже порога (тема, роль, фон, контраст, порог).
+  IT TASK; `Palette::contrast_issues()` — пары ниже порога (тема, роль, фон, контраст, порог). Проверка при
+  сохранении — `BrandingLevels::contrast_issues()` (организация поверх установки) и `installation_change_issues`
+  (новый набор установки и действующие палитры всех организаций); страховка отрисовки — `Palette::guarded`,
+  `Branding::safe_palette_over` (пара ниже порога — с уровня выше), ею пользуется `effective()`.
 - `BrandingStore`: `branding(scope)`, `set_branding(scope, &Branding)` (замена уровня целиком, `validate()`),
   `reset_branding(scope)` (возвращает прежний; знак удаляет вызывающий), `branding_levels(Option<TenantId>)` (оба
-  уровня одним чтением), `logo_in_use(hash)`. Контраст проверяет вызывающий по действующему набору (ADM-48).
+  уровня одним чтением), `org_brandings()` (свои наборы всех организаций), `logo_in_use(hash)`. Контраст проверяет вызывающий по действующему набору (ADM-48).
 - Описание — раздел «Branding» в `docs/CONTRACTS.md` и строка CHANGELOG; решение 122 и карточки META-84, ADM-48, UI-22,
   TUI-08, DOC-11 — по решениям владельца 14.11 (все роли, обязательных полей нет, без исключения 4,48).
 - `tp-testkit`: `MemBranding` и набор `suite::branding` — его же проходит `PgMeta` (META-84).

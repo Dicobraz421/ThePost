@@ -30,9 +30,9 @@ fn levels(installation: Option<&Branding>, org: Option<&Branding>) -> BrandingLe
 /// Набор проверок брендинга по уровням. Хранилище в начале пустое; `org` и `foreign` — разные организации.
 ///
 /// Без записей уровней нет (IT TASK); набор установки виден каждой организации; свой набор организации виден только
-/// ей, заменяется и сбрасывается целиком, все поля и роли сохраняются как заданы (пустой набор — тоже набор); поле,
-/// не заданное организацией, берётся с установки; `logo_in_use` после сброса последнего упоминания — `false`;
-/// неверный набор — `Invalid` без изменений.
+/// ей и в `org_brandings`, заменяется и сбрасывается целиком, все поля и роли сохраняются как заданы (пустой набор —
+/// тоже набор); поле, не заданное организацией, берётся с установки; `logo_in_use` после сброса последнего
+/// упоминания — `false`; неверный набор — `Invalid` без изменений.
 pub async fn branding(store: &dyn BrandingStore, org: TenantId, foreign: TenantId) {
     let (inst, own) = (BrandingScope::Installation, BrandingScope::Org(org));
     let (logo_a, logo_b) = (logo(0xa1), logo(0xb2));
@@ -49,6 +49,7 @@ pub async fn branding(store: &dyn BrandingStore, org: TenantId, foreign: TenantI
     assert_eq!(store.branding(own).await, Ok(None));
     assert_eq!(store.reset_branding(own).await, Ok(None), "сброс пустого");
     assert_eq!(store.logo_in_use(&logo_a.hash).await, Ok(false));
+    assert_eq!(store.org_brandings().await, Ok(Vec::new()));
 
     // Неверный набор не записывается.
     let invalid = Branding {
@@ -166,6 +167,13 @@ pub async fn branding(store: &dyn BrandingStore, org: TenantId, foreign: TenantI
         store.branding_levels(Some(foreign)).await,
         Ok(levels(Some(&installation_b), Some(&Branding::default())))
     );
+    let mut orgs = vec![(org, org_set.clone()), (foreign, Branding::default())];
+    orgs.sort_by_key(|(t, _)| *t);
+    assert_eq!(
+        store.org_brandings().await,
+        Ok(orgs),
+        "свои наборы всех организаций"
+    );
     assert_eq!(
         store.reset_branding(BrandingScope::Org(foreign)).await,
         Ok(Some(Branding::default()))
@@ -194,4 +202,5 @@ pub async fn branding(store: &dyn BrandingStore, org: TenantId, foreign: TenantI
             "{tenant:?}"
         );
     }
+    assert_eq!(store.org_brandings().await, Ok(Vec::new()));
 }

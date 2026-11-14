@@ -460,3 +460,131 @@ fn levels_effective() {
     assert_eq!(e.logo, None);
     assert_eq!(e.palette, Palette::it_task());
 }
+
+/// Страховка отрисовки: пара ниже порога берётся с уровня выше; палитра без нарушений не меняется.
+#[test]
+fn safe_palette_falls_back_to_parent() {
+    let it = Palette::it_task();
+    let ok = primary_only("#177CAA");
+    assert_eq!(ok.safe_palette_over(&it), ok.palette_over(&it));
+
+    let mut bad = primary_only("#177CAA");
+    bad.light.insert(Role::Sel, c("#F5E663"));
+    bad.light.insert(Role::Panel, c("#FFFFFF"));
+    bad.cli.insert(CliRole::Head, c("#202020"));
+    let safe = bad.safe_palette_over(&it);
+    assert_eq!(safe.contrast_issues(), Vec::new());
+    assert_eq!(
+        safe.role(Theme::Light, Role::Sel),
+        it.role(Theme::Light, Role::Sel)
+    );
+    assert_eq!(
+        safe.role(Theme::Light, Role::Panel),
+        it.role(Theme::Light, Role::Panel)
+    );
+    assert_eq!(safe.cli_role(CliRole::Head), it.cli_role(CliRole::Head));
+    assert_eq!(
+        safe.role(Theme::Light, Role::FkBg),
+        c("#177CAA"),
+        "прочие роли уровня остаются"
+    );
+    assert_eq!(
+        BrandingLevels {
+            installation: Some(bad),
+            org: None,
+        }
+        .effective()
+        .palette,
+        safe
+    );
+}
+
+/// Проверка при сохранении — без страховки: организация поверх действующих цветов установки.
+#[test]
+fn levels_contrast_issues() {
+    assert_eq!(BrandingLevels::default().contrast_issues(), Vec::new());
+    let mut installation = primary_only("#177CAA");
+    installation.light.insert(Role::Panel, c("#F0F0F0"));
+    let mut org = Branding::default();
+    org.light.insert(Role::Text, c("#9A9A9A"));
+    let levels = BrandingLevels {
+        installation: Some(installation.clone()),
+        org: Some(org),
+    };
+    let issues = levels.contrast_issues();
+    assert!(!issues.is_empty());
+    assert!(
+        issues
+            .iter()
+            .all(|i| i.fg == "text" && i.theme == Some(Theme::Light)),
+        "{issues:?}"
+    );
+    // Без цветов у организации — нарушений нет.
+    let named = BrandingLevels {
+        installation: Some(installation),
+        org: Some(Branding {
+            product_name: Some("Ромашка".into()),
+            ..Branding::default()
+        }),
+    };
+    assert_eq!(named.contrast_issues(), Vec::new());
+}
+
+/// Смена установки, ломающая палитру организации, называет организацию и пару.
+#[test]
+fn installation_change_names_orgs() {
+    let (a, b) = (TenantId::new(), TenantId::new());
+    let mut org_a = Branding::default();
+    org_a.dark.insert(Role::Text, c("#858585"));
+    let org_b = Branding {
+        product_name: Some("Б".into()),
+        ..Branding::default()
+    };
+    let orgs = [(a, org_a), (b, org_b)];
+    assert_eq!(
+        installation_change_issues(None, &orgs),
+        Vec::new(),
+        "поверх IT TASK"
+    );
+    // Установка светлит фоны тёмной темы (свой текст и вторичный текст — под них): текст организации a, 4,8:1 на
+    // панели IT TASK, теряет контраст.
+    let mut inst = Branding::default();
+    for (role, color) in [
+        (Role::Panel, "#262626"),
+        (Role::Screen, "#262626"),
+        (Role::Text, "#FFFFFF"),
+        (Role::Muted, "#A0A0A0"),
+    ] {
+        inst.dark.insert(role, c(color));
+    }
+    let issues = installation_change_issues(Some(&inst), &orgs);
+    assert!(!issues.is_empty());
+    assert!(issues.iter().all(|i| i.org == Some(a)), "{issues:?}");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.issue.fg == "text" && i.issue.bg == "panel")
+    );
+    // Нарушение самого набора установки — с `org: None`.
+    let mut broken = Branding::default();
+    broken.light.insert(Role::Head, c("#FFFFFF"));
+    let issues = installation_change_issues(Some(&broken), &[]);
+    assert_eq!(issues.len(), 1);
+    assert_eq!((issues[0].org, issues[0].issue.fg), (None, "head"));
+}
+
+/// Клиент со старой палитрой сервера: пара ниже порога — с IT TASK.
+#[test]
+fn guarded_client_palette() {
+    let it = Palette::it_task();
+    let mut p = it.clone();
+    p.dark.insert(Role::FkBg, c("#0F1317"));
+    p.dark.insert(Role::Head, c("#2EBCBA"));
+    let g = p.guarded(&it);
+    assert_eq!(g.contrast_issues(), Vec::new());
+    assert_eq!(
+        g.role(Theme::Dark, Role::FkBg),
+        it.role(Theme::Dark, Role::FkBg)
+    );
+    assert_eq!(it.clone().guarded(&it), it);
+}
