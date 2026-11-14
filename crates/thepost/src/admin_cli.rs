@@ -1900,16 +1900,27 @@ async fn source_command(
             } else {
                 serde_json::json!({ "gateway": { "xclient": xclient, "authserv_id": authserv_id } })
             };
-            let version = sources().await?.version;
+            let list = sources().await?;
             let body: SourceBody = from_json(
-                serde_json::json!({ "version": version, "matcher": matcher, "kind": kind }),
+                serde_json::json!({ "version": list.version, "matcher": matcher, "kind": kind }),
                 "источник",
             )?;
             let w: Written = client
                 .call(SOURCE_PUT, &[org, &name], &[], Some(&body))
                 .await?;
-            let text = format!("Источник {name} записан. Версия снимка: {}\n", w.version);
-            out(args, &w, text)
+            // Было/стало — запись источника в снимке до и после (новый источник — «было» пусто).
+            let find = |list: SourceList| {
+                list.sources
+                    .into_iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&name))
+            };
+            let before = find(list);
+            let after = find(sources().await?);
+            out(
+                args,
+                &w,
+                style::changes(args.theme(), SOURCE_PUT, &before, &after),
+            )
         }
         SourceAction::Delete { name } => {
             let query = query(&VersionQuery {
@@ -2001,8 +2012,9 @@ async fn route_command(
                         .map_err(|e| format!("--egress-ip {ip}: {e}"))
                 })
                 .transpose()?;
+            let list = routes().await?;
             let body = RouteBody {
-                version: routes().await?.version,
+                version: list.version,
                 tls,
                 smart_host,
                 egress_ip,
@@ -2010,11 +2022,19 @@ async fn route_command(
             let w: Written = client
                 .call(ROUTE_PUT, &[org, &pattern], &[], Some(&body))
                 .await?;
-            let text = format!(
-                "Политика {pattern} записана. Версия снимка: {}\n",
-                w.version
-            );
-            out(args, &w, text)
+            // Было/стало — политика в снимке до и после (шаблон узел приводит к нижнему регистру).
+            let find = |list: RouteList| {
+                list.routes
+                    .into_iter()
+                    .find(|r| r.pattern.eq_ignore_ascii_case(&pattern))
+            };
+            let before = find(list);
+            let after = find(routes().await?);
+            out(
+                args,
+                &w,
+                style::changes(args.theme(), ROUTE_PUT, &before, &after),
+            )
         }
         RouteAction::Delete { pattern } => {
             let query = query(&VersionQuery {
@@ -4029,7 +4049,25 @@ mod tests {
         let done = exec(&c, false, set("gw", vec!["192.0.2.0/24"], None, vec![]))
             .await
             .expect("source gw");
-        assert!(done.starts_with("Источник gw записан"), "{done}");
+        assert!(
+            done.contains("+ name: gw")
+                && done.contains("+ matcher: ")
+                && !done.contains("- name")
+                && done.contains(
+                    "✓ Сохранено · запись аудита: thepost admin audit search --method PUT"
+                ),
+            "{done}"
+        );
+        // Повтор с другой сетью — только изменённое поле.
+        let again = exec(&c, false, set("gw", vec!["198.51.100.0/24"], None, vec![]))
+            .await
+            .expect("source gw again");
+        assert!(
+            again.contains("198.51.100.0/24")
+                && !again.contains("name:")
+                && !again.contains("kind:"),
+            "{again}"
+        );
         exec(
             &c,
             false,
@@ -4082,7 +4120,12 @@ mod tests {
         )
         .await
         .expect("route set");
-        assert!(done.starts_with("Политика Example.org записана"), "{done}");
+        assert!(
+            done.contains("+ pattern: example.org")
+                && done.contains("+ tls: required")
+                && done.contains("✓ Сохранено"),
+            "{done}"
+        );
         let pin = "ab".repeat(32);
         let pinned = format!("pinned: {pin}");
         exec(

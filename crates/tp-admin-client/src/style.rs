@@ -488,10 +488,12 @@ fn api_line(theme: Theme, line: &str) -> String {
 }
 
 /// Было/стало по изменённым полям объекта: `- поле: было` (`err`) и `+ поле: стало` (`ok`); итог — «✓ Сохранено»
-/// и команда записи аудита операции `op`.
+/// и команда записи аудита операции `op`. Один вывод для всех `set` CLI; не заданное (`null`, записи не было) строки
+/// не даёт — у новой записи все поля со знаком `+`.
 pub fn changes<B: Serialize, A: Serialize>(theme: Theme, op: Op, before: &B, after: &A) -> String {
     let fields = |v: serde_json::Result<Value>| match v.unwrap_or(Value::Null) {
         Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
         other => serde_json::Map::from_iter([(String::new(), other)]),
     };
     let before = fields(serde_json::to_value(before));
@@ -511,13 +513,13 @@ pub fn changes<B: Serialize, A: Serialize>(theme: Theme, op: Op, before: &B, aft
         } else {
             format!("{name}: ")
         };
-        let was = format!("- {label}{}", value_text(was));
-        let now = format!("+ {label}{}", value_text(now));
-        out.push_str(&format!(
-            "{}\n{}\n",
-            theme.paint(Role::Err, &was),
-            theme.paint(Role::Ok, &now)
-        ));
+        // Не заданное (`null`) строки не даёт: новое поле — только `+`, снятое — только `-`.
+        for (value, sign, role) in [(was, '-', Role::Err), (now, '+', Role::Ok)] {
+            if !value.is_null() {
+                let line = format!("{sign} {label}{}", value_text(value));
+                out.push_str(&format!("{}\n", theme.paint(role, &line)));
+            }
+        }
     }
     if out.is_empty() {
         out.push_str(&format!("{}\n", theme.paint(Role::Muted, "изменений нет")));
@@ -665,7 +667,9 @@ mod tests {
     use tp_admin::accounts::PolicyBody;
 
     use super::*;
-    use crate::ops::{ACCOUNT_CREATE, ORG_POLICY_PUT};
+    use tp_contracts::transport::{DestinationPolicy, TlsRequirement};
+
+    use crate::ops::{ACCOUNT_CREATE, ORG_POLICY_PUT, ROUTE_PUT};
 
     const THEMES: [(&str, Theme); 3] = [
         ("plain", Theme::PLAIN),
@@ -721,12 +725,28 @@ mod tests {
         changes(t, ORG_POLICY_PUT, &before, &after)
     }
 
-    fn cases(t: Theme) -> [(&'static str, String); 4] {
+    /// `transport route set`: новая политика и изменение существующей (только изменённое поле).
+    fn route_set(t: Theme) -> String {
+        let policy = |tls, egress: Option<&str>| DestinationPolicy {
+            pattern: "example.org".into(),
+            tls,
+            smart_host: Some("relay.example.net:587".into()),
+            egress_ip: egress.map(|ip| ip.parse().expect("ip")),
+        };
+        let new = policy(TlsRequirement::Required, None);
+        let mut out = changes(t, ROUTE_PUT, &None::<DestinationPolicy>, &Some(new.clone()));
+        let changed = policy(TlsRequirement::Required, Some("192.0.2.1"));
+        out.push_str(&changes(t, ROUTE_PUT, &Some(new), &Some(changed)));
+        out
+    }
+
+    fn cases(t: Theme) -> [(&'static str, String); 5] {
         [
             ("accounts", accounts_list(t)),
             ("conflict", conflict(t)),
             ("policy", policy_set(t)),
             ("json", json(t, &sample()).expect("json")),
+            ("route", route_set(t)),
         ]
     }
 
@@ -734,7 +754,8 @@ mod tests {
         json!({"login": "a@b.test", "enabled": true, "quota": {"used": 10, "ratio": 0.5}, "aliases": [], "id": null})
     }
 
-    /// Снимки вывода (ESC — `^[`): список учётных записей, отказ 409, `policy set`, `--json` в трёх режимах.
+    /// Снимки вывода (ESC — `^[`): список учётных записей, отказ 409, `policy set`, `--json`, `route set` в трёх
+    /// режимах.
     const SNAPSHOTS: &[(&str, &str, &str)] = &[
         (
             "plain",
@@ -756,8 +777,7 @@ id-off@b.test    off@b.test    —    × заблокирована
         (
             "plain",
             "policy",
-            r#"- dkim_selector: —
-+ dkim_selector: s1
+            r#"+ dkim_selector: s1
 - quota_bytes: 1000
 + quota_bytes: 2000
 ✓ Сохранено · запись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/policy
@@ -776,6 +796,17 @@ id-off@b.test    off@b.test    —    × заблокирована
     "used": 10
   }
 }"#,
+        ),
+        (
+            "plain",
+            "route",
+            r#"+ pattern: example.org
++ smart_host: relay.example.net:587
++ tls: required
+✓ Сохранено · запись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/transport/routes/{pattern}
++ egress_ip: 192.0.2.1
+✓ Сохранено · запись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/transport/routes/{pattern}
+"#,
         ),
         (
             "ansi16",
@@ -797,8 +828,7 @@ id-off@b.test    off@b.test    —    ^[[1m^[[91m× заблокирована^[
         (
             "ansi16",
             "policy",
-            r#"^[[1m^[[91m- dkim_selector: —^[[0m
-^[[92m+ dkim_selector: s1^[[0m
+            r#"^[[92m+ dkim_selector: s1^[[0m
 ^[[1m^[[91m- quota_bytes: 1000^[[0m
 ^[[92m+ quota_bytes: 2000^[[0m
 ^[[92m✓ Сохранено^[[0m · ^[[2mзапись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/policy^[[0m
@@ -817,6 +847,17 @@ id-off@b.test    off@b.test    —    ^[[1m^[[91m× заблокирована^[
     ^[[94m"used"^[[0m: ^[[96m10^[[0m
   }
 }"#,
+        ),
+        (
+            "ansi16",
+            "route",
+            r#"^[[92m+ pattern: example.org^[[0m
+^[[92m+ smart_host: relay.example.net:587^[[0m
+^[[92m+ tls: required^[[0m
+^[[92m✓ Сохранено^[[0m · ^[[2mзапись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/transport/routes/{pattern}^[[0m
+^[[92m+ egress_ip: 192.0.2.1^[[0m
+^[[92m✓ Сохранено^[[0m · ^[[2mзапись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/transport/routes/{pattern}^[[0m
+"#,
         ),
         (
             "truecolor",
@@ -838,8 +879,7 @@ id-off@b.test    off@b.test    —    ^[[1m^[[38;2;229;72;77m× заблокир
         (
             "truecolor",
             "policy",
-            r#"^[[1m^[[38;2;229;72;77m- dkim_selector: —^[[0m
-^[[38;2;26;150;148m+ dkim_selector: s1^[[0m
+            r#"^[[38;2;26;150;148m+ dkim_selector: s1^[[0m
 ^[[1m^[[38;2;229;72;77m- quota_bytes: 1000^[[0m
 ^[[38;2;26;150;148m+ quota_bytes: 2000^[[0m
 ^[[38;2;26;150;148m✓ Сохранено^[[0m · ^[[2m^[[38;2;126;138;150mзапись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/policy^[[0m
@@ -858,6 +898,17 @@ id-off@b.test    off@b.test    —    ^[[1m^[[38;2;229;72;77m× заблокир
     ^[[38;2;42;139;196m"used"^[[0m: ^[[38;2;26;150;148m10^[[0m
   }
 }"#,
+        ),
+        (
+            "truecolor",
+            "route",
+            r#"^[[38;2;26;150;148m+ pattern: example.org^[[0m
+^[[38;2;26;150;148m+ smart_host: relay.example.net:587^[[0m
+^[[38;2;26;150;148m+ tls: required^[[0m
+^[[38;2;26;150;148m✓ Сохранено^[[0m · ^[[2m^[[38;2;126;138;150mзапись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/transport/routes/{pattern}^[[0m
+^[[38;2;26;150;148m+ egress_ip: 192.0.2.1^[[0m
+^[[38;2;26;150;148m✓ Сохранено^[[0m · ^[[2m^[[38;2;126;138;150mзапись аудита: thepost admin audit search --method PUT --route /api/v1/orgs/{org}/transport/routes/{pattern}^[[0m
+"#,
         ),
     ];
 
@@ -951,7 +1002,7 @@ id-off@b.test    off@b.test    —    ^[[1m^[[38;2;229;72;77m× заблокир
             _ => ColorChoice::Auto,
         };
         let t = Theme::stdout(choice);
-        let [(_, accounts), _, _, (_, json)] = cases(t);
+        let [(_, accounts), _, _, (_, json), _] = cases(t);
         print(t, &format!("<<<{accounts}{json}>>>"));
     }
 
@@ -974,7 +1025,7 @@ id-off@b.test    off@b.test    —    ^[[1m^[[38;2;229;72;77m× заблокир
             body.to_owned()
         };
         let snapshot = |t: Theme| {
-            let [(_, accounts), _, _, (_, json)] = cases(t);
+            let [(_, accounts), _, _, (_, json), _] = cases(t);
             format!("{accounts}{json}")
         };
         let plain = snapshot(Theme::PLAIN);
