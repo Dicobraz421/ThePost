@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::{HeaderName, MessageParser, MimeHeaders};
 use tp_contracts::schedule::ItipMethod;
 
 /// Сообщение iTIP из письма, `From` которого совпал с организатором или участником либо с его `SENT-BY`.
@@ -45,6 +45,11 @@ pub(crate) fn extract(raw: &[u8]) -> Option<Result<Imip, &'static str>> {
     })?;
     Some((|| {
         let method: ItipMethod = param.parse().map_err(|_| "неизвестный метод iTIP")?;
+        // Ровно один заголовок `From` (SMTP-48): разбор здесь берёт один из них, а DMARC (mail-auth) — адреса всех,
+        // и проверенный DMARC `From` разошёлся бы с применённым.
+        if msg.header_values(HeaderName::From).nth(1).is_some() {
+            return Err("у письма не один заголовок From");
+        }
         // Ровно один адрес `From`: DMARC и права отправки проверяют один адрес, а не выбор из нескольких.
         let from = msg
             .from()
@@ -254,6 +259,20 @@ mod tests {
             extract(mail("REPLY", &two).as_bytes()),
             Some(Err("отправитель письма — SENT-BY нескольких адресов"))
         );
+    }
+
+    #[test]
+    fn several_from_headers() {
+        // Второй заголовок `From` — даже с тем же адресом: применяется только письмо с одним заголовком.
+        for extra in ["org@example.com", "mallory@example.net"] {
+            let raw =
+                mail("REQUEST", REQUEST).replacen("To: ", &format!("From: {extra}\r\nTo: "), 1);
+            assert_eq!(
+                extract(raw.as_bytes()),
+                Some(Err("у письма не один заголовок From")),
+                "{extra}"
+            );
+        }
     }
 
     #[test]
