@@ -774,6 +774,114 @@ async fn room_organizer_not_allowed() {
     assert!(reply.ics.contains("COMMENT:"), "{}", reply.ics);
 }
 
+impl Share {
+    /// Приглашение ресурсу письмом iMIP от `from` (он же организатор).
+    async fn imip_to_room(&self, uid: &str, from: &str, start: &str, end: &str) -> ItipOutcome {
+        let ics = meeting(uid, from, &[ROOM], start, end)
+            .replace("BEGIN:VEVENT", "METHOD:REQUEST\r\nBEGIN:VEVENT");
+        self.inbox
+            .deliver(&ItipMessage {
+                recipient: self.scope(ROOM),
+                to: ROOM.into(),
+                from: from.into(),
+                method: ItipMethod::Request,
+                ics,
+                source: ItipSource::Imip,
+            })
+            .await
+            .expect("приём")
+    }
+
+    /// Организатор брони `uid` в календаре ресурса.
+    async fn room_organizer(&self, uid: &str) -> Option<String> {
+        let o = crate::deliver::find_uid(&self.store, self.scope(ROOM), uid)
+            .await
+            .expect("хранилище")?;
+        itip::meeting(&ICalendar::parse(&o.body).expect("iCalendar"))?.organizer
+    }
+}
+
+#[tokio::test]
+async fn room_booking_not_taken_by_foreign_uid() {
+    // DAV-40: приглашение с UID чужой встречи не снимает и не перехватывает бронь.
+    let env = Share::new().await;
+    env.policy(BookingPolicy {
+        horizon: None,
+        ..BookingPolicy::default()
+    })
+    .await;
+    env.book(ALICE, "b1", "20260105T100000Z", "20260105T110000Z")
+        .await;
+    assert_eq!(
+        env.partstat(ROOM, "b1", ROOM).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    // Внешний организатор с тем же UID.
+    let ext = "mallory@example.net";
+    let out = env
+        .imip_to_room("b1", ext, "20260105T100000Z", "20260105T110000Z")
+        .await;
+    assert!(matches!(out, ItipOutcome::Ignored(_)), "{out:?}");
+    assert_eq!(
+        env.partstat(ROOM, "b1", ROOM).await.as_deref(),
+        Some("ACCEPTED"),
+        "бронь цела"
+    );
+    assert_eq!(env.room_organizer("b1").await.as_deref(), Some(ALICE));
+    assert!(
+        !env.sender.sent().iter().any(|m| m.to == [ext]),
+        "ответа внешнему нет"
+    );
+    // Сотрудник с тем же UID в своё время.
+    env.book(BOB, "b1", "20260106T100000Z", "20260106T110000Z")
+        .await;
+    assert_eq!(
+        env.partstat(ROOM, "b1", ROOM).await.as_deref(),
+        Some("ACCEPTED"),
+        "бронь цела"
+    );
+    assert_eq!(env.room_organizer("b1").await.as_deref(), Some(ALICE));
+    assert_eq!(
+        env.partstat(BOB, "b1", ROOM).await.as_deref(),
+        Some("NEEDS-ACTION"),
+        "ресурс сотруднику не ответил"
+    );
+    // Время Алисы по-прежнему занято: встреча сотрудника в нём — отказ.
+    env.book(BOB, "b2", "20260105T103000Z", "20260105T113000Z")
+        .await;
+    assert_eq!(
+        env.partstat(BOB, "b2", ROOM).await.as_deref(),
+        Some("DECLINED")
+    );
+}
+
+#[tokio::test]
+async fn room_imip_from_own_domain_is_external() {
+    // DAV-42: письмо извне с адресом организации (DMARC pass через сторонний сервис домена) не бронирует.
+    let env = Share::new().await;
+    env.policy(BookingPolicy {
+        horizon: None,
+        ..BookingPolicy::default()
+    })
+    .await;
+    let out = env
+        .imip_to_room("i1", ALICE, "20260105T100000Z", "20260105T110000Z")
+        .await;
+    assert_eq!(out, ItipOutcome::Applied);
+    assert_eq!(env.partstat(ROOM, "i1", ROOM).await, None, "брони нет");
+    assert!(
+        env.sender.sent().is_empty(),
+        "ответ на свой адрес — не письмом наружу"
+    );
+    // Та же встреча изнутри (CalDAV) — принята.
+    env.book(ALICE, "i1", "20260105T100000Z", "20260105T110000Z")
+        .await;
+    assert_eq!(
+        env.partstat(ROOM, "i1", ROOM).await.as_deref(),
+        Some("ACCEPTED")
+    );
+}
+
 #[tokio::test]
 async fn room_in_principal_search() {
     let env = Share::new().await;

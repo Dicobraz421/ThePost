@@ -11,9 +11,12 @@
 //!   организации — в календарь ([`crate::ItipInbox`]), внешнему — письмом iMIP (`BookingDeps::sender`).
 //!
 //! Решение принимается для новой встречи и для перенесённой ([`crate::itip::rescheduled`]): прежняя бронь этой встречи
-//! снимается до чтения занятости, чтобы не пересекаться сама с собой. Правка без переноса сохраняет прежний статус, ответ
-//! не отправляется. Сообщение только с исключениями ряда, правила не заданы, получатель — не ресурс — обычный приём
-//! iTIP. Организатор вне организации бронировать не может ([`BookingPolicy::allows`]); группы организатора для
+//! снимается до чтения занятости, чтобы не пересекаться сама с собой, — только если приглашение от того же
+//! организатора и не устарело (`SEQUENCE`); иначе бронь не трогается и приглашение не применяется (DAV-40). Правка
+//! без переноса сохраняет прежний статус, ответ не отправляется. Сообщение только с исключениями ряда, правила не
+//! заданы, получатель — не ресурс — обычный приём iTIP. Организатор вне организации бронировать не может
+//! ([`BookingPolicy::allows`]), как и организатор письма извне ([`ItipSource::Imip`]) с адресом организации (DAV-42):
+//! сотрудники бронируют изнутри; группы организатора для
 //! [`Bookers::Only`] раскрываются ([`GroupStore::expand`]).
 
 use std::collections::BTreeSet;
@@ -29,7 +32,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use tp_contracts::dav::{DavStore, Precondition};
 use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AddressTarget};
-use tp_contracts::schedule::{FreeBusy, ItipMessage, ItipSender, Period};
+use tp_contracts::schedule::{FreeBusy, ItipMessage, ItipSender, ItipSource, Period};
 use tp_contracts::sharing::{
     Bookers, BookingDecision, BookingPeriod, BookingPolicy, BookingRequest, DeclineReason,
     ResourceStore,
@@ -67,7 +70,8 @@ impl std::fmt::Debug for BookingDeps {
 #[derive(Debug, Clone)]
 pub(crate) struct Booking {
     pub decision: BookingDecision,
-    /// Учётная запись организатора; `None` — внешний.
+    /// Учётная запись организации с адресом организатора — ответ ей в календарь (и на приглашение извне, DAV-42);
+    /// `None` — внешний адрес, ответ письмом iMIP.
     pub organizer: Option<AccountId>,
 }
 
@@ -124,9 +128,12 @@ impl BookingDeps {
             return Ok(None);
         }
         let existing = deliver::find_uid(store, scope, &it.meeting.uid).await?;
-        if let Some(o) = &existing
-            && let Ok(old) = ICalendar::parse(&o.body)
-        {
+        if let Some(o) = &existing {
+            // Чужой организатор или устаревший `SEQUENCE`: бронь не трогается, ответа нет — обычный приём отказывает
+            // с той же причиной (DAV-40). Иначе знающий UID чужой встречи снял бы её бронь своим приглашением.
+            let Ok(old) = deliver::replaceable(o, it) else {
+                return Ok(None);
+            };
             let answered = itip::meeting(&old)
                 .and_then(|m| m.attendee(to).map(|a| a.partstat != itip::NEEDS_ACTION))
                 .unwrap_or(false);
@@ -135,17 +142,24 @@ impl BookingDeps {
             }
         }
         let now = OffsetDateTime::now_utc();
-        let organizer = match it.meeting.organizer.as_deref() {
+        let account = match it.meeting.organizer.as_deref() {
             Some(addr) => match self.accounts.by_address(scope.tenant, addr).await? {
                 Some(AddressTarget::Account(a)) if a.enabled => Some(a.id),
                 _ => None,
             },
             None => None,
         };
-        let organizer_groups = self.groups_of(scope, organizer, &policy).await?;
+        // Бронирует сотрудник изнутри — CalDAV, JMAP, почтовый клиент (DAV-42). У письма извне адрес `From` нашего
+        // домена подтверждён только DMARC, а его проходит и сторонний сервис, разрешённый в SPF или DKIM домена:
+        // такой организатор — внешний.
+        let booker = match msg.source {
+            ItipSource::Internal => account,
+            ItipSource::Imip => None,
+        };
+        let organizer_groups = self.groups_of(scope, booker, &policy).await?;
         let (periods, unbounded) = periods(&it.ical, &policy, cfg.max_instances);
         let request = BookingRequest {
-            organizer,
+            organizer: booker,
             organizer_groups,
             periods,
             unbounded,
@@ -175,7 +189,7 @@ impl BookingDeps {
         tracing::info!(?decision, "DAV: решение ресурса по приглашению");
         Ok(Some(Booking {
             decision,
-            organizer,
+            organizer: account,
         }))
     }
 
