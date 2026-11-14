@@ -9,7 +9,9 @@
 //!   не из аргумента; `--oidc` — вход у поставщика `auth.oidc` с устройства (RFC 8628, клиент — `cli.oidc`).
 //!   Одноразовый токен `admin init` (`tpa_…`) клиент не принимает.
 //! - Организация — `--org`, иначе `THEPOST_ADMIN_ORG`, иначе организация администратора (`GET /api/v1/whoami`).
-//! - Вывод — таблица или ответ API (`--json`); и то и другое — из типизированного ответа tp-admin.
+//! - Вывод — таблица или ответ API (`--json`); и то и другое — из типизированного ответа tp-admin. Подсветка —
+//!   [`tp_admin_client::style`] (решение 120, ADM-46): `--color auto|always|never`, в файл и конвейер — без ESC;
+//!   данные — в stdout, ошибки и подсказки — в stderr.
 //!
 //! Команды проверяются против роутера tp-admin.
 
@@ -38,6 +40,7 @@ use tp_admin::transport::{
 };
 use tp_admin_client::oidc::{DeviceLogin, DeviceSettings, prompt_text};
 use tp_admin_client::ops::*;
+use tp_admin_client::style::{self, ColorChoice, Theme, value_text};
 use tp_admin_client::{
     Client, DEFAULT_TIMEOUT_SECS, ENV_TOKEN, ENV_URL, NO_BODY, Options, query, setting,
 };
@@ -74,6 +77,30 @@ pub struct ApiArgs {
     /// Предельное время запроса, секунд.
     #[arg(long, global = true, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
+    /// Цвет вывода: auto — только на терминал (учитывает NO_COLOR, CLICOLOR_FORCE, TERM=dumb), always, never.
+    #[arg(long, global = true, value_enum, default_value_t = ColorArg::Auto)]
+    pub color: ColorArg,
+}
+
+/// Значение `--color`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorArg {
+    /// Цвет — только на терминал.
+    Auto,
+    /// Всегда.
+    Always,
+    /// Никогда.
+    Never,
+}
+
+impl ColorArg {
+    fn choice(self) -> ColorChoice {
+        match self {
+            Self::Auto => ColorChoice::Auto,
+            Self::Always => ColorChoice::Always,
+            Self::Never => ColorChoice::Never,
+        }
+    }
 }
 
 impl Default for ApiArgs {
@@ -86,11 +113,23 @@ impl Default for ApiArgs {
             ca_file: None,
             insecure: false,
             timeout: DEFAULT_TIMEOUT_SECS,
+            // Вызов из кода (тесты) — текст без ESC; из командной строки — `--color`, по умолчанию auto.
+            color: ColorArg::Never,
         }
     }
 }
 
 impl ApiArgs {
+    /// Оформление stdout (данные).
+    fn theme(&self) -> Theme {
+        Theme::stdout(self.color.choice())
+    }
+
+    /// Оформление stderr (ошибки и подсказки).
+    fn err_theme(&self) -> Theme {
+        Theme::stderr(self.color.choice())
+    }
+
     /// Канал к Admin API по `--ca-file`, `--insecure` (с предупреждением в stderr) и `--timeout`.
     fn options(&self) -> Options {
         if self.insecure {
@@ -691,27 +730,19 @@ fn json_field<T: Serialize>(v: &T, field: &str) -> String {
     }
 }
 
-/// Значение JSON для вывода: строка — без кавычек, `null` — «—».
-fn value_text(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => "—".to_owned(),
-        other => other.to_string(),
-    }
-}
-
 /// `thepost admin <ресурс> <действие>`: код возврата (0 — успех, 1 — отказ или ошибка).
 pub async fn command(config: &Path, args: ApiArgs, action: ApiAction) -> i32 {
     if matches!(action, ApiAction::Login { oidc: true, .. }) {
-        return oidc_command(config).await;
+        return oidc_command(config, &args).await;
     }
     match run(config, &args, action).await {
         Ok(out) => {
-            print!("{out}");
+            style::print(args.theme(), &out);
             0
         }
         Err(msg) => {
-            eprintln!("thepost: admin: {msg}");
+            let t = args.err_theme();
+            style::eprint(t, &style::error(t, &msg));
             1
         }
     }
@@ -736,7 +767,7 @@ async fn run(config: &Path, args: &ApiArgs, action: ApiAction) -> CliResult<Stri
 
 /// `login --oidc` — вход с устройства по config.yaml `config`: приглашение — в stderr, токен доступа — строкой
 /// в stdout, чтобы он не попал в историю оболочки: `export THEPOST_ADMIN_TOKEN="$(…)"`.
-async fn oidc_command(config: &Path) -> i32 {
+async fn oidc_command(config: &Path, args: &ApiArgs) -> i32 {
     match oidc_login(config).await {
         Ok(token) => {
             println!("{token}");
@@ -747,7 +778,8 @@ async fn oidc_command(config: &Path) -> i32 {
             0
         }
         Err(msg) => {
-            eprintln!("thepost: admin: {msg}");
+            let t = args.err_theme();
+            style::eprint(t, &style::error(t, &msg));
             1
         }
     }
@@ -881,7 +913,7 @@ fn url_from_config(config: &Path) -> CliResult<String> {
 /// Вывод команды: ответ в JSON (`--json`) или текст `text`.
 fn out<T: Serialize>(args: &ApiArgs, v: &T, text: String) -> CliResult<String> {
     if args.json {
-        serde_json::to_string_pretty(v)
+        style::json(args.theme(), v)
             .map(|j| format!("{j}\n"))
             .map_err(|e| e.to_string())
     } else {
@@ -903,21 +935,25 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
             let org = client.org(args.org.clone()).await?;
             match *action {
                 AccountAction::Create { login, name } => {
+                    let hint = format!("thepost admin account get {login}");
                     let body = NewAccount {
                         login,
                         display_name: name,
                     };
                     let a: AccountInfo = client
                         .call(ACCOUNT_CREATE, &[org.as_str()], &[], Some(&body))
-                        .await?;
+                        .await
+                        .map_err(|e| e.hint(409, hint))?;
                     out(args, &a, account_record(&a))
                 }
                 AccountAction::List {
                     login: Some(login), ..
                 } => {
                     let found = find_accounts(client, &org, login).await?;
-                    let rows: Vec<Vec<String>> = found.iter().map(account_row).collect();
-                    out(args, &found, table(ACCOUNT_COLUMNS, &rows))
+                    let t = args.theme();
+                    let rows: Vec<Vec<String>> =
+                        found.iter().map(|a| style::account_row(t, a)).collect();
+                    out(args, &found, style::table(t, style::ACCOUNT_COLUMNS, &rows))
                 }
                 AccountAction::List {
                     login: None,
@@ -927,17 +963,22 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                 } => {
                     let (found, more) =
                         list_accounts(client, &org, prefix.clone(), after, limit).await?;
-                    let rows: Vec<Vec<String>> = found.iter().map(account_row).collect();
-                    let mut text = table(ACCOUNT_COLUMNS, &rows);
+                    let t = args.theme();
+                    let rows: Vec<Vec<String>> =
+                        found.iter().map(|a| style::account_row(t, a)).collect();
+                    let mut text = style::table(t, style::ACCOUNT_COLUMNS, &rows);
                     if let Some(last) = found.last().filter(|_| more) {
                         // `after` следующей страницы — как в ссылке rel="next": последнее показанное имя входа.
                         let prefix = prefix.map(|p| format!(" --prefix {p}")).unwrap_or_default();
-                        text.push_str(&format!(
-                            "Показано {}; есть ещё. Следующая страница: thepost admin account list{prefix} \
-                             --after {} --limit {}\n",
-                            found.len(),
-                            last.login.to_lowercase(),
-                            found.len()
+                        text.push_str(&style::more(
+                            t,
+                            &format!(
+                                "Показано {}; есть ещё. Следующая страница: thepost admin account list{prefix} \
+                                 --after {} --limit {}",
+                                found.len(),
+                                last.login.to_lowercase(),
+                                found.len()
+                            ),
                         ));
                     }
                     out(args, &found, text)
@@ -991,8 +1032,18 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                         hidden_from_gal,
                         ..AccountPatch::default()
                     };
-                    let a = patch_account(client, &org, &account, &patch).await?;
-                    out(args, &a, account_record(&a))
+                    let id = account_id(client, &org, &account).await?;
+                    let params = [org.as_str(), id.as_str()];
+                    let before: AccountInfo =
+                        client.call(ACCOUNT_GET, &params, &[], NO_BODY).await?;
+                    let a: AccountInfo = client
+                        .call(ACCOUNT_PATCH, &params, &[], Some(&patch))
+                        .await?;
+                    out(
+                        args,
+                        &a,
+                        style::changes(args.theme(), ACCOUNT_PATCH, &before, &a),
+                    )
                 }
             }
         }
@@ -1045,7 +1096,11 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                     out(
                         args,
                         &list,
-                        table(&["ИДЕНТИФИКАТОР", "ПОДПИСЬ", "ВЫПУЩЕН", "ОТОЗВАН"], &rows),
+                        style::table(
+                            args.theme(),
+                            &["ИДЕНТИФИКАТОР", "ПОДПИСЬ", "ВЫПУЩЕН", "ОТОЗВАН"],
+                            &rows,
+                        ),
                     )
                 }
                 AppPasswordAction::Revoke { account, id } => {
@@ -1096,7 +1151,11 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                             vec![s.name.clone(), s.size.to_string(), active.to_owned()]
                         })
                         .collect();
-                    out(args, &list, table(&["ИМЯ", "РАЗМЕР", "АКТИВЕН"], &rows))
+                    out(
+                        args,
+                        &list,
+                        style::table(args.theme(), &["ИМЯ", "РАЗМЕР", "АКТИВЕН"], &rows),
+                    )
                 }
                 SieveAction::Get { account, name } => {
                     let id = account_id(client, &org, &account).await?;
@@ -1230,7 +1289,11 @@ pub async fn execute(client: &Client, args: &ApiArgs, action: ApiAction) -> CliR
                     let body = change.apply(&current)?;
                     let v: VacationBody =
                         client.call(VACATION_PUT, &params, &[], Some(&body)).await?;
-                    out(args, &v, vacation_record(&v))
+                    out(
+                        args,
+                        &v,
+                        style::changes(args.theme(), VACATION_PUT, &current, &v),
+                    )
                 }
             }
         }
@@ -1262,66 +1325,66 @@ async fn policy_command(
     let org = client.org(args.org.clone()).await?;
     match action {
         PolicyAction::Get { level: l } => {
-            let p: Policies = match level(client, &org, l).await? {
-                Level::Org => {
-                    let o: Organization = client.call(ORG_GET, &[&org], &[], NO_BODY).await?;
-                    o.policies
-                }
-                Level::Domain(id) => {
-                    client
-                        .call(DOMAIN_POLICY_GET, &[&org, &id], &[], NO_BODY)
-                        .await?
-                }
-                Level::Account(id) => {
-                    let a: AccountInfo =
-                        client.call(ACCOUNT_GET, &[&org, &id], &[], NO_BODY).await?;
-                    a.policies
-                }
-            };
-            out(args, &p, policy_table(&p.policy, Some(&p.effective)))
+            let l = level(client, &org, l).await?;
+            let p = policies(client, &org, &l).await?;
+            out(args, &p, policy_table(args.theme(), &p))
         }
         PolicyAction::Set { level: l, file } => {
             let text = input_text(file).await?;
             let body: PolicyBody =
                 serde_json::from_str(&text).map_err(|e| format!("политика (JSON): {e}"))?;
-            let (op, id) = match level(client, &org, l).await? {
+            let l = level(client, &org, l).await?;
+            let before = policies(client, &org, &l).await?.policy;
+            let (op, id) = match &l {
                 Level::Org => (ORG_POLICY_PUT, None),
-                Level::Domain(id) => (DOMAIN_POLICY_PUT, Some(id)),
-                Level::Account(id) => (ACCOUNT_POLICY_PUT, Some(id)),
+                Level::Domain(id) => (DOMAIN_POLICY_PUT, Some(id.as_str())),
+                Level::Account(id) => (ACCOUNT_POLICY_PUT, Some(id.as_str())),
             };
-            let params: Vec<&str> = [Some(org.as_str()), id.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect();
+            let params: Vec<&str> = [Some(org.as_str()), id].into_iter().flatten().collect();
             let p: PolicyBody = client.call(op, &params, &[], Some(&body)).await?;
-            out(args, &p, policy_table(&p, None))
+            out(args, &p, style::changes(args.theme(), op, &before, &p))
         }
     }
 }
 
+/// Политика уровня `l`: заданное на уровне и действующее.
+async fn policies(client: &Client, org: &str, l: &Level) -> CliResult<Policies> {
+    Ok(match l {
+        Level::Org => {
+            let o: Organization = client.call(ORG_GET, &[org], &[], NO_BODY).await?;
+            o.policies
+        }
+        Level::Domain(id) => {
+            client
+                .call(DOMAIN_POLICY_GET, &[org, id.as_str()], &[], NO_BODY)
+                .await?
+        }
+        Level::Account(id) => {
+            let a: AccountInfo = client
+                .call(ACCOUNT_GET, &[org, id.as_str()], &[], NO_BODY)
+                .await?;
+            a.policies
+        }
+    })
+}
+
 /// Поля политики: заданное на уровне и действующее (`effective`); не задано — «—».
-fn policy_table(policy: &PolicyBody, effective: Option<&PolicyBody>) -> String {
+fn policy_table(t: Theme, p: &Policies) -> String {
     let fields = |p: &PolicyBody| match serde_json::to_value(p) {
         Ok(serde_json::Value::Object(fields)) => fields,
         _ => serde_json::Map::new(),
     };
-    let effective = effective.map(fields);
-    let rows: Vec<Vec<String>> = fields(policy)
+    let effective = fields(&p.effective);
+    let rows: Vec<Vec<String>> = fields(&p.policy)
         .iter()
         .map(|(name, v)| {
-            let mut row = vec![name.clone(), value_text(v)];
-            if let Some(e) = &effective {
-                row.push(e.get(name).map_or_else(|| "—".to_owned(), value_text));
-            }
-            row
+            let e = effective
+                .get(name)
+                .map_or_else(|| "—".to_owned(), value_text);
+            vec![name.clone(), value_text(v), e]
         })
         .collect();
-    let cols: &[&str] = if effective.is_some() {
-        &["ПОЛЕ", "НА УРОВНЕ", "ДЕЙСТВУЕТ"]
-    } else {
-        &["ПОЛЕ", "НА УРОВНЕ"]
-    };
-    table(cols, &rows)
+    style::table(t, &["ПОЛЕ", "НА УРОВНЕ", "ДЕЙСТВУЕТ"], &rows)
 }
 
 /// `thepost admin group …`.
@@ -1331,7 +1394,11 @@ async fn group_command(client: &Client, args: &ApiArgs, action: GroupAction) -> 
         GroupAction::List => {
             let list = groups(client, &org).await?;
             let rows: Vec<Vec<String>> = list.iter().map(group_row).collect();
-            out(args, &list, table(GROUP_COLUMNS, &rows))
+            out(
+                args,
+                &list,
+                style::table(args.theme(), GROUP_COLUMNS, &rows),
+            )
         }
         GroupAction::Get { group } => {
             let id = group_id(client, &org, &group).await?;
@@ -1352,7 +1419,10 @@ async fn group_command(client: &Client, args: &ApiArgs, action: GroupAction) -> 
                 moderators: Vec::new(),
                 hidden_from_gal: false,
             };
-            let g: GroupInfo = client.call(GROUP_CREATE, &[&org], &[], Some(&body)).await?;
+            let g: GroupInfo = client
+                .call(GROUP_CREATE, &[&org], &[], Some(&body))
+                .await
+                .map_err(|e| e.hint(409, "thepost admin group list"))?;
             out(args, &g, group_record(&g))
         }
         GroupAction::Delete { group } => {
@@ -1390,7 +1460,7 @@ async fn group_command(client: &Client, args: &ApiArgs, action: GroupAction) -> 
             out(
                 args,
                 &g.members,
-                table(&["ВИД", "ИДЕНТИФИКАТОР", "ИМЯ"], &rows),
+                style::table(args.theme(), &["ВИД", "ИДЕНТИФИКАТОР", "ИМЯ"], &rows),
             )
         }
     }
@@ -1555,9 +1625,15 @@ async fn trash_command(client: &Client, args: &ApiArgs, action: TrashAction) -> 
                 Some(_) => json_field(&page, "trash_retention"),
                 None => "по умолчанию узла".to_owned(),
             };
-            let mut text = format!("{}Срок корзины: {retention}\n", table(&cols, &rows));
+            let mut text = format!(
+                "{}Срок корзины: {retention}\n",
+                style::table(args.theme(), &cols, &rows)
+            );
             if let Some(next) = page.next_offset {
-                text.push_str(&format!("Есть ещё. Следующая страница: --offset {next}\n"));
+                text.push_str(&style::more(
+                    args.theme(),
+                    &format!("Есть ещё. Следующая страница: --offset {next}"),
+                ));
             }
             out(args, &page, text)
         }
@@ -1618,7 +1694,8 @@ async fn audit_command(client: &Client, args: &ApiArgs, action: AuditAction) -> 
             ]
         })
         .collect();
-    let mut text = table(
+    let mut text = style::table(
+        args.theme(),
         &[
             "НОМЕР",
             "МОМЕНТ",
@@ -1630,8 +1707,9 @@ async fn audit_command(client: &Client, args: &ApiArgs, action: AuditAction) -> 
         &rows,
     );
     if let Some(next) = page.next {
-        text.push_str(&format!(
-            "Есть ещё. Следующая страница: те же условия и --after {next}\n"
+        text.push_str(&style::more(
+            args.theme(),
+            &format!("Есть ещё. Следующая страница: те же условия и --after {next}"),
         ));
     }
     out(args, &page, text)
@@ -1677,7 +1755,8 @@ async fn delivery_command(
             ]
         })
         .collect();
-    let mut text = table(
+    let mut text = style::table(
+        args.theme(),
         &[
             "МОМЕНТ",
             "СОБЫТИЕ",
@@ -1689,8 +1768,9 @@ async fn delivery_command(
         &rows,
     );
     if let Some(next) = &page.next {
-        text.push_str(&format!(
-            "Есть ещё. Следующая страница: те же условия и --after {next}\n"
+        text.push_str(&style::more(
+            args.theme(),
+            &format!("Есть ещё. Следующая страница: те же условия и --after {next}"),
         ));
     }
     out(args, &page, text)
@@ -1715,7 +1795,7 @@ async fn domain_command(
             let rows: Vec<Vec<String>> = list.domains.iter().map(domain_row).collect();
             let text = format!(
                 "{}Версия снимка: {}\n",
-                table(DOMAIN_COLUMNS, &rows),
+                style::table(args.theme(), DOMAIN_COLUMNS, &rows),
                 list.version
             );
             out(args, &list, text)
@@ -1796,7 +1876,7 @@ async fn source_command(
             let rows: Vec<Vec<String>> = list.sources.iter().map(source_row).collect();
             let text = format!(
                 "{}Версия снимка: {}\n",
-                table(SOURCE_COLUMNS, &rows),
+                style::table(args.theme(), SOURCE_COLUMNS, &rows),
                 list.version
             );
             out(args, &list, text)
@@ -1820,16 +1900,27 @@ async fn source_command(
             } else {
                 serde_json::json!({ "gateway": { "xclient": xclient, "authserv_id": authserv_id } })
             };
-            let version = sources().await?.version;
+            let list = sources().await?;
             let body: SourceBody = from_json(
-                serde_json::json!({ "version": version, "matcher": matcher, "kind": kind }),
+                serde_json::json!({ "version": list.version, "matcher": matcher, "kind": kind }),
                 "источник",
             )?;
             let w: Written = client
                 .call(SOURCE_PUT, &[org, &name], &[], Some(&body))
                 .await?;
-            let text = format!("Источник {name} записан. Версия снимка: {}\n", w.version);
-            out(args, &w, text)
+            // Было/стало — запись источника в снимке до и после (новый источник — «было» пусто).
+            let find = |list: SourceList| {
+                list.sources
+                    .into_iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&name))
+            };
+            let before = find(list);
+            let after = find(sources().await?);
+            out(
+                args,
+                &w,
+                style::changes(args.theme(), SOURCE_PUT, &before, &after),
+            )
         }
         SourceAction::Delete { name } => {
             let query = query(&VersionQuery {
@@ -1898,7 +1989,7 @@ async fn route_command(
             let rows: Vec<Vec<String>> = list.routes.iter().map(route_row).collect();
             let text = format!(
                 "{}Версия снимка: {}\n",
-                table(ROUTE_COLUMNS, &rows),
+                style::table(args.theme(), ROUTE_COLUMNS, &rows),
                 list.version
             );
             out(args, &list, text)
@@ -1921,8 +2012,9 @@ async fn route_command(
                         .map_err(|e| format!("--egress-ip {ip}: {e}"))
                 })
                 .transpose()?;
+            let list = routes().await?;
             let body = RouteBody {
-                version: routes().await?.version,
+                version: list.version,
                 tls,
                 smart_host,
                 egress_ip,
@@ -1930,11 +2022,19 @@ async fn route_command(
             let w: Written = client
                 .call(ROUTE_PUT, &[org, &pattern], &[], Some(&body))
                 .await?;
-            let text = format!(
-                "Политика {pattern} записана. Версия снимка: {}\n",
-                w.version
-            );
-            out(args, &w, text)
+            // Было/стало — политика в снимке до и после (шаблон узел приводит к нижнему регистру).
+            let find = |list: RouteList| {
+                list.routes
+                    .into_iter()
+                    .find(|r| r.pattern.eq_ignore_ascii_case(&pattern))
+            };
+            let before = find(list);
+            let after = find(routes().await?);
+            out(
+                args,
+                &w,
+                style::changes(args.theme(), ROUTE_PUT, &before, &after),
+            )
         }
         RouteAction::Delete { pattern } => {
             let query = query(&VersionQuery {
@@ -2042,8 +2142,6 @@ async fn input_text(file: PathBuf) -> CliResult<String> {
     .map_err(|e| e.to_string())?
 }
 
-const ACCOUNT_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ИМЯ ВХОДА", "ИМЯ", "ВХОД"];
-
 const DOMAIN_COLUMNS: &[&str] = &["ИДЕНТИФИКАТОР", "ДОМЕН", "ВИД"];
 
 /// Текущий администратор — строки «подпись: значение».
@@ -2073,16 +2171,6 @@ fn account_record(a: &AccountInfo) -> String {
         ("Писем", a.quota.messages.to_string()),
         ("Квота, байт", optional(a.quota.limit_bytes.as_ref())),
     ])
-}
-
-/// Учётная запись — строка таблицы [`ACCOUNT_COLUMNS`].
-fn account_row(a: &AccountInfo) -> Vec<String> {
-    vec![
-        a.id.clone(),
-        a.login.clone(),
-        or_dash(&a.display_name),
-        a.enabled.to_string(),
-    ]
 }
 
 /// Принятый домен — строка таблицы [`DOMAIN_COLUMNS`].
@@ -2183,40 +2271,6 @@ fn record(fields: &[(&str, String)]) -> String {
             )
         })
         .collect()
-}
-
-/// Таблица с заголовком `cols`; строк нет — «нет записей».
-fn table(cols: &[&str], rows: &[Vec<String>]) -> String {
-    if rows.is_empty() {
-        return "нет записей\n".to_owned();
-    }
-    let widths: Vec<usize> = cols
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            rows.iter()
-                .map(|r| r.get(i).map_or(0, |c| c.chars().count()))
-                .chain([t.chars().count()])
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let line = |cells: Vec<&str>| {
-        let mut s = cells
-            .iter()
-            .zip(&widths)
-            .map(|(c, w)| pad(c, *w))
-            .collect::<Vec<_>>()
-            .join("  ");
-        s.truncate(s.trim_end().len());
-        s.push('\n');
-        s
-    };
-    let mut out = line(cols.to_vec());
-    for r in rows {
-        out.push_str(&line(r.iter().map(String::as_str).collect()));
-    }
-    out
 }
 
 fn pad(s: &str, w: usize) -> String {
@@ -2706,24 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_table_and_record() {
-        let rows = vec![
-            vec!["1".into(), "a@b.test".into(), "Анна".into(), "true".into()],
-            vec!["22".into(), "bb@b.test".into(), or_dash(""), "false".into()],
-        ];
-        let t = table(ACCOUNT_COLUMNS, &rows);
-        let lines: Vec<&str> = t.lines().collect();
-        assert_eq!(lines.len(), 3, "{t}");
-        assert!(lines[0].starts_with("ИДЕНТИФИКАТОР  ИМЯ ВХОДА"), "{t}");
-        assert!(
-            lines[2].contains("bb@b.test") && lines[2].contains('—'),
-            "{t}"
-        );
-        assert_eq!(
-            table(ACCOUNT_COLUMNS, &[]),
-            "нет записей
-"
-        );
+    fn renders_record() {
         let w = WhoAmI {
             tenant: TenantId::DEFAULT.to_string(),
             account: AccountId::new().to_string(),
@@ -3567,7 +3604,16 @@ mod tests {
         let shown = exec(&c, false, set(&[], true, Some(false)))
             .await
             .expect("set");
-        assert!(shown.contains("Псевдонимы"), "{shown}");
+        // Было/стало — только изменённые поля: псевдонимы сняты, скрытие из книги снято.
+        assert!(
+            shown.contains("- aliases: [\"b@alias.test\",\"c@alias.test\"]\n+ aliases: []\n")
+                && shown.contains("- hidden_from_gal: true\n+ hidden_from_gal: false\n")
+                && !shown.contains("login")
+                && shown.contains(
+                    "✓ Сохранено · запись аудита: thepost admin audit search --method PATCH"
+                ),
+            "{shown}"
+        );
         let get = account(AccountAction::Get { account: login() });
         assert_eq!(fields(exec(&c, true, get).await), (json!([]), json!(false)));
         let err = exec(&c, false, set(&["x@other.test"], false, None))
@@ -4003,7 +4049,25 @@ mod tests {
         let done = exec(&c, false, set("gw", vec!["192.0.2.0/24"], None, vec![]))
             .await
             .expect("source gw");
-        assert!(done.starts_with("Источник gw записан"), "{done}");
+        assert!(
+            done.contains("+ name: gw")
+                && done.contains("+ matcher: ")
+                && !done.contains("- name")
+                && done.contains(
+                    "✓ Сохранено · запись аудита: thepost admin audit search --method PUT"
+                ),
+            "{done}"
+        );
+        // Повтор с другой сетью — только изменённое поле.
+        let again = exec(&c, false, set("gw", vec!["198.51.100.0/24"], None, vec![]))
+            .await
+            .expect("source gw again");
+        assert!(
+            again.contains("198.51.100.0/24")
+                && !again.contains("name:")
+                && !again.contains("kind:"),
+            "{again}"
+        );
         exec(
             &c,
             false,
@@ -4015,7 +4079,7 @@ mod tests {
             .await
             .expect("source list");
         for part in [
-            "192.0.2.0/24",
+            "198.51.100.0/24",
             "XCLIENT",
             "authserv-id mx.res.test",
             "сертификат mfu.res.test",
@@ -4056,7 +4120,12 @@ mod tests {
         )
         .await
         .expect("route set");
-        assert!(done.starts_with("Политика Example.org записана"), "{done}");
+        assert!(
+            done.contains("+ pattern: example.org")
+                && done.contains("+ tls: required")
+                && done.contains("✓ Сохранено"),
+            "{done}"
+        );
         let pin = "ab".repeat(32);
         let pinned = format!("pinned: {pin}");
         exec(
