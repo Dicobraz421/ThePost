@@ -195,7 +195,6 @@ fn unquote(v: &str) -> &str {
 }
 
 /// Роли и цвета IT TASK в контракте — те же, что в `design/tokens.toml` (единственный источник цветов, решение 119).
-/// До волны design у `sel` в файле — прежний `#E4107F` (решение 122: розовый выделения — `#E3107F`).
 #[test]
 fn it_task_matches_tokens() {
     let toml = include_str!("../../../../design/tokens.toml");
@@ -207,12 +206,13 @@ fn it_task_matches_tokens() {
         let mode = section(toml, &format!("mode.{}", theme.as_str()));
         for role in Role::ALL {
             let file = c(unquote(&mode[role.as_str()]));
-            let ours = role.it_task(theme);
-            if role == Role::Sel && file == c("#E4107F") {
-                assert_eq!(ours, c("#E3107F"));
-                continue;
-            }
-            assert_eq!(ours, file, "{}.{}", theme.as_str(), role.as_str());
+            assert_eq!(
+                role.it_task(theme),
+                file,
+                "{}.{}",
+                theme.as_str(),
+                role.as_str()
+            );
         }
     }
     let cli = section(toml, "cli.roles");
@@ -231,8 +231,7 @@ fn it_task_matches_tokens() {
     assert_eq!(cli_main["min"], CLI_MIN_CONTRAST.to_string() + ".0");
 }
 
-/// Пары [`CONTRAST`] — те же, что `[[contrast]]` файла токенов; порог `selFg` на `sel` — 4,5 (в файле до волны
-/// design — 4,48 с исключением, решение 122 его отменило).
+/// Пары [`CONTRAST`] — те же, что `[[contrast]]` файла токенов, исключений нет (решение 122).
 #[test]
 fn contrast_pairs_match_tokens() {
     let toml = include_str!("../../../../design/tokens.toml");
@@ -260,10 +259,6 @@ fn contrast_pairs_match_tokens() {
         assert_eq!(fg, pair.fg.as_str());
         let ours: Vec<&str> = pair.bg.iter().map(|r| r.as_str()).collect();
         assert_eq!(bg, &ours, "{fg}");
-        if pair.fg == Role::SelFg && (*min - 4.48).abs() < 1e-9 {
-            assert!((pair.min - 4.5).abs() < 1e-9);
-            continue;
-        }
         assert!((pair.min - min).abs() < 1e-9, "{fg}: {min}");
     }
 }

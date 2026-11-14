@@ -1,10 +1,13 @@
-//! Запуск интерфейса в терминале: crossterm, клиент Admin API (`tp-admin-client`) и цикл событий.
+//! Запуск интерфейса в терминале: crossterm, клиент Admin API (`tp-admin-client`) и цикл событий; тема по
+//! окружению, знак бренда протоколом графики терминала, палитра консоли Linux на время работы.
 
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
+use ratatui_image::picker::Picker;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tp_admin::server::WhoAmI;
@@ -15,7 +18,7 @@ use crate::app::{App, Effect, LoginField, LoginForm, LoginRequest, Page, Stage};
 use crate::engine::Request;
 use crate::node::{self, ConfigFile, NodeConfig, SaveError, Saved};
 use crate::schema::Response;
-use crate::theme::Theme;
+use crate::theme::{ConsolePalette, Theme, console_palette_needed};
 use crate::ui;
 
 /// Как часто поток ввода проверяет, не закрыт ли интерфейс (ожидание клавиши не дольше).
@@ -38,6 +41,9 @@ pub struct Connect {
     /// Конфигурация узла, когда интерфейс запущен на самом узле с правом на `config.yaml`; нет — раздел
     /// «Конфигурация узла» только поясняет, где её править.
     pub node: Option<NodeConfig>,
+    /// Режим темы (`--theme`): `auto`, `dark`, `light`, `256`, `16`, `mono`; нет — `THEPOST_TUI_THEME` и
+    /// автоопределение по `NO_COLOR`, `COLORTERM`, `TERM`.
+    pub theme: Option<String>,
 }
 
 enum Msg {
@@ -47,17 +53,42 @@ enum Msg {
     Done(u64, Result<Page, tp_admin_client::Error>),
     Config(Result<ConfigFile, String>),
     ConfigSaved(Result<Saved, SaveError>),
+    /// `SIGTERM` или закрытие окна: выйти штатно (терминал и палитра консоли возвращаются).
+    Quit,
 }
 
 /// Текстовый интерфейс `thepost admin tui`: до выхода по F10; терминал возвращается в прежний режим и при ошибке.
-pub async fn run(connect: Connect) -> Result<(), String> {
+pub async fn run(mut connect: Connect) -> Result<(), String> {
+    let theme = Theme::from_env(connect.theme.take().as_deref())?;
     let mut terminal = ratatui::try_init().map_err(|e| format!("терминал: {e}"))?;
-    let result = event_loop(&mut terminal, connect).await;
+    let palette = console_palette(&theme);
+    // Опрос терминала — до потока ввода (ответ приходит в stdin).
+    let theme = if theme.mode().graphics() {
+        theme.with_mark(&Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()))
+    } else {
+        theme
+    };
+    let result = event_loop(&mut terminal, connect, theme).await;
     let restored = ratatui::try_restore().map_err(|e| format!("терминал: {e}"));
+    drop(palette);
     result.and(restored)
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, connect: Connect) -> Result<(), String> {
+/// Палитра бренда на консоли Linux в 16 цветах; возвращается при сбросе и при панике.
+fn console_palette(theme: &Theme) -> Option<ConsolePalette<io::Stdout>> {
+    let term = std::env::var("TERM").ok();
+    if !console_palette_needed(term.as_deref(), theme.mode()) {
+        return None;
+    }
+    ConsolePalette::<io::Stdout>::reset_on_panic();
+    ConsolePalette::set(io::stdout(), theme.console_palette()).ok()
+}
+
+async fn event_loop(
+    terminal: &mut DefaultTerminal,
+    connect: Connect,
+    theme: Theme,
+) -> Result<(), String> {
     let url = setting(connect.url, ENV_URL).unwrap_or_default();
     let token = setting(connect.token, ENV_TOKEN);
     let mut login = LoginForm::new(url.clone(), connect.oidc.is_some());
@@ -65,13 +96,14 @@ async fn event_loop(terminal: &mut DefaultTerminal, connect: Connect) -> Result<
         login.user = user;
         login.focus = LoginField::Secret;
     }
-    let mut app = App::new(Theme::from_env(), login);
+    let mut app = App::new(theme, login);
     app.node = connect.node.is_some();
     let node = connect.node;
     let options = connect.options;
     let oidc = connect.oidc.map(Arc::new);
     let (tx, mut rx) = mpsc::unbounded_channel();
     spawn_input(tx.clone());
+    spawn_signal(tx.clone());
     let mut client: Option<Client> = None;
     if let Some(token) = token {
         let effects = vec![Effect::Login(LoginRequest::Token { url, token })];
@@ -112,6 +144,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, connect: Connect) -> Result<
                 Vec::new()
             }
             Msg::ConfigSaved(r) => app.on_config_saved(r),
+            Msg::Quit => return Ok(()),
         };
         if effects.contains(&Effect::Quit) {
             return Ok(());
@@ -211,6 +244,21 @@ fn spawn_input(tx: mpsc::UnboundedSender<Msg>) {
                 Ok(false) => {}
                 Err(_) => break,
             }
+        }
+    });
+}
+
+/// `SIGTERM` (в Windows — закрытие окна консоли) — сообщением в цикл: выход штатный, с возвратом терминала и
+/// палитры.
+fn spawn_signal(tx: mpsc::UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        let stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        #[cfg(windows)]
+        let stop = tokio::signal::windows::ctrl_close();
+        if let Ok(mut stop) = stop {
+            stop.recv().await;
+            let _ = tx.send(Msg::Quit);
         }
     });
 }

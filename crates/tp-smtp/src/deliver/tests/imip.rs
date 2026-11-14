@@ -3,7 +3,7 @@
 
 use tp_contracts::delivery::{DeliveryDecision, DeliveryEvent, DeliveryEventKind};
 use tp_contracts::membership::NodeId;
-use tp_contracts::schedule::{ItipMethod, ItipOutcome, ItipSource};
+use tp_contracts::schedule::{ItipMethod, ItipOutcome, SenderKind};
 use tp_testkit::{FakeItip, MemDeliveryLog};
 
 use super::*;
@@ -22,14 +22,108 @@ fn imip(method: &str, organizer: &str, attendee: &str) -> String {
     )
 }
 
-/// Доставка с проверками отправителя (`example.com`: SPF `192.0.2.0/24`, DMARC `none`) и приёмом iTIP.
+/// Домены-партнёры организации окружения (`TenantId::DEFAULT`).
+struct Partners(BTreeSet<&'static str>);
+
+#[async_trait]
+impl PartnerDomains for Partners {
+    async fn is_partner(&self, tenant: TenantId, domain: &str) -> Result<bool> {
+        Ok(tenant == TenantId::DEFAULT && self.0.contains(domain))
+    }
+}
+
+/// Доставка с проверками отправителя (`example.com`: SPF `192.0.2.0/24`, DMARC `none`) и приёмом iTIP; `example.com`
+/// — домен-партнёр организации.
 fn delivery(env: &Env) -> (Delivery, FakeItip) {
+    with_partners(env, &["example.com"])
+}
+
+/// Доставка [`delivery`] с доменами-партнёрами `partners`.
+fn with_partners(env: &Env, partners: &[&'static str]) -> (Delivery, FakeItip) {
     let check = fx::checker();
     fx::publish_sender(check.cache(), "none");
     let itip = FakeItip::new();
-    let mut d = env.delivery(false).with_itip(Arc::new(itip.clone()));
+    let mut d = env
+        .delivery(false)
+        .with_itip(Arc::new(itip.clone()))
+        .with_partners(Arc::new(Partners(partners.iter().copied().collect())));
     d.deps.authcheck = Some(Arc::new(check));
     (d, itip)
+}
+
+/// Принятый домен `name` организации `tenant` в настройках транспорта окружения.
+pub(super) async fn accept(env: &Env, name: &str, tenant: TenantId) {
+    let store = env.transport.clone();
+    let v = store.cluster().await.expect("cluster").version;
+    store
+        .put_domain(
+            v,
+            &AcceptedDomain {
+                id: tp_contracts::DomainId::new(),
+                tenant,
+                name: name.into(),
+                kind: DomainKind::Authoritative,
+            },
+        )
+        .await
+        .expect("domain");
+}
+
+/// Организация адреса — по ближайшему принятому домену: сам домен или родитель (поддомен — организации домена).
+#[tokio::test]
+async fn org_of_by_nearest_accepted_domain() {
+    let env = Env::new(DecisionHooks::default()).await;
+    let other = TenantId::new();
+    accept(&env, "example.com", other).await;
+    let d = env.delivery(false);
+    for (address, tenant) in [
+        ("a@Sub.Example.org", Some(TenantId::DEFAULT)),
+        ("a@mail.example.com", Some(other)),
+        ("a@example.com", Some(other)),
+        ("a@example.net", None),
+        ("a@org", None),
+    ] {
+        assert_eq!(d.org_of(address).await.expect("org"), tenant, "{address}");
+    }
+}
+
+/// Решение 123 (SMTP-49): тип отправителя письма через smtp-in — по домену `From`. Свой домен — внешний (DMARC
+/// проходит и сторонний сервис домена), даже если он в списке партнёров; домен другой организации установки —
+/// соседняя организация, если не партнёр; без списка партнёров — внешний.
+#[tokio::test]
+async fn smtp_in_sender_kind_by_from_domain() {
+    let request = imip("REQUEST", "sender@example.com", "bob@example.org");
+    let kind = |itip: &FakeItip| {
+        let calls = itip.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        calls[0].sender
+    };
+    // Без партнёров.
+    let env = Env::new(DecisionHooks::default()).await;
+    let (d, itip) = with_partners(&env, &[]);
+    assert_eq!(send(&d, &request).await, 250);
+    assert_eq!(kind(&itip), SenderKind::External);
+    // Партнёр.
+    let (d, itip) = delivery(&env);
+    assert_eq!(send(&d, &request).await, 250);
+    assert_eq!(kind(&itip), SenderKind::Partner);
+    // Домен своей организации письмом снаружи — внешний, и в списке партнёров тоже.
+    let env = Env::new(DecisionHooks::default()).await;
+    accept(&env, "example.com", TenantId::DEFAULT).await;
+    let (d, itip) = delivery(&env);
+    assert_eq!(send(&d, &request).await, 250);
+    assert_eq!(kind(&itip), SenderKind::External);
+    // Другая организация установки (MSSP): соседняя; партнёр — партнёр.
+    let env = Env::new(DecisionHooks::default()).await;
+    accept(&env, "example.com", TenantId::new()).await;
+    let (d, itip) = with_partners(&env, &[]);
+    assert_eq!(send(&d, &request).await, 250);
+    assert_eq!(kind(&itip), SenderKind::Neighbor);
+    let (d, itip) = delivery(&env);
+    assert_eq!(send(&d, &request).await, 250);
+    assert_eq!(kind(&itip), SenderKind::Partner);
+    // Письмо в любом случае — в ящике.
+    assert_eq!(env.inbox("bob@example.org").await.len(), 2);
 }
 
 /// Письмо с адреса из SPF отправителя: DMARC пройден.
@@ -62,7 +156,7 @@ async fn request_reply_cancel_reach_itip_and_stay_in_inbox() {
         assert_eq!(c.recipient, bob);
         assert_eq!(c.to, "bob@example.org");
         assert_eq!(c.from, "sender@example.com");
-        assert_eq!(c.source, ItipSource::Imip);
+        assert_eq!(c.sender, SenderKind::Partner);
         assert!(c.ics.starts_with("BEGIN:VCALENDAR") && c.ics.contains("UID:u1"));
     }
     assert!(calls[1].ics.contains("METHOD:REPLY"));

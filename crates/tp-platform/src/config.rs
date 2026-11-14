@@ -1294,6 +1294,20 @@ fn apply_env(
     Ok(!vars.is_empty())
 }
 
+/// Документ YAML (`config.yaml`) как JSON — тем же разбором в дерево, что у загрузчика конфигурации (повтор ключа —
+/// ошибка, как при загрузке); пустой документ — `null`. Ошибка разбора — `Error::Invalid` с позицией в тексте
+/// (`at line 3 column 5`); ключ, который в JSON не выразить (`~`), — тоже `Invalid`.
+pub fn yaml_to_json(src: &str) -> tp_contracts::Result<serde_json::Value> {
+    let tree: Value = serde_yaml_ng::from_str(src)
+        .map_err(|e| Error::Invalid(ConfigError::Parse(e).to_string()))?;
+    serde_json::to_value(tree).map_err(|e| Error::Invalid(e.to_string()))
+}
+
+/// Документ JSON как текст YAML (блочный стиль).
+pub fn json_to_yaml(doc: &serde_json::Value) -> tp_contracts::Result<String> {
+    serde_yaml_ng::to_string(doc).map_err(|e| Error::Invalid(ConfigError::Parse(e).to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use tp_contracts::role::Role;
@@ -1716,5 +1730,58 @@ mod tests {
         assert!(json.contains("\"$defs\""));
         assert!(json.contains("SmtpConfig"));
         assert!(json.contains("max_size"));
+    }
+
+    /// YAML → JSON → YAML → JSON: документ тот же, вывод снова разбирается загрузчиком.
+    #[test]
+    fn yaml_json_round_trip() {
+        let src = "# узел\ndomain: example.com\nsmtp:\n  max_size: 100\n  ratio: 0.5\n  greeting: \"220 ok\"\n  relay: [10.0.0.1, '::1']\n  tls: true\n  limits: ~\n";
+        let doc = yaml_to_json(src).expect("yaml");
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                "domain": "example.com",
+                "smtp": {
+                    "max_size": 100,
+                    "ratio": 0.5,
+                    "greeting": "220 ok",
+                    "relay": ["10.0.0.1", "::1"],
+                    "tls": true,
+                    "limits": null
+                }
+            })
+        );
+        let text = json_to_yaml(&doc).expect("render");
+        assert_eq!(yaml_to_json(&text).expect("yaml"), doc);
+        // Строки, похожие на числа и логические значения, остаются строками.
+        let tricky = serde_json::json!({"a": "1", "b": "true", "c": "null", "d": "", "e": "x: y"});
+        assert_eq!(
+            yaml_to_json(&json_to_yaml(&tricky).expect("render")).expect("yaml"),
+            tricky
+        );
+        assert_eq!(yaml_to_json("").expect("пустой"), serde_json::Value::Null);
+        // Вывод — тот же документ для загрузчика.
+        let cfg = registry()
+            .parse(
+                &json_to_yaml(&yaml_to_json(MINIMAL).expect("yaml")).expect("render"),
+                [],
+            )
+            .expect("config");
+        assert_eq!(cfg.domain(), "example.com");
+    }
+
+    /// Ошибка разбора — `Invalid` с номером строки и столбца.
+    #[test]
+    fn yaml_parse_error_has_position() {
+        let Err(Error::Invalid(m)) = yaml_to_json("domain: x\nsmtp:\n  relay: [a, b\n") else {
+            panic!("ждали Invalid");
+        };
+        assert!(m.contains("at line 4 column 1"), "{m}");
+        // Повтор ключа — ошибка, как у загрузчика: последнее значение молча не берётся.
+        let Err(Error::Invalid(m)) = yaml_to_json("domain: x\ndomain: y\n") else {
+            panic!("ждали Invalid");
+        };
+        assert!(m.contains("duplicate entry") && m.contains("domain"), "{m}");
+        assert!(matches!(yaml_to_json("~: x\n"), Err(Error::Invalid(_))));
     }
 }

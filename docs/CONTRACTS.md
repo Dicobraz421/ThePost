@@ -744,12 +744,16 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
 с JMAP (`sendSchedulingMessages`, JMAP-31; JMAP Calendars — по черновику IETF, решение 35). Адрес календарного пользователя —
 без `mailto:`, `valid_address` (1–320 байт, без пробелов и управляющих; нормализует вызывающий).
 - `ItipMethod::{Publish, Request, Reply, Add, Cancel, Refresh, Counter, DeclineCounter}` (`as_str`, `FromStr` без регистра, `from_organizer`).
-- `ItipDelivery::deliver(&ItipMessage { recipient: AccountScope, to, from, method, ics, source: ItipSource::{Internal, Imip} }) ->
+- `ItipDelivery::deliver(&ItipMessage { recipient: AccountScope, to, from, method, ics, sender: SenderKind }) ->
   ItipOutcome::{Applied, Ignored(reason)}` — приём iTIP учётной записью: `REQUEST`, `ADD` — событие в календаре по умолчанию
   (`PARTSTAT=NEEDS-ACTION`), `REPLY` — статус участника у организатора, `CANCEL` — `STATUS:CANCELLED`, все — во входящие планирования.
-  `from` проверен вызывающим (iMIP — `From`, прошедший DMARC; внутри — адрес учётной записи). CTR-59 (решение 78): `Internal` — также
+  `from` проверен вызывающим (iMIP — `From`, прошедший DMARC; внутри — адрес учётной записи). CTR-59 (решение 78): своя организация — также
   приглашение из почтового клиента (submission, JMAP `EmailSubmission`; SMTP-36), если `From` письма принадлежит вошедшей учётной записи
-  (свой адрес, псевдоним, право Send As); иначе — письмо без доставки iTIP. Недопустимое (`ItipMessage::validate`),
+  (свой адрес, псевдоним, право Send As); иначе — письмо без доставки iTIP. CTR-92 (решение 123): `sender` — тип отправителя
+  относительно организации получателя `SenderKind::{Own, Partner, Neighbor, External}` (определяет вызывающий по пути и домену `From`);
+  что можно — только `inbound_allowed(sender, InboundAction::of(method, resource, update))`, действия `InboundAction::{Invite, Update, Reply,
+  Cancel, Other, Booking}`; по умолчанию своей организации (вошедшему) — всё, извне (партнёр, соседняя организация, внешний) — только `Update`,
+  `Reply` и `Cancel` к существующему событию (не разрешено — `Ok(Ignored)`, ни события, ни брони, ни ответа). Недопустимое (`ItipMessage::validate`),
   подделанный отправитель, устаревший `SEQUENCE`, чужой `UID` организатора — `Ok(Ignored)`; `Err` — сбой хранилища (идемпотентно,
   повтор безопасен); письмо iMIP при любом итоге остаётся в ящике. Реализация — `tp-dav` (DAV-15); вызывают `tp-smtp` (SMTP-33,
   `Delivery::with_itip`), `tp-dav` (DAV-13), `tp-jmap` (JMAP-31). Заглушка — `FakeItip` (`set(to, outcome)`, `fail_next`, `calls`).
@@ -1226,10 +1230,16 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   получателей и лиза уже в `queue`, `queue_rcpts`). In-memory — `MemQueue` (хранит конечный статус получателя); набор
   `suite::lifecycle::queue_list`. По сравнению с карточкой: оба метода принимают `now` (время передаёт вызывающий, как у `claim`);
   `retry` возвращает `bool` (`false` — запись под лизой); `MemQueue` реализует методы в этой волне — иначе набору не на чем пройти.
+- 2026-11-14 — CTR-92 (x/inbound-mail-only, решение 123 «Снаружи — только почта»): `schedule::ItipSource::{Internal, Imip}` заменён
+  типом отправителя `schedule::SenderKind::{Own, Partner, Neighbor, External}` (поле `ItipMessage::sender` вместо `source`): путь
+  сообщения не отвечает на вопрос «что можно» — письмо через smtp-in с адресом своего домена и письмо соседней организации установки
+  шли одним `Imip`. Матрица «кто — что» — `schedule::inbound_allowed(SenderKind, InboundAction) -> bool`, действия
+  `InboundAction::{Invite, Update, Reply, Cancel, Other, Booking}` (`InboundAction::of(method, resource, update)`): единственное место решения
+  «применять, бронировать, отвечать», позже — настройка администратора с теми же значениями по умолчанию. Несовместимо: поле и тип
+  `ItipMessage` (вызывающие — `tp-smtp`, `tp-dav`, `tp-testkit` — в той же волне).
 - 2026-11-14 — CTR-91 (x/contracts-62, решение 122): `branding::{BrandingStore, Branding, BrandingLevels, EffectiveBranding,
   BrandingScope, BrandColor, BrandLogo, Theme, Role, CliRole, Palette, ContrastPair, ContrastIssue, OrgContrastIssue,
-  installation_change_issues, CONTRAST, CLI_BACKGROUNDS,
-  CLI_MIN_CONTRAST, MAX_PRODUCT_NAME, MAX_LOGO_SIZE, MAX_LOGO_SIDE}` — брендинг заказчика: все роли `design/tokens.toml`, обязательных
-  полей нет, незаданное — с уровня выше (организация → установка → IT TASK), вывод ролей из основного цвета, контраст без исключений, проверка смены установки по организациям, страховка
-  отрисовки;
+  installation_change_issues, CONTRAST, CLI_BACKGROUNDS, CLI_MIN_CONTRAST, MAX_PRODUCT_NAME, MAX_LOGO_SIZE, MAX_LOGO_SIDE}` —
+  брендинг заказчика: все роли `design/tokens.toml`, обязательных полей нет, незаданное — с уровня выше (организация → установка →
+  IT TASK), вывод ролей из основного цвета, контраст без исключений, проверка смены установки по организациям, страховка отрисовки;
   раздел «Branding». In-memory — `MemBranding`; набор `suite::branding`. PostgreSQL — META-84, Admin API — ADM-48.

@@ -38,8 +38,9 @@
 //!   флаги, отброс, перенаправление, автоответ; перенаправленное письмо и внутренний автоответ — через правила
 //!   получателя с проверкой петли ([`Delivery::relay`], SMTP-34);
 //! - приглашения iTIP в письмах ([`Delivery::with_itip`], [`crate::itip`]): письмо с частью `text/calendar;
-//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя — smtp-in как iMIP (SMTP-33),
-//!   submission и [`Delivery::submit`] как внутреннее планирование (решение 78, SMTP-36); письмо остаётся в ящике,
+//!   method=…` после доставки в ящик передаётся `ItipDelivery` получателя с типом отправителя (решение 123):
+//!   submission и [`Delivery::submit`] — внутреннее планирование (решение 78, SMTP-36), smtp-in — iMIP (SMTP-33);
+//!   снаружи — только почта: что применять, решает матрица `inbound_allowed` приёма; письмо остаётся в ящике,
 //!   итог приёма — событие `Itip` журнала доставки (SMTP-37), сбой — только запись в журнал узла.
 //! - личные списки отправителей ящика ([`Delivery::with_sender_lists`], `SenderLists`, SMTP-25) — при каждой
 //!   доставке в ящик (smtp-in, submission, [`Delivery::submit`], пересылки и перенаправления): письмо
@@ -86,7 +87,7 @@ use tp_contracts::meta::{
 };
 use tp_contracts::queue::{DsnRet, Outbound, SubmitStatus, Submitted};
 use tp_contracts::retention::Quota;
-use tp_contracts::schedule::{ItipDelivery, ItipMessage, ItipSource};
+use tp_contracts::schedule::{ItipDelivery, ItipMessage, SenderKind};
 use tp_contracts::senders::{SenderLists, SenderVerdict};
 use tp_contracts::sieve::{AutoReply, DeliveryRules, MailboxRef, RulesInput, RulesOutcome};
 use tp_contracts::transport::{
@@ -220,6 +221,8 @@ pub struct Delivery {
     flow: Option<FlowDeps>,
     rules: Option<Arc<dyn DeliveryRules>>,
     itip: Option<Arc<dyn ItipDelivery>>,
+    /// Домены-партнёры организации (решение 123).
+    partners: Option<Arc<dyn PartnerDomains>>,
     /// Права отправки от чужого адреса (Send As, Send on Behalf) для приглашений из почтового клиента (SMTP-36).
     authz: Option<Arc<dyn Authorizer>>,
     senders: Option<Arc<dyn SenderLists>>,
@@ -327,6 +330,7 @@ impl Delivery {
             flow: None,
             rules: None,
             itip: None,
+            partners: None,
             authz: None,
             senders: None,
             policies: None,
@@ -379,11 +383,16 @@ impl Delivery {
     /// Приглашения iTIP в письмах: письмо с частью `text/calendar; method=…` после доставки в ящик передаётся `itip`
     /// для каждой учётной записи получателя, если `From` письма совпадает с `ORGANIZER` (сообщения организатора) или
     /// `ATTENDEE` (ответы участника) и ему можно доверять:
-    /// - smtp-in (iMIP, RFC 6047, SMTP-33) — письмо прошло DMARC, источник `ItipSource::Imip`;
     /// - submission и [`Delivery::submit`] (решение 78, SMTP-36) — `From` принадлежит учётной записи отправителя
     ///   (вошедшей в сеанс submission; у [`Delivery::submit`] — по отправителю конверта): её адрес, псевдоним
-    ///   (`Account::addresses`) или право Send As / Send on Behalf ([`Delivery::with_authz`]); источник
-    ///   `ItipSource::Internal`. Иначе — только письмо.
+    ///   (`Account::addresses`) или право Send As / Send on Behalf ([`Delivery::with_authz`]);
+    /// - smtp-in (iMIP, RFC 6047, SMTP-33; в том числе через шлюз Edge) — письмо прошло DMARC.
+    ///
+    /// Иначе — только письмо. С сообщением передаётся тип отправителя (`SenderKind`, решение 123, SMTP-49): своя
+    /// организация — вошедший (внутренний путь); письмо через smtp-in — по домену `From`: адрес своего домена —
+    /// внешний, домен-партнёр ([`Delivery::with_partners`]), другая организация установки (MSSP), внешний. Что
+    /// применять, бронировать и на что отвечать, решает приём iTIP по матрице `tp_contracts::schedule::inbound_allowed`
+    /// (снаружи — только почта; ответы и отмены к существующим событиям — как у Exchange и Google).
     ///
     /// Представитель (SMTP-38): `From` совпал с `SENT-BY` организатора или участника — сообщение передаётся от имени
     /// владельца (`ItipMessage::from`), если `From` принадлежит учётной записи отправителя и у неё есть право Send As
@@ -394,6 +403,13 @@ impl Delivery {
     /// журнала доставки на получателя (SMTP-37, `delivery::itip_record`), сбой — только запись в журнал узла.
     pub fn with_itip(mut self, itip: Arc<dyn ItipDelivery>) -> Self {
         self.itip = Some(itip);
+        self
+    }
+
+    /// Домены-партнёры организации (решение 123): письмо iMIP с них через smtp-in — от отправителя
+    /// `SenderKind::Partner` ([`Delivery::with_itip`]). Без них партнёров нет.
+    pub fn with_partners(mut self, partners: Arc<dyn PartnerDomains>) -> Self {
+        self.partners = Some(partners);
         self
     }
 
@@ -428,7 +444,7 @@ impl Delivery {
             }
             Some(Ok(m)) => m,
         };
-        let source = match origin {
+        let internal = match origin {
             ItipOrigin::Imip { dmarc_pass: false } => {
                 tracing::info!(%id, reason = "отправитель не прошёл DMARC", "smtp: сообщение iTIP не применено");
                 return steps;
@@ -438,7 +454,7 @@ impl Delivery {
                 tracing::info!(%id, reason = "представитель (SENT-BY) извне", "smtp: сообщение iTIP не применено");
                 return steps;
             }
-            ItipOrigin::Imip { dmarc_pass: true } => ItipSource::Imip,
+            ItipOrigin::Imip { dmarc_pass: true } => false,
             ItipOrigin::Internal { account, principal } => {
                 // `From` — адрес отправителя; у представителя (`SENT-BY`, SMTP-38) — ещё и право Send As или Send on
                 // Behalf на адрес владельца: то же право, что у письма от имени владельца.
@@ -457,7 +473,16 @@ impl Delivery {
                     tracing::info!(%id, %account, "smtp: From приглашения не принадлежит отправителю, осталось письмом");
                     return steps;
                 }
-                ItipSource::Internal
+                true
+            }
+        };
+        // Кто отправитель: вошедший — своя организация, письмо через smtp-in — по домену `From`; что ему можно, решает
+        // приём iTIP по матрице решения 123 (`inbound_allowed`).
+        let sender = match self.sender_kind(&msg.from, internal).await {
+            Ok(kind) => kind,
+            Err(e) => {
+                tracing::warn!(%id, error = %e, "smtp: сбой проверки домена отправителя приглашения");
+                return steps;
             }
         };
         let mut seen = HashSet::new();
@@ -480,7 +505,7 @@ impl Delivery {
                 from: msg.from.clone(),
                 method: msg.method,
                 ics: msg.ics.clone(),
-                source,
+                sender,
             };
             match delivery.deliver(&message).await {
                 Ok(outcome) => {
@@ -493,6 +518,53 @@ impl Delivery {
             }
         }
         steps
+    }
+
+    /// Организация адреса `address`: принятый домен кластера, совпавший с доменом адреса или ближайшим из
+    /// родительских (поддомен принадлежит организации домена); `None` — домен вне установки.
+    async fn org_of(&self, address: &str) -> Result<Option<TenantId>> {
+        let Some((_, domain)) = address.rsplit_once('@') else {
+            return Ok(None);
+        };
+        let domain = domain.to_lowercase();
+        let mut name = domain.as_str();
+        loop {
+            if let Some(d) = self.accepted(name).await? {
+                return Ok(Some(d.tenant));
+            }
+            match name.split_once('.') {
+                Some((_, parent)) if parent.contains('.') => name = parent,
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// Тип отправителя `from` относительно организации узла (решение 123). Своя организация
+    /// ([`SenderKind::Own`]) — по входу, а не по домену: внутренний путь (`internal`), `From` которого принадлежит
+    /// вошедшей учётной записи. Письмо через smtp-in — по домену `From` (ближайший принятый домен — сам или
+    /// родитель): домен своей организации — [`SenderKind::External`] (DMARC проходит и сторонний сервис,
+    /// разрешённый в SPF или DKIM домена), домен-партнёр ([`Delivery::with_partners`]) — [`SenderKind::Partner`],
+    /// принятый домен другой организации установки — [`SenderKind::Neighbor`], иначе — [`SenderKind::External`].
+    async fn sender_kind(&self, from: &str, internal: bool) -> Result<SenderKind> {
+        if internal {
+            return Ok(SenderKind::Own);
+        }
+        let org = self.org_of(from).await?;
+        if org == Some(self.deps.tenant) {
+            return Ok(SenderKind::External);
+        }
+        if let (Some(partners), Some((_, domain))) = (&self.partners, from.rsplit_once('@'))
+            && partners
+                .is_partner(self.deps.tenant, &domain.to_lowercase())
+                .await?
+        {
+            return Ok(SenderKind::Partner);
+        }
+        Ok(if org.is_some() {
+            SenderKind::Neighbor
+        } else {
+            SenderKind::External
+        })
     }
 
     /// Право учётной записи `account` организации узла на адрес отправителя `from` (решение 78, SMTP-45): её адрес
@@ -2900,6 +2972,16 @@ pub(crate) async fn read_blob(blobs: &dyn BlobStore, key: &tp_contracts::BlobKey
     use futures::TryStreamExt;
     let chunks: Vec<Bytes> = blobs.get(key, None).await?.try_collect().await?;
     Ok(chunks.concat().into())
+}
+
+/// Домены-партнёры организации — официально установленные доверительные отношения (решение 123): отправитель письма
+/// iMIP с них — `SenderKind::Partner` ([`Delivery::with_partners`]). Источник списка — политика организации (шаблоны
+/// ссылок занятости доменов-партнёров, META-34; хранилища ещё нет — узел список не подключает).
+#[async_trait]
+pub trait PartnerDomains: Send + Sync + 'static {
+    /// Домен `domain` (строчными) — партнёр организации `tenant`: заведён в её политике сам или его родительский
+    /// домен.
+    async fn is_partner(&self, tenant: TenantId, domain: &str) -> Result<bool>;
 }
 
 /// Откуда письмо с iTIP и чем подтверждается его `From` ([`Delivery::with_itip`]).

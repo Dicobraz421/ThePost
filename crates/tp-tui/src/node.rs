@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -309,9 +310,11 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Записать значение параметра `path` (`None` — убрать, действует значение по умолчанию): файл не изменился с
-/// чтения (`loaded`), не помечен и доступен на запись; новый текст проходит `thepost config check` (ошибка у поля —
-/// строка проверки с путём параметра); прежний файл копируется в `config.yaml.bak`; файл пишется на месте (владелец
-/// и права сохраняются).
+/// чтения (`loaded`), не помечен и доступен на запись. Замена атомарная, как у `visudo`: новый текст пишется во
+/// временный файл в том же каталоге (права и владелец — как у прежнего файла, данные сброшены на диск), временный
+/// файл проходит `thepost config check` (ошибка у поля — строка проверки с путём параметра), прежний файл
+/// копируется в `config.yaml.bak`, временный переименовывается поверх. Узел и сбой посередине видят либо прежний
+/// файл, либо новый целиком. Символическая ссылка остаётся ссылкой: заменяется файл, на который она указывает.
 pub fn save(
     node: &NodeConfig,
     loaded: &str,
@@ -337,19 +340,71 @@ pub fn save(
     set(&mut doc, path, value);
     let body = node.host.render(&doc).map_err(SaveError::file)?;
     let new_text = format!("{}{body}", header(&text));
-    let check = sibling(file, ".check");
-    fs::write(&check, &new_text)
-        .map_err(|e| SaveError::file(format!("{}: {e}", check.display())))?;
-    let checked = node.host.check(&check);
-    let _ = fs::remove_file(&check);
-    if let Err(e) = checked {
-        return Err(field_error(&e, &path.join(".")));
-    }
+    let target =
+        fs::canonicalize(file).map_err(|e| SaveError::file(format!("{}: {e}", file.display())))?;
+    let tmp = sibling(&target, &format!(".{}.tmp", std::process::id()));
     let backup = sibling(file, ".bak");
-    fs::copy(file, &backup)
+    let replaced = replace(node, &target, &tmp, &backup, &new_text, &path.join("."));
+    if replaced.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    replaced.map(|()| Saved { backup })
+}
+
+/// Атомарная замена `target` текстом `text` через временный файл `tmp` (шаги — у [`save`]); при ошибке `tmp`
+/// убирает вызывающий код.
+fn replace(
+    node: &NodeConfig,
+    target: &Path,
+    tmp: &Path,
+    backup: &Path,
+    text: &str,
+    key: &str,
+) -> Result<(), SaveError> {
+    let meta =
+        fs::metadata(target).map_err(|e| SaveError::file(format!("{}: {e}", target.display())))?;
+    write_temp(tmp, text, &meta).map_err(|e| SaveError::file(format!("{}: {e}", tmp.display())))?;
+    node.host.check(tmp).map_err(|e| field_error(&e, key))?;
+    fs::copy(target, backup)
         .map_err(|e| SaveError::file(format!("резервная копия {}: {e}", backup.display())))?;
-    fs::write(file, new_text).map_err(|e| SaveError::file(format!("{}: {e}", file.display())))?;
-    Ok(Saved { backup })
+    fs::rename(tmp, target).map_err(|e| SaveError::file(format!("{}: {e}", target.display())))?;
+    // Запись в каталоге (новое имя файла) — тоже на диск; файл уже заменён, поэтому сбой здесь не ошибка записи.
+    if let Some(dir) = target.parent() {
+        let _ = sync_dir(dir);
+    }
+    Ok(())
+}
+
+/// Временный файл с текстом `text`: владелец и права — как у `meta` (до этого — только владельцу), данные на диске.
+fn write_temp(tmp: &Path, text: &str, meta: &fs::Metadata) -> io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    f.write_all(text.as_bytes())?;
+    // Сначала владелец: смена владельца сбрасывает биты setuid/setgid, права ставятся после.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, fchown};
+        fchown(&f, Some(meta.uid()), Some(meta.gid()))?;
+    }
+    f.set_permissions(meta.permissions())?;
+    f.sync_all()
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Каталог на Windows не открыть как файл; переименование там журналируется файловой системой.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Ошибка проверки у правленого параметра `key`, если строка проверки называет его (или вложенный параметр).
@@ -537,8 +592,22 @@ pub(crate) mod tests {
             "{err:?}"
         );
         assert_eq!(fs::read_to_string(&node.path).expect("файл"), text);
-        assert!(!dir.0.join("config.yaml.bak").exists());
-        assert!(!dir.0.join("config.yaml.check").exists());
+        assert_eq!(names(&dir), ["config.yaml"], "временный файл убран");
+    }
+
+    /// Имена файлов каталога теста по порядку.
+    fn names(dir: &Dir) -> Vec<String> {
+        let mut out: Vec<String> = fs::read_dir(&dir.0)
+            .expect("каталог")
+            .map(|e| {
+                e.expect("запись")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// Верное значение: резервная копия прежнего файла, новый текст с заголовком-комментарием.
@@ -557,6 +626,8 @@ pub(crate) mod tests {
         .expect("запись");
         assert_eq!(saved.backup, dir.0.join("config.yaml.bak"));
         assert_eq!(fs::read_to_string(&saved.backup).expect("копия"), text);
+        // Временный файл переименован поверх: рядом — только файл и резервная копия.
+        assert_eq!(names(&dir), ["config.yaml", "config.yaml.bak"]);
         let new = load(&node).expect("чтение");
         assert!(new.text.starts_with("# Узел 1\n"), "{}", new.text);
         assert_eq!(
@@ -572,6 +643,41 @@ pub(crate) mod tests {
         // Файл изменили после чтения — запись отказывает.
         let err = save(&node, &new.text, &key(&["domain"]), Some(json!("x"))).expect_err("отказ");
         assert!(err.message.contains("изменён после чтения"), "{err:?}");
+    }
+
+    /// Файл заменяется, а не переписывается на месте: новый inode, права и владелец прежнего файла; ссылка
+    /// остаётся ссылкой, заменяется файл, на который она указывает.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_keeps_mode_owner_and_symlink() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let dir = Dir::new();
+        let real = dir.0.join("node.yaml");
+        fs::write(&real, "{\"domain\": \"it-task.ru\"}\n").expect("запись");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).expect("права");
+        let link = dir.0.join("config.yaml");
+        symlink(&real, &link).expect("ссылка");
+        let node = NodeConfig {
+            path: link.clone(),
+            host: Arc::new(FakeHost),
+        };
+        let before = fs::metadata(&real).expect("файл");
+        let file = load(&node).expect("чтение");
+        save(&node, &file.text, &key(&["domain"]), Some(json!("x.ru"))).expect("запись");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("ссылка")
+                .file_type()
+                .is_symlink()
+        );
+        let after = fs::metadata(&real).expect("файл");
+        assert_ne!(after.ino(), before.ino(), "замена, а не запись на месте");
+        assert_eq!(after.mode() & 0o7777, 0o640);
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(load(&node).expect("чтение").doc, json!({"domain": "x.ru"}));
+        assert_eq!(names(&dir), ["config.yaml", "config.yaml.bak", "node.yaml"]);
     }
 
     /// Помеченный файл — только чтение: запись отказывает, файл не тронут.

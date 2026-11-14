@@ -869,6 +869,39 @@
 | [UI-22](UI-22.md) | консоль — брендинг заказчика: тема из действующего брендинга, знак на входе и в шапке, настройка | console | A | console-13 | todo | UI-19,ADM-48 |
 | [TUI-08](TUI-08.md) | текстовый интерфейс — тема поверх действующего брендинга, знак на экране входа | tui | A | tui-05 | todo | TUI-06,ADM-48 |
 | [DOC-11](DOC-11.md) | INSTALL — брендинг заказчика | docs | A | docs-11 | todo | ADM-48 |
+| [CTR-93](CTR-93.md) | контракт политики доверия — типы абонентов, функции, уровни, потолок, безопасные умолчания | contracts | B | contracts-64 | ready | CTR-92 |
+| [META-85](META-85.md) | политика доверия в PostgreSQL — `TrustStore` в `PgMeta`, внешний текст автоответа | meta | A | meta-58 | todo | CTR-93 |
+| [ADM-49](ADM-49.md) | политика доверия в Admin API — маршруты уровней, проверка потолка, партнёры, CLI | admin | B | admin-35 | todo | CTR-93,ADM-44 |
+| [UI-23](UI-23.md) | консоль — экран «Доверие»: матрица типов абонентов и функций, уровни, партнёры | console | A | console-14 | todo | ADM-49 |
+| [TUI-09](TUI-09.md) | текстовый интерфейс — раздел «Доверие»: матрица, уровни, партнёры | tui | A | tui-06 | todo | TUI-03,ADM-49 |
+| [SMTP-50](SMTP-50.md) | матрица доверия в SMTP — тип абонента, автоответ, MDN, DSN, группы, автопересылка | smtp | A | smtp-30 | todo | CTR-93,SMTP-49 |
+| [DAV-44](DAV-44.md) | матрица доверия в CalDAV и CardDAV — iTIP извне, занятость, общий доступ, публикация, GAL | dav | A | dav-21 | todo | CTR-93,DAV-43 |
+| [JMAP-47](JMAP-47.md) | матрица доверия в JMAP — принципалы и занятость своей организации, общий доступ, публикация, внешний автоответ | jmap | A | jmap-30 | todo | CTR-93 |
+| [SIEVE-14](SIEVE-14.md) | `processcalendar` (RFC 9671), расширение `vnd.thepost.peer`, админский скрипт — только сужение | sieve | A | sieve-07 | todo | CTR-93 |
+| [APP-76](APP-76.md) | узел — политика доверия в точках решения (SMTP, DAV, JMAP, Sieve, Admin API) | app | A | app-73 | todo | META-85,ADM-49,SMTP-50,DAV-44,JMAP-47,SIEVE-14 |
+| [DOC-12](DOC-12.md) | ADMIN-GUIDE — сверка раздела «Кто с кем и что может» с кодом | docs | A | docs-12 | todo | APP-76 |
+| [DEPS-18](DEPS-18.md) | зависимости метки ответа и BATV — `chacha20poly1305`, `hmac`, `sha1` в tp-smtp | deps | B | deps-18 | ready | — |
+| [CTR-94](CTR-94.md) | контракты ответа и беседы — запись об отправленном, ключи меток, беседа, удержание и действия по беседе | contracts | B | contracts-65 | todo | CTR-93 |
+| [META-86](META-86.md) | запись об отправленном и беседы в PostgreSQL — `SentLog`, `ThreadStore`, удержание и действия по беседе | meta | A | meta-59 | todo | CTR-94 |
+| [MS-21](MS-21.md) | приём письма — беседа и политики беседы в той же транзакции | mailstore | A | mailstore-15 | todo | CTR-94 |
+| [SMTP-51](SMTP-51.md) | ответ на наше письмо — метка в Message-ID, BATV, признак ответа, память беседы | smtp | A | smtp-31 | todo | CTR-94,DEPS-18,SMTP-50 |
+| [JMAP-48](JMAP-48.md) | Thread — неизменяемый `threadId` и действия по беседе | jmap | A | jmap-31 | todo | CTR-94,MS-21 |
+| [ADM-50](ADM-50.md) | удержание беседы в Admin API — удержать, снять, перечислить, выгрузить; CLI | admin | B | admin-36 | todo | CTR-94,ADM-44 |
+| [APP-77](APP-77.md) | узел — ответ на наше письмо и беседы: ключи меток, `SentLog`, `ThreadStore` | app | A | app-74 | todo | META-86,MS-21,SMTP-51,JMAP-48,ADM-50 |
+| [DEP-56](DEP-56.md) | Rspamd — балл за признак ответа; ключи меток и BATV в поставке | deploy | A | deploy-43 | todo | SMTP-51 |
+| [DOC-13](DOC-13.md) | ADMIN-GUIDE — раздел «Ответы на наши письма и беседы» | docs | A | docs-13 | todo | APP-77,DEP-56 |
+| [DEPS-19](DEPS-19.md) | зависимости каталога признаков и TI — `ring` (Ed25519), `regex`, `publicsuffix`, `winnow`; `zip`, `infer`, `ipnet` в крейты | deps | B | deps-19 | ready | — |
+| [CTR-95](CTR-95.md) | контракт каталога признаков и источников TI — признаки, уровни, пакет поставщика, источники | contracts | B | contracts-66 | todo | CTR-94 |
+| [META-87](META-87.md) | каталог признаков и TI в PostgreSQL — `RiskStore` в `PgMeta`: пакеты, политика, источники, учёт | meta | A | meta-60 | todo | CTR-95 |
+| [SIEVE-15](SIEVE-15.md) | расширение `vnd.thepost.risk` — `signal`, `environment "vnd.thepost.*"`, `extlists`, `:regex` | sieve | A | sieve-08 | todo | CTR-95,DEPS-19,SIEVE-14 |
+| [SMTP-52](SMTP-52.md) | детекторы каталога признаков и применение балла на smtp-in | smtp | A | smtp-32 | todo | CTR-95,DEPS-19,SMTP-51 |
+| [ADM-51](ADM-51.md) | каталог признаков и TI в Admin API — признаки, пороги, пакеты, источники, срабатывания; CLI | admin | B | admin-37 | todo | CTR-95,ADM-44 |
+| [UI-24](UI-24.md) | консоль — экран «Признаки риска»: каталог, пороги, пакеты, источники TI, срабатывания | console | A | console-15 | todo | ADM-51 |
+| [TUI-10](TUI-10.md) | текстовый интерфейс — раздел «Признаки риска»: каталог, пороги, пакеты, источники | tui | A | tui-07 | todo | TUI-09,ADM-51 |
+| [APP-78](APP-78.md) | узел — подписанные пакеты признаков: проверка, установка, обновление, откат, офлайн-импорт | app | A | app-75 | todo | META-87,ADM-51,SMTP-52,SIEVE-15,DEPS-19 |
+| [APP-79](APP-79.md) | узел — источники TI: коннекторы «ключ заказчика», импорт txt/CSV/RPZ/MISP/STIX, TAXII 2.1, TTL | app | A | app-76 | todo | APP-78 |
+| [DEP-57](DEP-57.md) | доставка пакета признаков — исходники пакета, ключи, обновление и закрытый контур; фиды через Rspamd и ClamAV | deploy | A | deploy-44 | todo | APP-78,DEP-56 |
+| [DOC-14](DOC-14.md) | ADMIN-GUIDE — раздел «Признаки риска и threat intelligence» с таблицей лицензий фидов | docs | A | docs-14 | todo | APP-79,DEP-57 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
@@ -894,4 +927,7 @@
 | [DAV-41](DAV-41.md) | приглашение — только получателю из `ATTENDEE` | dav | A | — |
 | [DAV-42](DAV-42.md) | организатор письма извне с адресом организации — внешний для бронирования | dav | A | — |
 | [DOC-07](DOC-07.md) | ожидания APP-28 и CMP-10 по `inbox/`/`outbox/` и ленте уведомлений; значение по умолчанию в INSTALL | docs | A | DAV-36 |
+| [DOC-10](DOC-10.md) | INSTALL — входящая почта через шлюз, доверие к `Authentication-Results` | docs | A | SMTP-47 |
 | [META-80](META-80.md) | почтовые контакты в каталоге PostgreSQL (`Directory::contacts_since`) | meta | A | META-65 |
+| [SMTP-47](SMTP-47.md) | результаты шлюза — печать ARC домена шлюза и `header.from` письма | smtp | A | SMTP-20,SMTP-33 |
+| [SMTP-48](SMTP-48.md) | iTIP — письмо с несколькими заголовками `From` не применяется | smtp | A | SMTP-33 |
