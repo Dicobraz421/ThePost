@@ -114,8 +114,16 @@ async fn branding_migration_on_existing_db() {
         Ok(Some(own.clone())),
         "роли — из jsonb как заданы"
     );
+    // RLS действует на роль узлов `thepost_app` (владелец тестовой БД её обходит).
+    let as_app = async |tx: &mut sqlx::Transaction<'static, sqlx::Postgres>| {
+        sqlx::query("SET LOCAL ROLE thepost_app")
+            .execute(&mut **tx)
+            .await
+            .expect("role");
+    };
     let visible = async |tenant| -> Vec<Option<uuid::Uuid>> {
         let mut tx = schema::begin(&pool, tenant).await.expect("begin");
+        as_app(&mut tx).await;
         let rows =
             sqlx::query_scalar("SELECT tenant_id FROM branding ORDER BY tenant_id NULLS FIRST")
                 .fetch_all(&mut *tx)
@@ -129,6 +137,7 @@ async fn branding_migration_on_existing_db() {
 
     // Транзакция организации не меняет набор установки.
     let mut tx = schema::begin(&pool, foreign).await.expect("begin");
+    as_app(&mut tx).await;
     let deleted = sqlx::query("DELETE FROM branding WHERE tenant_id IS NULL")
         .execute(&mut *tx)
         .await
