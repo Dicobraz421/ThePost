@@ -39,6 +39,7 @@ use tp_contracts::meta::{AccountScope, AccountStore, MailboxStore, MessageQuery,
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
+use tp_contracts::sharing::SharingAuthorizer;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
@@ -84,6 +85,9 @@ pub struct Services {
     pub sasl: Arc<dyn SaslServer>,
     /// Права на папки и отправку от имени.
     pub authz: Arc<dyn Authorizer>,
+    /// Права на календари и адресные книги (AUTH-12, CTR-84): владелец, записи прав, представители, политика
+    /// организации поверх `PgMeta`; CalDAV, CardDAV и JMAP подключают его своими волнами.
+    pub collections: Arc<dyn SharingAuthorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL (книгу GAL тогда строит каталог `PgMeta`,
     /// [`Services::gal`]).
     pub directory: Option<Arc<dyn Directory>>,
@@ -259,6 +263,15 @@ impl Services {
             Arc::new(meta.clone()),
             Arc::new(meta.clone()),
         ));
+        let collections: Arc<dyn SharingAuthorizer> =
+            Arc::new(tp_auth::CollectionAuthorizer::new(tp_auth::SharingStores {
+                acl: Arc::new(meta.clone()),
+                delegates: Arc::new(meta.clone()),
+                policy: Arc::new(meta.clone()),
+                dav: Arc::new(meta.clone()),
+                groups: Arc::new(meta.clone()),
+                accounts: Arc::new(meta.clone()),
+            }));
         let directory = ldap.map(|l| l as Arc<dyn Directory>);
 
         // Поиск: индексы на узле, сегменты в BlobStore, кэш; счётчики кэша — в /metrics.
@@ -337,6 +350,7 @@ impl Services {
             authn,
             sasl,
             authz,
+            collections,
             gal_push,
             directory,
             oidc_issuer: auth.oidc.as_ref().map(|o| o.issuer.clone()),
