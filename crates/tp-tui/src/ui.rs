@@ -10,11 +10,12 @@ use ratatui::widgets::{Block, BorderType, Widget};
 use serde_json::Value;
 
 use crate::app::{
-    App, BODY_ROWS, CardView, LIST_ROWS, Level, ListView, LoginField, LoginForm, Main, Method,
-    Overlay, Panel, Stage, TreeRow, View,
+    App, BODY_ROWS, CardView, ConfigEdit, ConfigView, LIST_ROWS, Level, ListView, LoginField,
+    LoginForm, Main, Method, Overlay, Panel, Stage, TreeRow, View,
 };
 use crate::engine::{self, Form};
 use crate::layout::{self, Layout};
+use crate::node::Access;
 use crate::schema::{Kind, catalog};
 use crate::theme::{Role, Theme};
 use crate::tree::{NODE_CONFIG, SECTIONS};
@@ -222,9 +223,11 @@ impl Painter<'_> {
             Some(Overlay::Confirm(req)) => self.confirm(&body, req),
             Some(Overlay::Menu { sel }) => self.op_menu(&body, *sel),
             Some(Overlay::Help) => self.help(&body, m),
+            Some(Overlay::ConfigEdit(e)) => self.config_edit(&body, m, e),
             None => match &m.view {
                 View::List(l) => self.list(&body, l),
                 View::Card(c) => self.card(&body, c),
+                View::Config(c) => self.config(&body, c),
                 View::Info { title, lines } => {
                     self.put(body.x0, 4, title, Role::Text);
                     for (i, l) in lines.iter().enumerate() {
@@ -266,7 +269,20 @@ impl Painter<'_> {
                 }
                 TreeRow::Config => {
                     self.put_n(1, 18, &format!("◆ {NODE_CONFIG}"), Role::Text, LEFT - 2);
-                    self.put_n(3, 19, "config.yaml · на узле", Role::Muted, LEFT - 4);
+                    let (label, ro) = match &m.view {
+                        View::Config(c) => match &c.file.access {
+                            Access::Write => ("config.yaml · правка".to_owned(), false),
+                            Access::Managed(tool) => {
+                                (format!("config.yaml · {}", capitalized(tool)), true)
+                            }
+                            Access::ReadOnly(_) => ("config.yaml · нет права".to_owned(), true),
+                        },
+                        _ => ("config.yaml · на узле".to_owned(), false),
+                    };
+                    self.put_n(3, 19, &label, Role::Muted, LEFT - 8);
+                    if ro {
+                        self.put(LEFT - 5, 19, "R/O", Role::Warn);
+                    }
                     18
                 }
             };
@@ -327,7 +343,7 @@ impl Painter<'_> {
                 x += *wdt as u16 + 1;
             }
         }
-        self.scrollbar(b, l);
+        self.scrollbar(b, l.rows.len(), l.top);
         if let Some(row) = l.row() {
             let first = cols
                 .first()
@@ -358,15 +374,153 @@ impl Painter<'_> {
         self.put_n(b.x0, 19, &hint, Role::Muted, b.width());
     }
 
+    /// Конфигурация узла: дерево параметров схемы, значение или значение по умолчанию, описание и доступ.
+    fn config(&mut self, b: &Body, c: &ConfigView) {
+        let (nw, vx) = (22u16, b.x0 + 23);
+        let vw = b.x1 - vx + 1;
+        self.put_n(b.x0, 2, "Параметр", Role::Head, nw);
+        self.put_n(vx, 2, "Значение", Role::Head, vw);
+        let rows = c.rows();
+        let end = (c.top + LIST_ROWS).min(rows.len());
+        for (i, p) in rows[c.top.min(end)..end].iter().enumerate() {
+            let y = 3 + i as u16;
+            let sel = c.top + i == c.sel;
+            let line = match (sel, b.active) {
+                (true, true) => Some(Role::Sel),
+                (true, false) => Some(Role::SelI),
+                _ => None,
+            };
+            if let Some(r) = line {
+                self.fill(b.x0 - 1, b.x1 + 1, y, r);
+            }
+            let indent = "  ".repeat(p.path.len() - 1);
+            let name = if p.section {
+                let mark = if c.open.contains(&p.key()) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                format!("{indent}{mark} {}", p.name())
+            } else {
+                format!("{indent}  {}", p.name())
+            };
+            self.put_n(b.x0, y, &name, line.unwrap_or(Role::Text), nw);
+            let (value, role) = match (p.section, c.file.value(p)) {
+                (true, _) => (String::new(), Role::Muted),
+                (false, Some(v)) => (engine::cell(Some(v)), Role::Text),
+                (false, None) => match &p.default {
+                    Some(d) => (format!("{} (умолч.)", engine::cell(Some(d))), Role::Muted),
+                    None => ("—".to_owned(), Role::Muted),
+                },
+            };
+            self.put_n(vx, y, &value, line.unwrap_or(role), vw);
+        }
+        self.scrollbar(b, rows.len(), c.top);
+        if let Some(p) = c.selected() {
+            let d = if p.field.description.is_empty() {
+                p.key()
+            } else {
+                p.field.description.clone()
+            };
+            self.put_n(b.x0, 18, &d, Role::Muted, b.width());
+        }
+        match c.file.access.reason() {
+            Some(reason) => self.put_n(
+                b.x0,
+                19,
+                &format!("▲ только чтение: {reason}"),
+                Role::Warn,
+                b.width(),
+            ),
+            None => self.put_n(
+                b.x0,
+                19,
+                "Enter — правка · ←→ — секции · F2 — перечитать",
+                Role::Muted,
+                b.width(),
+            ),
+        }
+    }
+
+    /// Правка параметра конфигурации узла.
+    fn config_edit(&mut self, b: &Body, m: &Main, e: &ConfigEdit) {
+        let p = &e.param;
+        self.put_n(b.x0, 2, &p.key(), Role::TitleA, b.width());
+        let file = match &m.view {
+            View::Config(c) => c.file.path.display().to_string(),
+            _ => String::new(),
+        };
+        self.put_n(b.x0, 3, &file, Role::Muted, b.width());
+        for (i, l) in wrap(&p.field.description, b.width() as usize)
+            .iter()
+            .take(3)
+            .enumerate()
+        {
+            self.put_n(b.x0, 5 + i as u16, l, Role::Text, b.width());
+        }
+        let lw: u16 = 18;
+        let vx = b.x0 + lw + 1;
+        let vw = b.x1 - vx + 1;
+        self.put_n(b.x0, 9, "Значение", Role::Text, lw);
+        self.fill(vx, b.x1, 9, Role::Sel);
+        let n = e.value.chars().count();
+        let shown: String = if n > vw as usize {
+            e.value.chars().skip(n + 1 - vw as usize).collect()
+        } else {
+            e.value.clone()
+        };
+        self.put_n(vx, 9, &shown, Role::Sel, vw);
+        let default = p
+            .default
+            .as_ref()
+            .map_or_else(|| "—".to_owned(), |d| engine::cell(Some(d)));
+        self.put_n(b.x0, 10, "По умолчанию", Role::Muted, lw);
+        self.put_n(vx, 10, &default, Role::Muted, vw);
+        let mut kind = match p.field.kind {
+            Kind::Integer => "целое".to_owned(),
+            Kind::Number => "число".to_owned(),
+            Kind::Boolean => "да или нет · ←→".to_owned(),
+            Kind::List => "через запятую".to_owned(),
+            Kind::Json => "JSON".to_owned(),
+            Kind::Text => "текст".to_owned(),
+        };
+        if !p.field.choices.is_empty() {
+            kind = format!("{} · ←→", p.field.choices.join("|"));
+        }
+        self.put_n(b.x0, 11, "Вид", Role::Muted, lw);
+        self.put_n(vx, 11, &kind, Role::Muted, vw);
+        if let Some(err) = &e.error {
+            for (i, l) in wrap(&format!("× {err}"), b.width() as usize)
+                .iter()
+                .take(3)
+                .enumerate()
+            {
+                self.put_n(b.x0, 13 + i as u16, l, Role::Err, b.width());
+            }
+        }
+        let (hint, role) = if e.busy {
+            ("проверка: thepost config check…", Role::Muted)
+        } else {
+            ("Enter — проверить и записать (копия .bak)", Role::Muted)
+        };
+        self.put_n(b.x0, 18, hint, role, b.width());
+        self.put_n(
+            b.x0,
+            19,
+            "пусто — значение по умолчанию · Esc — отмена",
+            Role::Muted,
+            b.width(),
+        );
+    }
+
     /// Полоса прокрутки списка длиннее экрана.
-    fn scrollbar(&mut self, b: &Body, l: &ListView) {
-        if l.rows.len() <= LIST_ROWS {
+    fn scrollbar(&mut self, b: &Body, len: usize, top: usize) {
+        if len <= LIST_ROWS {
             return;
         }
         let track = LIST_ROWS as u16;
-        let len = l.rows.len().max(1);
         let thumb = ((LIST_ROWS * LIST_ROWS) / len).max(1) as u16;
-        let start = ((l.top * LIST_ROWS) / len) as u16;
+        let start = ((top * LIST_ROWS) / len) as u16;
         let role = if b.active { Role::FrameA } else { Role::Frame };
         for i in 0..track {
             let ch = if (start..start + thumb).contains(&i) {
@@ -407,7 +561,7 @@ impl Painter<'_> {
                 x += c.width + 1;
             }
         }
-        self.scrollbar(b, l);
+        self.scrollbar(b, l.rows.len(), l.top);
         let Some(row) = l.row() else {
             return;
         };
@@ -618,7 +772,7 @@ impl Painter<'_> {
         let op = match &m.view {
             View::List(l) => Some(l.req.op),
             View::Card(c) => Some(c.req.op),
-            View::Info { .. } => None,
+            View::Info { .. } | View::Config(_) => None,
         };
         if let Some(op) = op {
             for (i, l) in wrap(&op.summary.replace('\n', " "), b.width() as usize)
@@ -708,6 +862,14 @@ impl Body {
     fn width(&self) -> u16 {
         self.x1 - self.x0 + 1
     }
+}
+
+/// Слово с прописной буквы (`ansible` → `Ansible`).
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// Строки карточки: поле и значение; вложенные объекты — JSON одной строкой.
@@ -1008,6 +1170,178 @@ mod tests {
             rows[19]
         );
         assert!(rows[19].contains("90 %"), "{}", rows[19]);
+    }
+
+    /// Конфигурация узла на узле: дерево параметров, правка с проверкой `config check` до записи; ошибка — у поля.
+    #[test]
+    fn node_config_edit() {
+        use crate::app::{Effect, Overlay, Stage};
+        use crate::node::tests::Dir;
+        use crate::node::{load, save};
+
+        let dir = Dir::new();
+        let node = dir.node("{\"domain\": \"it-task.ru\"}\n");
+        let mut app = App::new(
+            Theme { mono: false },
+            LoginForm::new("https://node:9443".into(), false),
+        );
+        app.node = true;
+        app.on_login(Ok((crate::app::tests::who(), "node:9443".into())));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), vec![Effect::ConfigLoad]);
+        app.on_config(load(&node));
+        assert_eq!(app.keys()[1], "Перечит");
+        // ↓↓ — секция smtp, → — раскрыть, ↓↓↓ — max_size (greeting, limits, max_size).
+        for k in [
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Down,
+        ] {
+            app.on_key(key(k));
+        }
+        let (rows, _) = screen(&app);
+        let all = rows.join("\n");
+        assert!(
+            rows[2].contains("Параметр               Значение"),
+            "{}",
+            rows[2]
+        );
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| r.contains(name))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(
+            row(" domain ").contains("   domain               it-task.ru"),
+            "{all}"
+        );
+        assert!(all.contains("▾ smtp"), "{all}");
+        assert!(
+            row("max_size").contains("     max_size           10 (умолч.)"),
+            "{all}"
+        );
+        assert!(
+            rows[18].contains("Предельный размер письма."),
+            "{}",
+            rows[18]
+        );
+        assert!(rows[19].contains("config.yaml · правка"), "{}", rows[19]);
+        assert!(rows[22].contains("$ thepost config check"), "{}", rows[22]);
+
+        app.on_key(key(KeyCode::Enter));
+        for c in "500".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let fx = app.on_key(key(KeyCode::Enter));
+        let [
+            Effect::ConfigSave {
+                path,
+                value,
+                loaded,
+            },
+        ] = fx.as_slice()
+        else {
+            panic!("нет записи: {fx:?}");
+        };
+        // Неверное значение: config check отказывает, ошибка — у поля, файл не тронут.
+        let r = save(&node, loaded, path, value.clone());
+        assert!(app.on_config_saved(r).is_empty());
+        let (rows, _) = screen(&app);
+        let all = rows.join("\n");
+        assert!(all.contains("× smtp.max_size: invalid value: 500"), "{all}");
+        assert!(
+            rows[21].contains("× не записано: ошибка проверки"),
+            "{}",
+            rows[21]
+        );
+        let Stage::Main(m) = &app.stage else {
+            panic!("не вошли");
+        };
+        assert!(matches!(&m.overlay, Some(Overlay::ConfigEdit(e)) if !e.busy));
+        // Верное значение: записано с копией, файл перечитывается.
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        for c in "50".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let fx = app.on_key(key(KeyCode::Enter));
+        let [
+            Effect::ConfigSave {
+                path,
+                value,
+                loaded,
+            },
+        ] = fx.as_slice()
+        else {
+            panic!("нет записи: {fx:?}");
+        };
+        let r = save(&node, loaded, path, value.clone());
+        assert_eq!(app.on_config_saved(r), vec![Effect::ConfigLoad]);
+        assert!(dir.0.join("config.yaml.bak").exists());
+        app.on_config(load(&node));
+        let (rows, _) = screen(&app);
+        let all = rows.join("\n");
+        let max = rows
+            .iter()
+            .find(|r| r.contains("max_size"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(max.contains("     max_size           50 "), "{all}");
+        assert!(rows[21].contains("● записано, копия"), "{}", rows[21]);
+    }
+
+    /// Файл с меткой DEP-55 — только чтение с пояснением, где править.
+    #[test]
+    fn node_config_managed() {
+        use crate::node::load;
+        use crate::node::tests::Dir;
+
+        let dir = Dir::new();
+        let node = dir.node("# thepost: managed-by=ansible\n{\"domain\": \"it-task.ru\"}\n");
+        let mut app = App::new(
+            Theme { mono: false },
+            LoginForm::new("https://node:9443".into(), false),
+        );
+        app.node = true;
+        app.on_login(Ok((crate::app::tests::who(), "node:9443".into())));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::End));
+        app.on_key(key(KeyCode::Enter));
+        app.on_config(load(&node));
+        app.on_key(key(KeyCode::Enter));
+        let (rows, _) = screen(&app);
+        assert!(
+            rows[19].contains("config.yaml · Ansible R/O"),
+            "{}",
+            rows[19]
+        );
+        assert!(
+            rows[19].contains("▲ только чтение: файл управляется Ansible"),
+            "{}",
+            rows[19]
+        );
+        assert!(rows[21].contains("▲ только чтение"), "{}", rows[21]);
+        assert!(!rows.join("\n").contains("По умолчанию"));
+    }
+
+    /// Без доступа к файлу узла — пояснение, где править.
+    #[test]
+    fn node_config_elsewhere() {
+        let mut app = with_accounts();
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::End));
+        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+        let (rows, _) = screen(&app);
+        assert!(
+            rows.join("\n")
+                .contains("Правка config.yaml — на самом узле")
+        );
     }
 
     #[test]

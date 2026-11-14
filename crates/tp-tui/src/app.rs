@@ -2,7 +2,7 @@
 //! Сети здесь нет: действия возвращают [`Effect`], ответы Admin API приходят в [`App::on_result`] — поэтому экран
 //! проверяется тестами без узла.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
@@ -11,6 +11,7 @@ use tp_admin::server::WhoAmI;
 use crate::cli;
 use crate::engine::{self, Context, Form, Request, ScreenKind};
 use crate::layout::{self, Act, Layout, Rows};
+use crate::node::{ConfigFile, Param, SaveError, Saved};
 use crate::schema::{Kind, Operation, catalog};
 use crate::theme::Theme;
 use crate::tree::{ORG_ROWS, SECTIONS};
@@ -30,6 +31,20 @@ pub const KEYS: [&str; 10] = [
     "",
     "Создать",
     "Удалить",
+    "Меню",
+    "Выход",
+];
+
+/// Подписи F-клавиш конфигурации узла.
+pub const CONFIG_KEYS: [&str; 10] = [
+    "Помощь",
+    "Перечит",
+    "",
+    "Правка",
+    "",
+    "",
+    "",
+    "",
     "Меню",
     "Выход",
 ];
@@ -234,6 +249,17 @@ pub enum Effect {
     Login(LoginRequest),
     /// Запрос к Admin API; ответ — [`App::on_result`] с тем же номером.
     Call(u64, Request),
+    /// Прочитать `config.yaml` узла; ответ — [`App::on_config`].
+    ConfigLoad,
+    /// Записать значение параметра конфигурации узла; ответ — [`App::on_config_saved`].
+    ConfigSave {
+        /// Путь параметра.
+        path: Vec<String>,
+        /// Значение; `None` — убрать (действует значение по умолчанию).
+        value: Option<Value>,
+        /// Текст файла на момент чтения.
+        loaded: String,
+    },
     /// Выйти из интерфейса.
     Quit,
 }
@@ -346,6 +372,56 @@ pub enum View {
     List(ListView),
     /// Карточка.
     Card(CardView),
+    /// Конфигурация узла.
+    Config(ConfigView),
+}
+
+/// Конфигурация узла: дерево параметров схемы со значениями файла.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigView {
+    /// Прочитанный файл.
+    pub file: ConfigFile,
+    /// Раскрытые секции (ключи через точку).
+    pub open: BTreeSet<String>,
+    /// Выделенная строка.
+    pub sel: usize,
+    /// Первая видимая строка.
+    pub top: usize,
+}
+
+impl ConfigView {
+    /// Видимые строки дерева.
+    pub fn rows(&self) -> Vec<&Param> {
+        self.file.visible(&self.open)
+    }
+
+    /// Выделенный параметр.
+    pub fn selected(&self) -> Option<&Param> {
+        self.rows().get(self.sel).copied()
+    }
+
+    fn select(&mut self, sel: usize) {
+        let n = self.rows().len();
+        self.sel = sel.min(n.saturating_sub(1));
+        if self.sel < self.top {
+            self.top = self.sel;
+        } else if self.sel >= self.top + LIST_ROWS {
+            self.top = self.sel + 1 - LIST_ROWS;
+        }
+    }
+}
+
+/// Правка значения параметра конфигурации узла.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigEdit {
+    /// Параметр.
+    pub param: Param,
+    /// Введённое значение; пустое — убрать (действует значение по умолчанию).
+    pub value: String,
+    /// Ошибка проверки у поля или отказ записи.
+    pub error: Option<String>,
+    /// Идёт проверка и запись.
+    pub busy: bool,
 }
 
 impl View {
@@ -354,7 +430,7 @@ impl View {
         match self {
             Self::List(l) => l.layout,
             Self::Card(c) => c.back.as_ref().and_then(|b| b.layout),
-            Self::Info { .. } => None,
+            Self::Info { .. } | Self::Config(_) => None,
         }
     }
 }
@@ -408,6 +484,8 @@ pub enum Overlay {
     Lookup(Box<Form>, Then),
     /// Подтверждение удаления.
     Confirm(Request),
+    /// Правка параметра конфигурации узла.
+    ConfigEdit(ConfigEdit),
 }
 
 /// Состояние основного экрана.
@@ -429,6 +507,8 @@ pub struct Main {
     pub view: View,
     /// Окно поверх правой панели.
     pub overlay: Option<Overlay>,
+    /// Интерфейс запущен на узле с доступом к `config.yaml`.
+    pub node: bool,
 }
 
 /// Строка дерева.
@@ -555,6 +635,8 @@ pub struct App {
     pub theme: Theme,
     /// Этап.
     pub stage: Stage,
+    /// Интерфейс запущен на узле с доступом к `config.yaml` (раздел «Конфигурация узла» правит файл).
+    pub node: bool,
     bus: Bus,
 }
 
@@ -564,6 +646,7 @@ impl App {
         Self {
             theme,
             stage: Stage::Login(login),
+            node: false,
             bus: Bus::default(),
         }
     }
@@ -584,6 +667,9 @@ impl App {
         let Stage::Main(m) = &self.stage else {
             return KEYS;
         };
+        if matches!(m.view, View::Config(_)) && m.overlay.is_none() {
+            return CONFIG_KEYS;
+        }
         let Some(l) = m.view.layout().filter(|_| m.overlay.is_none()) else {
             return KEYS;
         };
@@ -647,6 +733,7 @@ impl App {
                 lines: Vec::new(),
             },
             overlay: None,
+            node: self.node,
         });
         let mut out = Vec::new();
         if let Some(op) = catalog().get("list_orgs")
@@ -657,6 +744,73 @@ impl App {
         out.extend(open_tree(&mut m, &mut self.bus));
         self.stage = Stage::Main(m);
         out
+    }
+
+    /// Прочитанный `config.yaml` узла (или ошибка чтения).
+    pub fn on_config(&mut self, result: Result<ConfigFile, String>) {
+        let Stage::Main(m) = &mut self.stage else {
+            return;
+        };
+        match result {
+            Ok(file) => {
+                let (open, sel) = match &m.view {
+                    View::Config(c) => (c.open.clone(), c.sel),
+                    _ => (BTreeSet::new(), 0),
+                };
+                let mut v = ConfigView {
+                    file,
+                    open,
+                    sel: 0,
+                    top: 0,
+                };
+                v.select(sel);
+                if let Some(reason) = v.file.access.reason() {
+                    self.bus
+                        .say(Level::Warn, format!("только чтение: {reason}"));
+                }
+                m.view = View::Config(v);
+            }
+            Err(e) => {
+                m.view = View::Info {
+                    title: crate::tree::NODE_CONFIG.to_owned(),
+                    lines: vec![e.clone()],
+                };
+                self.bus.say(Level::Err, e);
+            }
+        }
+    }
+
+    /// Итог записи параметра конфигурации узла: ошибка — у поля правки; записано — файл перечитывается.
+    pub fn on_config_saved(&mut self, result: Result<Saved, SaveError>) -> Vec<Effect> {
+        let Stage::Main(m) = &mut self.stage else {
+            return Vec::new();
+        };
+        match result {
+            Ok(saved) => {
+                m.overlay = None;
+                self.bus.say(
+                    Level::Ok,
+                    format!(
+                        "записано, копия — {}; узел перечитает файл без перезапуска",
+                        saved.backup.display()
+                    ),
+                );
+                vec![Effect::ConfigLoad]
+            }
+            Err(e) => {
+                if let Some(Overlay::ConfigEdit(edit)) = &mut m.overlay {
+                    edit.busy = false;
+                    edit.error = Some(e.message.clone());
+                }
+                let what = if e.at_field {
+                    "не записано: ошибка проверки"
+                } else {
+                    "не записано"
+                };
+                self.bus.say(Level::Err, format!("{what}: {}", e.message));
+                Vec::new()
+            }
+        }
     }
 
     /// Адрес и код входа с устройства.
@@ -787,6 +941,7 @@ fn main_command(m: &Main) -> String {
                 .map(|op| show(&Form::new(op, &m.ctx(), false, &Map::new()).preview()))
                 .unwrap_or_default();
         }
+        Some(Overlay::ConfigEdit(_)) => return "thepost config check".to_owned(),
         Some(Overlay::Help) | None => {}
     }
     if m.focus == Panel::Tree {
@@ -812,6 +967,7 @@ fn main_command(m: &Main) -> String {
             }
         }
         View::Card(c) => show(&c.req),
+        View::Config(_) => "thepost config check".to_owned(),
         View::Info { .. } => String::new(),
     }
 }
@@ -1054,6 +1210,17 @@ fn open_tree(m: &mut Main, bus: &mut Bus) -> Vec<Effect> {
             m.tree = 0;
             open_tree(m, bus)
         }
+        Some(TreeRow::Config) if m.node => {
+            m.section = crate::tree::NODE_CONFIG.to_owned();
+            m.focus = Panel::Main;
+            if !matches!(m.view, View::Config(_)) {
+                m.view = View::Info {
+                    title: crate::tree::NODE_CONFIG.to_owned(),
+                    lines: vec!["чтение config.yaml…".to_owned()],
+                };
+            }
+            vec![Effect::ConfigLoad]
+        }
         Some(TreeRow::Config) => {
             m.section = crate::tree::NODE_CONFIG.to_owned();
             m.view = View::Info {
@@ -1167,8 +1334,133 @@ fn view_key(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
             }
             Vec::new()
         }
+        View::Config(c) => config_key(c, bus, &mut m.overlay, key),
         View::Info { .. } => Vec::new(),
     }
+}
+
+/// Клавиши дерева конфигурации узла: ←→ и Enter — секции, Enter и F4 — правка параметра, F2 — перечитать.
+fn config_key(
+    c: &mut ConfigView,
+    bus: &mut Bus,
+    overlay: &mut Option<Overlay>,
+    key: KeyEvent,
+) -> Vec<Effect> {
+    let n = c.rows().len();
+    let sel = c.selected().cloned();
+    match key.code {
+        KeyCode::Up => c.select(c.sel.saturating_sub(1)),
+        KeyCode::Down => c.select(c.sel + 1),
+        KeyCode::PageUp => c.select(c.sel.saturating_sub(LIST_ROWS)),
+        KeyCode::PageDown => c.select(c.sel + LIST_ROWS),
+        KeyCode::Home => c.select(0),
+        KeyCode::End => c.select(n.saturating_sub(1)),
+        KeyCode::F(2) => return vec![Effect::ConfigLoad],
+        KeyCode::Right | KeyCode::Enter if sel.as_ref().is_some_and(|p| p.section) => {
+            let k = sel.map(|p| p.key()).unwrap_or_default();
+            if key.code == KeyCode::Enter && c.open.contains(&k) {
+                c.open.remove(&k);
+            } else {
+                c.open.insert(k);
+            }
+        }
+        KeyCode::Left => {
+            let Some(p) = sel else {
+                return Vec::new();
+            };
+            if p.section && c.open.remove(&p.key()) {
+                return Vec::new();
+            }
+            if p.path.len() > 1 {
+                let parent = p.path[..p.path.len() - 1].join(".");
+                if let Some(i) = c.rows().iter().position(|r| r.key() == parent) {
+                    c.select(i);
+                }
+            }
+        }
+        KeyCode::Enter | KeyCode::F(4) => {
+            let Some(p) = sel.filter(|p| !p.section) else {
+                return Vec::new();
+            };
+            if let Some(reason) = c.file.access.reason() {
+                bus.say(Level::Warn, format!("только чтение: {reason}"));
+                return Vec::new();
+            }
+            let value = c
+                .file
+                .value(&p)
+                .map(|v| engine::text(v, p.field.kind))
+                .unwrap_or_default();
+            *overlay = Some(Overlay::ConfigEdit(ConfigEdit {
+                param: p,
+                value,
+                error: None,
+                busy: false,
+            }));
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Клавиши правки параметра конфигурации: Enter — проверить и записать (пусто — значение по умолчанию).
+fn config_edit_key(m: &mut Main, mut e: ConfigEdit, key: KeyEvent) -> Vec<Effect> {
+    if e.busy {
+        m.overlay = Some(Overlay::ConfigEdit(e));
+        return Vec::new();
+    }
+    let f = &e.param.field;
+    match key.code {
+        KeyCode::Esc => return Vec::new(),
+        KeyCode::Enter => {
+            let raw = e.value.trim();
+            let value = if raw.is_empty() {
+                Ok(None)
+            } else {
+                engine::parse(f, raw).map(Some)
+            };
+            let View::Config(c) = &m.view else {
+                return Vec::new();
+            };
+            match value {
+                Ok(value) => {
+                    let save = Effect::ConfigSave {
+                        path: e.param.path.clone(),
+                        value,
+                        loaded: c.file.text.clone(),
+                    };
+                    e.busy = true;
+                    e.error = None;
+                    m.overlay = Some(Overlay::ConfigEdit(e));
+                    return vec![save];
+                }
+                Err(err) => e.error = Some(err),
+            }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            let mut choices = f.choices.clone();
+            if f.kind == Kind::Boolean {
+                choices = vec!["да".to_owned(), "нет".to_owned()];
+            }
+            if !choices.is_empty() {
+                choices.insert(0, String::new());
+                let k = choices.len();
+                let j = match (choices.iter().position(|c| *c == e.value), key.code) {
+                    (None, _) => 0,
+                    (Some(i), KeyCode::Left) => (i + k - 1) % k,
+                    (Some(i), _) => (i + 1) % k,
+                };
+                e.value = choices[j].clone();
+            }
+        }
+        KeyCode::Backspace => {
+            e.value.pop();
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => e.value.push(ch),
+        _ => {}
+    }
+    m.overlay = Some(Overlay::ConfigEdit(e));
+    Vec::new()
 }
 
 /// Список (или карточка записи из него), над которым выполняется действие.
@@ -1205,7 +1497,7 @@ fn list_action(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
             },
             None => return Vec::new(),
         },
-        View::Info { .. } => return Vec::new(),
+        View::Info { .. } | View::Config(_) => return Vec::new(),
     };
     let n = match key.code {
         KeyCode::Enter => 3,
@@ -1409,6 +1701,7 @@ fn form_key(f: &mut Form, key: KeyEvent) -> FormKey {
 fn overlay_key(m: &mut Main, bus: &mut Bus, ov: Overlay, key: KeyEvent) -> Vec<Effect> {
     match ov {
         Overlay::Help => Vec::new(),
+        Overlay::ConfigEdit(e) => config_edit_key(m, e, key),
         Overlay::Menu { sel } => {
             let n = catalog().ops.len();
             let sel = match key.code {
