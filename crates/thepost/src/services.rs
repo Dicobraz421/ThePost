@@ -19,6 +19,11 @@
 //! Применённые сообщения во входящих планирования (`dav.schedule_keep_processed`) удаляет по сроку роль maintenance
 //! (`crate::roles::ItipPurge`, APP-53).
 //!
+//! Общий доступ к календарям и книгам (DAV-17, DAV-18, APP-71) — один слой прав на узел ([`Services::collections`]);
+//! CalDAV принимает выдачу прав `POST` (`cs:share`, `share-resource`) и состав групп представителей
+//! (`calendar-proxy`) в хранилища `PgMeta`. Приглашения переговорным и другим ресурсам (DAV-19) решает приём iTIP
+//! узла по правилам бронирования ресурса: ответ организатору организации — в его календарь, внешнему — письмом iMIP.
+//!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
 use std::net::IpAddr;
@@ -325,10 +330,22 @@ impl Services {
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
         // Приём iTIP — с настройками секции `dav` (календарь по умолчанию, входящие планирования, лимиты).
-        let itip = Arc::new(tp_dav::ItipInbox::new(
-            Arc::new(meta.clone()),
-            (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
-        ));
+        // Бронирование ресурсов (DAV-19, APP-71): правила, занятость и группы бронирующих — `PgMeta`; ответ внешнему
+        // организатору — письмом iMIP в очередь исходящей почты (с подписью DKIM). Доставка узла здесь не подходит:
+        // она сама держит этот приём iTIP (`Delivery::with_itip`).
+        let itip = Arc::new(
+            tp_dav::ItipInbox::new(
+                Arc::new(meta.clone()),
+                (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
+            )
+            .with_booking(tp_dav::BookingDeps {
+                accounts: Arc::new(meta.clone()),
+                resources: Arc::new(meta.clone()),
+                freebusy: Arc::new(meta.clone()),
+                group_store: Arc::new(meta.clone()),
+                sender: Some(Arc::new(tp_dav::ImipSender::new(queue.clone()))),
+            }),
+        );
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
@@ -432,7 +449,7 @@ impl Services {
             .with_authz(self.authz.clone()))
     }
 
-    /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
+    /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_shared`) и JMAP (`Jmap::with_schedule`): учётным
     /// записям организации сообщения iTIP кладутся прямо в календарь ([`Services::itip`]), остальным адресам —
     /// письмом iMIP через `outbound` (локальные получатели — в ящики, внешние — в очередь с подписью DKIM);
     /// занятость и группы рассылки (раскрытие вложенных групп участника, DAV-35) — из `PgMeta`.
@@ -597,6 +614,7 @@ impl Services {
     /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
     /// Планирование встреч (APP-28): приглашения, ответы и отмены рассылает сервер ([`Services::schedule`]);
     /// письма iMIP уходят через доставку SMTP с настройками `smtp`.
+    /// Общий доступ (APP-71): выдача прав `POST` и группы представителей `calendar-proxy` — в `PgMeta`.
     pub fn dav(
         &self,
         cfg: tp_dav::DavConfig,
@@ -610,8 +628,13 @@ impl Services {
             sharing: Some(self.collections.clone()),
         };
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
+        // Права на коллекции и представители (DAV-17, DAV-18) — записи `PgMeta`, те же, что читает `collections`.
+        let stores = tp_dav::SharingStores {
+            acl: Arc::new(self.meta.clone()),
+            delegates: Arc::new(self.meta.clone()),
+        };
         // Книгу GAL маршруты читают из хранилища, заполняет её `Services::gal`.
-        let router = tp_dav::router_with(deps, Some(self.schedule(outbound)), cfg);
+        let router = tp_dav::router_shared(deps, Some(self.schedule(outbound)), Some(stores), cfg);
         if !well_known {
             return Ok(router);
         }
