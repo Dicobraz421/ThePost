@@ -151,7 +151,7 @@ Compose и Ansible его не копируют, а подставляют зн�
 | `database.url` | `localhost`, CA `/etc/thepost/pki` | `postgres-tls`, CA тома `tls` | `thepost_db_url` (+ `thepost_db_urls`) |
 | `database.owner.user` | `thepost_owner` | — | `thepost_db_owner_role` |
 | `smtp.hostname` | `mail.example.ru` | `mail.example.test` | `thepost_hostname` |
-| `smtp.milter` | — | — | `thepost_rspamd_milter_address`, `thepost_clamav` |
+| `smtp.milter` | — | — | `thepost_rspamd_milter_address`, `thepost_clamav`, `thepost_milter_submission` (адреса фильтров; профиль письма — политика) |
 | `http.admin.listen` | `127.0.0.1:8443` | — | `thepost_admin_listen` |
 | `secrets.url`, `secrets.tls.ca_file` | `localhost:8200`, `/etc/thepost/pki` | `openbao-tls:8200`, том `tls` | `thepost_secrets_url`, `thepost_internal_ca_file` |
 | `secrets.auth.approle` | `role_id` — `/etc/thepost/openbao`, `secret_id` — учётные данные systemd | `secret_id` — том `openbao-approle` | `thepost_secrets_role_id_file` |
@@ -164,6 +164,21 @@ Compose и Ansible его не копируют, а подставляют зн�
 Остальное (слушатели 25, 465, 587, 143, 993, 443, ManageSieve 4190, роли, BLOB) — из пресета без изменений; новый параметр эталона
 добавляется в пресет, а не в compose или шаблон роли. Проверка пресета — `thepost config check --config
 deploy/config/all.yaml`.
+
+Лимиты отправки, селектор DKIM и профиль Milter — не конфигурация, а политика организации (цепочка «организация →
+домен → учётная запись», решение 97): ни пресет, ни compose, ни Ansible их не задают. Конфигурация хранит только
+ключи DKIM (`smtp.dkim.domains`) и адреса фильтров (`smtp.milter.filters`, наборы — `smtp.milter.profiles`). Без
+политики действуют умолчания: 1000 писем и 2000 адресатов в час на учётную запись, 100 получателей письма, подпись
+всеми ключами домена, все фильтры. Значения эталона — после `thepost admin init` и `thepost admin login`:
+```sh
+cat > policy.json <<'JSON'
+{"send_per_hour": 1000, "rcpts_per_hour": 2000, "max_recipients": 100, "dkim_selector": "s2026"}
+JSON
+thepost admin policy set --file policy.json        # уровень организации; --domain <домен>, --account <вход>
+thepost admin policy get                            # заданное и действующее
+```
+`policy set` заменяет политику уровня целиком: поля, которых нет в файле, на уровне не заданы. Селектор — из
+`smtp.dkim.domains.<домен>.keys`, профиль (`"milter_profile": "<имя>"`) — из `smtp.milter.profiles`.
 
 ## Эталон SMB одной командой (Ansible)
 Чистая ВМ → PostgreSQL 16 (PGDG), OpenBao, Rspamd (clamav-milter — `thepost_clamav: true`) и `thepost` (все роли) под
