@@ -23,12 +23,12 @@ fn imip(method: &str, organizer: &str, attendee: &str) -> String {
 }
 
 /// Домены-партнёры организации окружения (`TenantId::DEFAULT`).
-pub(super) struct Partners(pub(super) Vec<&'static str>);
+struct Partners(BTreeSet<&'static str>);
 
 #[async_trait]
 impl PartnerDomains for Partners {
     async fn is_partner(&self, tenant: TenantId, domain: &str) -> Result<bool> {
-        Ok(tenant == TenantId::DEFAULT && self.0.iter().any(|p| *p == domain))
+        Ok(tenant == TenantId::DEFAULT && self.0.contains(domain))
     }
 }
 
@@ -46,7 +46,7 @@ fn with_partners(env: &Env, partners: &[&'static str]) -> (Delivery, FakeItip) {
     let mut d = env
         .delivery(false)
         .with_itip(Arc::new(itip.clone()))
-        .with_partners(Arc::new(Partners(partners.to_vec())));
+        .with_partners(Arc::new(Partners(partners.iter().copied().collect())));
     d.deps.authcheck = Some(Arc::new(check));
     (d, itip)
 }
