@@ -16,6 +16,10 @@
 //!
 //! Книга «Организация» без LDAP (APP-51): учётная запись из Admin API видна в книге по CardDAV.
 //!
+//! Общий доступ, представители и бронирование в CalDAV (APP-71): выдача и отзыв прав `POST` на коллекцию,
+//! представитель через `PROPPATCH group-member-set`, приглашение переговорной — бронь в её календаре и ответ
+//! организатору.
+//!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
 use std::path::{Path, PathBuf};
@@ -1572,12 +1576,37 @@ async fn dav_send(
     headers: &str,
     ics: &str,
 ) -> String {
+    let headers = format!("Content-Type: text/calendar; charset=utf-8\r\n{headers}");
+    dav_body(addr, method, path, authorization, &headers, ics).await
+}
+
+/// Запрос DAV с телом XML и заголовком `Depth`: ответ целиком.
+async fn dav_xml(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    depth: &str,
+    xml: &str,
+) -> String {
+    let headers = format!("Content-Type: application/xml; charset=utf-8\r\nDepth: {depth}\r\n");
+    dav_body(addr, method, path, authorization, &headers, xml).await
+}
+
+/// Запрос DAV с телом `body` и заголовками `headers` (строки с `\r\n`, включая `Content-Type`): ответ целиком.
+async fn dav_body(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    headers: &str,
+    body: &str,
+) -> String {
     let mut s = TcpStream::connect(addr).await.expect("dav connect");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\n\
-         Content-Type: text/calendar; charset=utf-8\r\n{headers}\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{ics}",
-        ics.len()
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\n{headers}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     s.write_all(req.as_bytes()).await.expect("dav write");
     let mut raw = Vec::new();
@@ -1808,6 +1837,247 @@ async fn meeting_scheduling() {
     assert!(invited.contains("SUMMARY:Planning JMAP"), "{invited}");
     assert_eq!(queued(&pool, external_jmap).await, 1);
     assert_eq!(queued(&pool, &bob).await, 0);
+    pool.close().await;
+    shutdown.cancel();
+    let report = running.wait().await.expect("report");
+    assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- APP-71: общий доступ, представители, бронирование ----------
+
+/// `PARTSTAT` участника `address` в тексте iCalendar (строки развёрнуты по RFC 5545 §3.1).
+fn partstat(ics: &str, address: &str) -> Option<String> {
+    let unfolded = ics.replace("\r\n ", "").replace("\r\n\t", "");
+    let target = format!("mailto:{}", address.to_ascii_lowercase());
+    let line = unfolded
+        .lines()
+        .find(|l| l.starts_with("ATTENDEE") && l.to_ascii_lowercase().ends_with(&target))?;
+    let rest = &line[line.find("PARTSTAT=")? + "PARTSTAT=".len()..];
+    rest.split([';', ':']).next().map(str::to_owned)
+}
+
+/// CalDAV узла с хранилищами `PgMeta` (APP-71, DAV-17…19): владелец выдаёт права на календарь `POST` (`cs:share`) —
+/// календарь виден в доме получателя, отзыв (`share-resource`) убирает его; `PROPPATCH group-member-set` группы
+/// `calendar-proxy-write` назначает представителя; приглашение переговорной — бронь `ACCEPTED` в её календаре и
+/// ответ ресурса (`REPLY`) в событии организатора.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sharing_delegates_and_booking() {
+    use tp_contracts::dav::{CollectionKind, DavStore};
+    use tp_contracts::sharing::{
+        BookingPolicy, CollectionAcl, CollectionRights, DelegateLevel, DelegateStore, ResourceStore,
+    };
+
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = node_secrets(password);
+
+    let domain = "example.ru".to_owned();
+    let path = dir.path().join("config.yaml");
+    let text = config(dir.path(), &db_url, &domain).replace(
+        "roles: [all]",
+        "roles: [smtp-in, imap, jmap, dav, search, indexer, maintenance]",
+    );
+    assert!(!text.contains("roles: [all]"), "{text}");
+    std::fs::write(&path, text).expect("config");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+
+    let pool = db_pool(&url_db).await;
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let tenant = TenantId::DEFAULT;
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
+    let apps =
+        tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
+            .expect("app passwords");
+    let mut users = Vec::new();
+    for (name, kind) in [
+        ("alice", AccountKind::User),
+        ("bob", AccountKind::User),
+        ("room", AccountKind::Resource),
+    ] {
+        let login = format!("{name}@{domain}");
+        let account = meta
+            .upsert(
+                tenant,
+                AccountUpsert {
+                    domain: domain_id,
+                    login: login.clone(),
+                    display_name: name.to_owned(),
+                    external_id: None,
+                    enabled: true,
+                    aliases: Vec::new(),
+                    kind,
+                    hidden_from_gal: false,
+                },
+            )
+            .await
+            .expect("account");
+        let scope = AccountScope {
+            tenant,
+            account: account.id,
+        };
+        let (_, secret) = apps.issue(scope, "e2e").await.expect("issue");
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{login}:{}", secret.expose()));
+        users.push((login, scope, format!("Basic {auth}")));
+    }
+    let (alice, alice_scope, alice_basic) = users[0].clone();
+    let (bob, bob_scope, bob_basic) = users[1].clone();
+    let (room, room_scope, _) = users[2].clone();
+    let web = addr(&running, "jmap");
+    let alice_home = format!("/dav/calendars/{alice}/");
+    let bob_home = format!("/dav/calendars/{bob}/");
+    let calendars = dav_calendars(web, &alice_home, &alice_basic).await;
+    let calendar = calendars
+        .first()
+        .unwrap_or_else(|| panic!("нет календаря по умолчанию: {calendars:?}"))
+        .clone();
+    let name = calendar
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .expect("имя календаря");
+    let work = DavStore::collection_by_name(&meta, alice_scope, CollectionKind::Calendar, name)
+        .await
+        .expect("calendar")
+        .expect("календарь в хранилище");
+
+    // 1. Выдача прав `POST` (CalendarServer sharing): запись в `PgMeta`, календарь — в доме получателя.
+    let share = format!(
+        r#"<cs:share xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><cs:set><d:href>mailto:{bob}</d:href><cs:summary>Работа</cs:summary><cs:read-write/></cs:set></cs:share>"#
+    );
+    let r = dav_xml(web, "POST", &calendar, &alice_basic, "0", &share).await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let acl = CollectionAcl::collection_acl(&meta, alice_scope, work.id)
+        .await
+        .expect("права");
+    assert_eq!(acl.len(), 1, "{acl:?}");
+    assert_eq!(acl[0].identifier, bob);
+    assert!(acl[0].rights.contains(CollectionRights::WRITE), "{acl:?}");
+    let listed = dav(web, "PROPFIND", &bob_home, &bob_basic, "1").await;
+    assert!(
+        listed.contains(&calendar),
+        "общего календаря нет в доме получателя: {listed}"
+    );
+    // Отзыв (WebDAV `share-resource`): записи нет, календаря в доме получателя — тоже.
+    let revoke = format!(
+        r#"<d:share-resource xmlns:d="DAV:"><d:sharee><d:href>mailto:{bob}</d:href><d:share-access><d:no-access/></d:share-access></d:sharee></d:share-resource>"#
+    );
+    let r = dav_xml(web, "POST", &calendar, &alice_basic, "0", &revoke).await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let acl = CollectionAcl::collection_acl(&meta, alice_scope, work.id)
+        .await
+        .expect("права");
+    assert!(acl.is_empty(), "{acl:?}");
+    let listed = dav(web, "PROPFIND", &bob_home, &bob_basic, "1").await;
+    assert!(!listed.contains(&calendar), "{listed}");
+
+    // 2. Представитель: `PROPPATCH group-member-set` группы `calendar-proxy-write` владельца.
+    let group = format!("/dav/principals/{alice}/calendar-proxy-write/");
+    let set = format!(
+        r#"<d:propertyupdate xmlns:d="DAV:"><d:set><d:prop><d:group-member-set><d:href>/dav/principals/{bob}/</d:href></d:group-member-set></d:prop></d:set></d:propertyupdate>"#
+    );
+    let r = dav_xml(web, "PROPPATCH", &group, &alice_basic, "0", &set).await;
+    assert!(r.starts_with("HTTP/1.1 207"), "{r}");
+    assert!(r.contains("200 OK"), "{r}");
+    let delegates = DelegateStore::delegates(&meta, alice_scope)
+        .await
+        .expect("представители");
+    assert_eq!(delegates.len(), 1, "{delegates:?}");
+    assert_eq!(delegates[0].delegate, bob_scope.account);
+    assert_eq!(delegates[0].level, DelegateLevel::Write);
+    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><cs:calendar-proxy-write-for/></d:prop></d:propfind>"#;
+    let r = dav_xml(
+        web,
+        "PROPFIND",
+        &format!("/dav/principals/{bob}/"),
+        &bob_basic,
+        "0",
+        body,
+    )
+    .await;
+    assert!(
+        r.contains(&format!("/dav/principals/{alice}/")),
+        "представитель не видит владельца: {r}"
+    );
+
+    // 3. Бронирование переговорной: свободно — бронь `ACCEPTED` в календаре ресурса и ответ организатору.
+    ResourceStore::set_booking_policy(
+        &meta,
+        room_scope,
+        Some(BookingPolicy {
+            horizon: None,
+            ..BookingPolicy::default()
+        }),
+    )
+    .await
+    .expect("правила бронирования");
+    let uid = "app-71-room";
+    let ics = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//thepost//e2e//EN\r\nBEGIN:VEVENT\r\n\
+         UID:{uid}\r\nDTSTAMP:20261112T100000Z\r\nDTSTART:20270113T070000Z\r\n\
+         DTEND:20270113T080000Z\r\nSEQUENCE:0\r\nSUMMARY:Room booking\r\n\
+         ORGANIZER:mailto:{alice}\r\n\
+         ATTENDEE;PARTSTAT=ACCEPTED:mailto:{alice}\r\n\
+         ATTENDEE;CUTYPE=ROOM;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{room}\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
+    let put = dav_send(
+        web,
+        "PUT",
+        &format!("{calendar}{uid}.ics"),
+        &alice_basic,
+        "If-None-Match: *\r\n",
+        &ics,
+    )
+    .await;
+    assert!(put.starts_with("HTTP/1.1 201"), "{put}");
+    let mut booked = None;
+    for c in DavStore::list_collections(&meta, room_scope, CollectionKind::Calendar)
+        .await
+        .expect("calendars")
+    {
+        if let Some(o) = DavStore::object_by_uid(&meta, room_scope, c.id, uid)
+            .await
+            .expect("object")
+        {
+            booked = Some(o.body);
+        }
+    }
+    let booked = booked.expect("брони нет в календаре переговорной");
+    assert_eq!(
+        partstat(&booked, &room).as_deref(),
+        Some("ACCEPTED"),
+        "{booked}"
+    );
+    let mine = dav_event(web, &alice_home, &alice_basic, uid)
+        .await
+        .expect("событие организатора");
+    assert_eq!(
+        partstat(&mine, &room).as_deref(),
+        Some("ACCEPTED"),
+        "ответа переговорной нет у организатора: {mine}"
+    );
+
     pool.close().await;
     shutdown.cancel();
     let report = running.wait().await.expect("report");
