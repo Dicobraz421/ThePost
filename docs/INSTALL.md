@@ -266,6 +266,18 @@ smtp:
 
 `thepost doctor` проверяет MX, SPF, DKIM, DMARC, MTA-STS и PTR по публичному DNS и подсказывает, чего не хватает.
 
+### Входящая почта через шлюз
+
+Если входящая почта приходит через доверенный шлюз с `authserv_id` и без XCLIENT/XFORWARD, The Post не проверяет письмо заново, а берёт результаты шлюза из `Authentication-Results` с этим authserv-id (иначе из ARC с печатью домена шлюза). Шлюз обязан выполнять RFC 8601 §5: удалять из входящих писем все `Authentication-Results` со своим authserv-id, которые поставил не он. Иначе отправитель впишет `dmarc=pass` сам, и приглашения iMIP от чужого имени будут приняты как подлинные. authserv-id должен быть доменом шлюза или его поддоменом, а печать ARC — ставиться ключом этого домена. Домен верхнего уровня не годится. Результаты `Authentication-Results` принимаются только с `header.from=` домена `From` письма.
+
+Шлюз задаётся доверенным источником организации (Admin API `/api/v1/orgs/{org}/transport/sources`, поле `gateway.authserv_id`), в `config.yaml` его нет:
+
+```bash
+thepost admin transport source set gw --network 192.0.2.0/24 --authserv-id mx.example.ru --insecure
+```
+
+Без `--authserv-id` результатам шлюза не доверяют и письмо проверяется как от обычного клиента; `--xclient` включает передачу адреса исходного клиента (тогда проверки выполняются по нему).
+
 ## Kubernetes: Helm
 
 Чарт — `deploy/helm/thepost`, до него — OpenBao и секрет TLS (порядок — в
