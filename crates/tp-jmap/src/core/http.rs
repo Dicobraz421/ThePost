@@ -148,7 +148,7 @@ async fn session(State(j): State<Arc<Jmap>>, peer: Peer, headers: HeaderMap) -> 
         Ok(p) => p,
         Err(e) => return auth_error(&e),
     };
-    let s = j.session(&p, &j.base_url(&headers));
+    let s = j.session(&p, &j.base_url(&headers)).await;
     let mut resp = json(StatusCode::OK, "application/json", &s);
     resp.headers_mut().insert(
         header::CACHE_CONTROL,

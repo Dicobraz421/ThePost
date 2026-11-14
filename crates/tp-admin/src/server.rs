@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,12 +45,15 @@ use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::senders::SenderLists;
 use tp_contracts::transport::TransportStore;
 use tp_contracts::{Error, Result, TenantId};
+use utoipa::openapi::path::ParameterIn;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::{Content, Ref, RefOr, ResponseBuilder};
 use utoipa::{Modify, OpenApi, ToSchema};
 
 use crate::audit::AUDIT_ROUTE;
 use crate::console::ConsoleConfig;
 use crate::export::AuditExportConfig;
+use crate::extract::Json;
 use crate::groups::Moderation;
 use crate::init::{InitConfig, Local, OidcClient};
 
@@ -388,6 +391,9 @@ pub struct Admin {
     pub(crate) held_blobs: Option<Arc<dyn BlobStore>>,
     /// Общий доступ, представители, ресурсы; `None` — не подключено (маршруты отвечают 503).
     pub(crate) sharing: Option<crate::sharing::SharingStores>,
+    /// Организации инсталляции: без модуля «Мультитенантность» — только организация по умолчанию (решение 10).
+    /// Маршрут `/api/v1/orgs/{org}/...` другой организации — 404 ([`guard`]).
+    pub(crate) organizations: BTreeSet<TenantId>,
 }
 
 impl fmt::Debug for Admin {
@@ -400,6 +406,7 @@ impl fmt::Debug for Admin {
             .field("sieve", &self.sieve.is_some())
             .field("held_blobs", &self.held_blobs.is_some())
             .field("sharing", &self.sharing.is_some())
+            .field("organizations", &self.organizations)
             .finish()
     }
 }
@@ -435,6 +442,7 @@ impl Admin {
             sieve: None,
             held_blobs: None,
             sharing: None,
+            organizations: BTreeSet::from([TenantId::DEFAULT]),
         })
     }
 
@@ -540,7 +548,8 @@ impl Admin {
     }
 }
 
-/// Слой доступа: вход, роль, область роли по `{org}`; изменения — в журнал аудита.
+/// Слой доступа: вход, роль, область роли по `{org}`, организация существует (нет — 404 после проверки области,
+/// чтобы администратор организации не узнавал чужие); изменения — в журнал аудита.
 async fn guard(
     State(a): State<Arc<Admin>>,
     params: std::result::Result<RawPathParams, RawPathParamsRejection>,
@@ -572,11 +581,13 @@ async fn guard(
         .get::<MatchedPath>()
         .map_or_else(|| path.clone(), |m| m.as_str().to_owned());
     let allowed = caller.permits(tenant, &method, &route);
-    let resp = if allowed {
+    let resp = if !allowed {
+        ApiError(Error::Forbidden).into_response()
+    } else if tenant.is_some_and(|t| !a.organizations.contains(&t)) {
+        ApiError(Error::NotFound).into_response()
+    } else {
         req.extensions_mut().insert(caller.clone());
         next.run(req).await
-    } else {
-        ApiError(Error::Forbidden).into_response()
     };
     if method != Method::GET && method != Method::HEAD {
         let record = AdminAuditRecord {
@@ -819,7 +830,53 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::mailboxes::Doc::openapi());
     api.merge(crate::sharing::Doc::openapi());
     api.merge(crate::resources::Doc::openapi());
+    CommonErrors.modify(&mut api);
     api
+}
+
+/// Отказы, общие для маршрутов (их дают слой доступа и [`crate::extract`], не обработчик): маршрут организации —
+/// 404 (организации нет), разбор тела, строки запроса или `{org}` — 400.
+struct CommonErrors;
+
+impl Modify for CommonErrors {
+    fn modify(&self, api: &mut utoipa::openapi::OpenApi) {
+        let problem = || {
+            RefOr::T(
+                ResponseBuilder::new()
+                    .content(
+                        "application/json",
+                        Content::new(Some(Ref::from_schema_name("Problem"))),
+                    )
+                    .build(),
+            )
+        };
+        for (path, item) in &mut api.paths.paths {
+            let org = path.starts_with("/api/v1/orgs/{org}");
+            for op in [
+                &mut item.get,
+                &mut item.put,
+                &mut item.post,
+                &mut item.delete,
+                &mut item.patch,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let query = op
+                    .parameters
+                    .iter()
+                    .flatten()
+                    .any(|p| matches!(p, RefOr::T(p) if p.parameter_in == ParameterIn::Query));
+                let codes = &mut op.responses.responses;
+                if org || query || op.request_body.is_some() {
+                    codes.entry("400".into()).or_insert_with(problem);
+                }
+                if org {
+                    codes.entry("404".into()).or_insert_with(problem);
+                }
+            }
+        }
+    }
 }
 
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
@@ -986,6 +1043,33 @@ mod tests {
                     let required = in_path || (method == "delete" && name == "version");
                     if p["in"] != place || p["required"] != required {
                         wrong.push(format!("{method} {path}: {name} {p}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// ADM-43: маршрут организации объявляет 404 и 400, маршрут с телом или параметрами запроса — 400 (problem+json).
+    #[test]
+    fn common_errors_declared() {
+        let spec = serde_json::to_value(openapi_spec()).expect("spec");
+        let problem = json!({"$ref": "#/components/schemas/Problem"});
+        let mut wrong = Vec::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for (method, op) in item.as_object().expect("item") {
+                let org = path.starts_with("/api/v1/orgs/{org}");
+                let query = op["parameters"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|p| p["in"] == "query");
+                let body = op.get("requestBody").is_some();
+                let codes = [("400", org || query || body), ("404", org)];
+                for (code, needed) in codes {
+                    let schema = &op["responses"][code]["content"]["application/json"]["schema"];
+                    if needed && *schema != problem {
+                        wrong.push(format!("{method} {path}: {code}"));
                     }
                 }
             }

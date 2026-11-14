@@ -28,6 +28,14 @@
 //! оповещения по умолчанию (VALARM; не разбирается — 409). Изменения атомарны: ошибка одного свойства — оно
 //! со своим статусом (403 — защищённое или неизвестное, 409 — недопустимое значение), остальные — 424, ничего не
 //! записано. Произвольные («мёртвые») свойства не хранятся.
+//!
+//! Общий доступ ([`crate::share`]): `owner` — принципал владельца, `current-user-principal` — вошедшего,
+//! `current-user-privilege-set` — по действующим правам. Дом своих коллекций с `Depth: 1` — свои коллекции, затем общие
+//! с вошедшим (ссылками на коллекции владельцев), книга GAL — последней; чужой дом — коллекции владельца, на которые
+//! у вошедшего есть права, без создания коллекций по умолчанию. Объекты коллекции (`Depth: 1`) — только с правом
+//! чтения. Свои коллекции при общем доступе: `cs:allowed-sharing-modes` (`can-be-shared`) и `cs:invite` (по имени).
+//! Принципал: `calendar-user-type` (`INDIVIDUAL`, ресурс — `ROOM`), своему — `calendar-proxy-read-for`,
+//! `calendar-proxy-write-for` и `group-membership` (DAV-18, [`crate::proxy`]); `Depth: 1` — группы представителей.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -42,13 +50,14 @@ use calcard::icalendar::{
 use time::OffsetDateTime;
 use tp_contracts::ModSeq;
 use tp_contracts::dav::{Collection, CollectionKind, Component, DavStore};
-use tp_contracts::meta::AccountScope;
+use tp_contracts::meta::{Account, AccountKind, AccountScope};
 use tp_contracts::{Error, Result};
 
 use crate::alarm;
 use crate::config::DavConfig;
 use crate::path::{self, Target};
 use crate::server::{Cx, multistatus, precondition, status};
+use crate::share::{self, Shared};
 use crate::xml::{
     CALDAV, CARDDAV, CS, DAV, Element, Group, ICAL, Multistatus, PropName, href, text,
 };
@@ -74,27 +83,87 @@ const ALLPROP: [(&str, &str); 4] = [
     (DAV, "getcontenttype"),
 ];
 
-/// Права владельца на свои ресурсы (RFC 3744 §5.4).
-const PRIV_OWNER: &str = concat!(
-    "<d:privilege><d:all/></d:privilege><d:privilege><d:read/></d:privilege>",
-    "<d:privilege><d:write/></d:privilege><d:privilege><d:write-properties/></d:privilege>",
-    "<d:privilege><d:write-content/></d:privilege><d:privilege><d:bind/></d:privilege>",
-    "<d:privilege><d:unbind/></d:privilege>",
-    "<d:privilege><d:read-current-user-privilege-set/></d:privilege>"
-);
-
 /// Права на служебные ресурсы (корень, принципалы): только чтение.
 const PRIV_READ: &str = concat!(
     "<d:privilege><d:read/></d:privilege>",
     "<d:privilege><d:read-current-user-privilege-set/></d:privilege>"
 );
 
+/// Права владельца на свои группы представителей: чтение и состав (`group-member-set`).
+const PRIV_PROXY_OWNER: &str = concat!(
+    "<d:privilege><d:read/></d:privilege>",
+    "<d:privilege><d:write-properties/></d:privilege>",
+    "<d:privilege><d:read-current-user-privilege-set/></d:privilege>"
+);
+
+/// Принципал в ответе: учётная запись организации.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrincipalView {
+    /// Имя входа (сегмент URL).
+    pub login: String,
+    /// Отображаемое имя.
+    pub name: String,
+    /// Адреса календарного пользователя (`calendar-user-address-set`).
+    pub addresses: Vec<String>,
+    /// `calendar-user-type` (RFC 6638 §2.4.2).
+    pub cutype: &'static str,
+    /// Своему принципалу: владельцы, представителем которых он является, — логин и запись
+    /// (`calendar-proxy-read-for`, `calendar-proxy-write-for`).
+    pub proxy_for: Option<Vec<(String, bool)>>,
+}
+
+impl PrincipalView {
+    /// Принципал учётной записи `a`.
+    pub(crate) fn of(a: &Account) -> Self {
+        Self {
+            login: a.login.clone(),
+            name: share::display_name(a),
+            addresses: a.addresses(),
+            cutype: cutype(a.kind),
+            proxy_for: None,
+        }
+    }
+}
+
+/// `calendar-user-type` учётной записи вида `kind`: ресурс — переговорная (`ROOM`).
+pub(crate) fn cutype(kind: AccountKind) -> &'static str {
+    match kind {
+        AccountKind::User => "INDIVIDUAL",
+        AccountKind::Resource => "ROOM",
+    }
+}
+
+/// Принципал владельца ресурса запроса; своему — с представительствами ([`crate::proxy::proxy_for`]).
+pub(crate) async fn principal_view(cx: &Cx<'_>) -> Result<PrincipalView> {
+    let account = cx.account().await?;
+    let proxy_for = if cx.own() && cx.dav.sharing().is_some() {
+        Some(crate::proxy::proxy_for(cx).await?)
+    } else {
+        None
+    };
+    Ok(PrincipalView {
+        login: cx.login().to_owned(),
+        name: account
+            .as_ref()
+            .map_or_else(|| cx.login().to_owned(), share::display_name),
+        addresses: cx.addresses().await?,
+        cutype: cutype(account.map_or(AccountKind::User, |a| a.kind)),
+        proxy_for,
+    })
+}
+
 /// Ресурс, свойства которого возвращаются.
 pub(crate) enum Res<'a> {
     Root,
     Principals,
-    /// Принципал вошедшего с адресами календарного пользователя (`calendar-user-address-set`).
-    Principal(&'a [String]),
+    /// Принципал.
+    Principal(&'a PrincipalView),
+    /// Группа представителей владельца ([`crate::proxy`]): логин владельца, запись, логины представителей.
+    Proxy {
+        owner: &'a str,
+        write: bool,
+        members: &'a [String],
+    },
     Home(CollectionKind),
     /// Ресурс планирования дома календарей: входящие (`inbox`) или исходящие.
     Schedule {
@@ -110,7 +179,10 @@ pub(crate) enum Res<'a> {
         etag: &'a str,
         body: Option<&'a str>,
     },
-    Collection(&'a Collection),
+    /// Коллекция владельца ресурса запроса (права — [`Cx::rights`]) и выданные права (`cs:invite`), если запрошены.
+    Collection(&'a Collection, Option<&'a str>),
+    /// Чужая коллекция в доме: общая с вошедшим или в доме владельца, открытом вошедшему.
+    Shared(&'a Shared),
     Object {
         coll: &'a Collection,
         name: &'a str,
@@ -127,13 +199,15 @@ impl Res<'_> {
         match self {
             Res::Root => path::PREFIX.to_owned(),
             Res::Principals => path::PRINCIPALS.to_owned(),
-            Res::Principal(_) => path::principal(login),
+            Res::Principal(v) => path::principal(&v.login),
+            Res::Proxy { owner, write, .. } => path::proxy(owner, *write),
             Res::Home(k) => path::home(*k, login),
             Res::Schedule { inbox, .. } => schedule_href(login, *inbox),
             Res::InboxItem { name, .. } => {
                 path::object(CollectionKind::Calendar, login, path::INBOX, name)
             }
-            Res::Collection(c) => path::collection(c.kind, login, &c.name),
+            Res::Collection(c, _) => path::collection(c.kind, login, &c.name),
+            Res::Shared(s) => path::collection(s.coll.kind, &s.owner, &s.coll.name),
             Res::Object { coll, name, .. } => path::object(coll.kind, login, &coll.name, name),
         }
     }
@@ -179,6 +253,14 @@ impl Want {
         None
     }
 
+    /// Свойство `{ns}name` запрошено по имени (`prop` или `include`).
+    pub(crate) fn wants(&self, ns: &str, name: &str) -> bool {
+        match self {
+            Want::All(n) | Want::Props(n) => n.iter().any(|k| k.is(ns, name)),
+            Want::Names => false,
+        }
+    }
+
     /// Запрошены данные объектов (`calendar-data`, `address-data`).
     pub(crate) fn needs_body(&self) -> bool {
         match self {
@@ -214,57 +296,111 @@ pub(crate) fn content_type(kind: CollectionKind) -> &'static str {
     }
 }
 
+/// `href` принципала по логину.
+fn principal_href(login: &str) -> String {
+    href(&path::principal(login))
+}
+
+/// Свойства принципала `v`.
+fn principal_props(v: &PrincipalView, out: &mut Vec<(PropName, String)>) {
+    let login = v.login.as_str();
+    let me = path::principal(login);
+    out.push(p(DAV, "displayname", text(&v.name).into_owned()));
+    out.push(p(DAV, "principal-URL", href(&me)));
+    out.push(p(
+        CALDAV,
+        "calendar-home-set",
+        href(&path::home(CollectionKind::Calendar, login)),
+    ));
+    out.push(p(
+        CARDDAV,
+        "addressbook-home-set",
+        href(&path::home(CollectionKind::AddressBook, login)),
+    ));
+    let mut addrs: String = v
+        .addresses
+        .iter()
+        .map(|a| href(&format!("mailto:{a}")))
+        .collect();
+    addrs.push_str(&href(&me));
+    out.push(p(CALDAV, "calendar-user-address-set", addrs));
+    let emails: String = v
+        .addresses
+        .iter()
+        .map(|a| format!("<cs:email-address>{}</cs:email-address>", text(a)))
+        .collect();
+    out.push(p(CS, "email-address-set", emails));
+    out.push(p(
+        CALDAV,
+        "schedule-inbox-URL",
+        href(&schedule_href(login, true)),
+    ));
+    out.push(p(
+        CALDAV,
+        "schedule-outbox-URL",
+        href(&schedule_href(login, false)),
+    ));
+    out.push(p(CALDAV, "calendar-user-type", v.cutype.to_owned()));
+    if let Some(list) = &v.proxy_for {
+        for (name, write) in [
+            ("calendar-proxy-read-for", false),
+            ("calendar-proxy-write-for", true),
+        ] {
+            let hrefs: String = list
+                .iter()
+                .filter(|(_, w)| *w == write)
+                .map(|(owner, _)| principal_href(owner))
+                .collect();
+            out.push(p(CS, name, hrefs));
+        }
+        let groups: String = list
+            .iter()
+            .map(|(owner, write)| href(&path::proxy(owner, *write)))
+            .collect();
+        out.push(p(DAV, "group-membership", groups));
+    }
+}
+
 /// Все свойства ресурса со значениями (готовый XML).
 fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
     let login = cx.login();
-    let me = path::principal(login);
+    let owner = principal_href(login);
     let rt = match res {
-        Res::Root | Res::Principals | Res::Home(_) => "<d:collection/>",
-        Res::Principal(_) => "<d:collection/><d:principal/>",
-        Res::Collection(c) => match c.kind {
-            CollectionKind::Calendar => "<d:collection/><c:calendar/>",
-            CollectionKind::AddressBook => "<d:collection/><card:addressbook/>",
-        },
-        Res::Schedule { inbox: true, .. } => "<d:collection/><c:schedule-inbox/>",
-        Res::Schedule { inbox: false, .. } => "<d:collection/><c:schedule-outbox/>",
-        Res::Object { .. } | Res::InboxItem { .. } => "",
+        Res::Root | Res::Principals | Res::Home(_) => "<d:collection/>".to_owned(),
+        Res::Principal(_) => "<d:collection/><d:principal/>".to_owned(),
+        Res::Proxy { write: true, .. } => "<d:principal/><cs:calendar-proxy-write/>".to_owned(),
+        Res::Proxy { write: false, .. } => "<d:principal/><cs:calendar-proxy-read/>".to_owned(),
+        Res::Collection(c, _) => collection_type(c.kind).to_owned(),
+        Res::Shared(s) => format!("{}<cs:shared/>", collection_type(s.coll.kind)),
+        Res::Schedule { inbox: true, .. } => "<d:collection/><c:schedule-inbox/>".to_owned(),
+        Res::Schedule { inbox: false, .. } => "<d:collection/><c:schedule-outbox/>".to_owned(),
+        Res::Object { .. } | Res::InboxItem { .. } => String::new(),
     };
-    let mut v = vec![p(DAV, "resourcetype", rt.to_owned())];
+    let mut v = vec![p(DAV, "resourcetype", rt)];
     match res {
-        Res::Principal(addresses) => {
-            v.push(p(DAV, "displayname", text(login).into_owned()));
-            v.push(p(DAV, "principal-URL", href(&me)));
+        Res::Principal(view) => principal_props(view, &mut v),
+        Res::Proxy {
+            owner: o,
+            write,
+            members,
+        } => {
+            let kind = if *write {
+                "запись"
+            } else {
+                "чтение"
+            };
             v.push(p(
-                CALDAV,
-                "calendar-home-set",
-                href(&path::home(CollectionKind::Calendar, login)),
+                DAV,
+                "displayname",
+                text(&format!("Представители {o}: {kind}")).into_owned(),
             ));
-            v.push(p(
-                CARDDAV,
-                "addressbook-home-set",
-                href(&path::home(CollectionKind::AddressBook, login)),
-            ));
-            let mut addrs: String = addresses
-                .iter()
-                .map(|a| href(&format!("mailto:{a}")))
-                .collect();
-            addrs.push_str(&href(&me));
-            v.push(p(CALDAV, "calendar-user-address-set", addrs));
-            v.push(p(
-                CALDAV,
-                "schedule-inbox-URL",
-                href(&schedule_href(login, true)),
-            ));
-            v.push(p(
-                CALDAV,
-                "schedule-outbox-URL",
-                href(&schedule_href(login, false)),
-            ));
-            v.push(p(CALDAV, "calendar-user-type", "INDIVIDUAL".to_owned()));
+            v.push(p(DAV, "principal-URL", href(&path::proxy(o, *write))));
+            let hrefs: String = members.iter().map(|m| principal_href(m)).collect();
+            v.push(p(DAV, "group-member-set", hrefs));
         }
-        Res::Home(_) => v.push(p(DAV, "owner", href(&me))),
+        Res::Home(_) => v.push(p(DAV, "owner", owner.clone())),
         Res::Schedule { ctag, default, .. } => {
-            v.push(p(DAV, "owner", href(&me)));
+            v.push(p(DAV, "owner", owner.clone()));
             if let Some(state) = ctag {
                 v.push(p(CS, "getctag", state.0.to_string()));
             }
@@ -288,7 +424,26 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
                 v.push(p(DAV, "getcontentlength", b.len().to_string()));
             }
         }
-        Res::Collection(c) => collection_props(cx, c, &me, &mut v),
+        Res::Collection(c, invite) => {
+            collection_props(cx, c, &path::principal(login), &mut v);
+            if cx.dav.sharing().is_some_and(|s| s.stores.is_some()) && cx.own() && !c.is_gal() {
+                v.push(p(
+                    CS,
+                    "allowed-sharing-modes",
+                    "<cs:can-be-shared/>".to_owned(),
+                ));
+                if let Some(i) = invite {
+                    v.push(p(CS, "invite", (*i).to_owned()));
+                }
+            }
+        }
+        Res::Shared(s) => {
+            collection_props(cx, &s.coll, &path::principal(&s.owner), &mut v);
+            if let Some(name) = share::shared_name(s) {
+                v.retain(|(n, _)| !n.is(DAV, "displayname"));
+                v.insert(1, p(DAV, "displayname", name));
+            }
+        }
         Res::Object {
             coll,
             etag,
@@ -316,30 +471,50 @@ fn properties(cx: &Cx<'_>, res: &Res<'_>) -> Vec<(PropName, String)> {
         }
         Res::Root | Res::Principals => {}
     }
-    v.push(p(DAV, "current-user-principal", href(&me)));
+    v.push(p(
+        DAV,
+        "current-user-principal",
+        principal_href(&cx.principal.login),
+    ));
     v.push(p(DAV, "principal-collection-set", href(path::PRINCIPALS)));
     let privs = match res {
-        Res::Root | Res::Principals | Res::Principal(_) => PRIV_READ,
-        Res::Collection(c) | Res::Object { coll: c, .. } if c.is_gal() => PRIV_READ,
-        _ => PRIV_OWNER,
+        Res::Root | Res::Principals | Res::Principal(_) => PRIV_READ.to_owned(),
+        Res::Proxy { .. } if cx.own() => PRIV_PROXY_OWNER.to_owned(),
+        Res::Proxy { .. } => PRIV_READ.to_owned(),
+        Res::Collection(c, _) | Res::Object { coll: c, .. } if c.is_gal() => PRIV_READ.to_owned(),
+        Res::Shared(s) => share::privileges(s.rights),
+        _ => share::privileges(cx.rights),
     };
-    v.push(p(DAV, "current-user-privilege-set", privs.to_owned()));
-    let reports = match res {
-        Res::Collection(c) if c.kind == CollectionKind::Calendar => concat!(
+    v.push(p(DAV, "current-user-privilege-set", privs));
+    let kind = match res {
+        Res::Collection(c, _) => Some(c.kind),
+        Res::Shared(s) => Some(s.coll.kind),
+        _ => None,
+    };
+    let reports = match kind {
+        Some(CollectionKind::Calendar) => concat!(
             "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:calendar-query/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:calendar-multiget/></d:report></d:supported-report>",
             "<d:supported-report><d:report><c:free-busy-query/></d:report></d:supported-report>"
         ),
-        Res::Collection(_) => concat!(
+        Some(CollectionKind::AddressBook) => concat!(
             "<d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>",
             "<d:supported-report><d:report><card:addressbook-query/></d:report></d:supported-report>",
             "<d:supported-report><d:report><card:addressbook-multiget/></d:report></d:supported-report>"
         ),
-        _ => "",
+        None => "",
     };
     v.push(p(DAV, "supported-report-set", reports.to_owned()));
     v
+}
+
+/// `resourcetype` коллекции вида `kind`.
+fn collection_type(kind: CollectionKind) -> &'static str {
+    match kind {
+        CollectionKind::Calendar => "<d:collection/><c:calendar/>",
+        CollectionKind::AddressBook => "<d:collection/><card:addressbook/>",
+    }
 }
 
 fn collection_props(cx: &Cx<'_>, c: &Collection, me: &str, v: &mut Vec<(PropName, String)>) {
@@ -457,7 +632,7 @@ fn timezone_of(ical: &str) -> Option<String> {
 }
 
 /// Группы `propstat` ресурса для запроса `want`.
-fn groups(cx: &Cx<'_>, res: &Res<'_>, want: &Want) -> Vec<Group> {
+pub(crate) fn groups(cx: &Cx<'_>, res: &Res<'_>, want: &Want) -> Vec<Group> {
     let all = properties(cx, res);
     let find = |n: &PropName| all.iter().find(|(k, _)| k == n).cloned();
     let mut ok: Vec<(PropName, String)> = Vec::new();
@@ -534,7 +709,6 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         return Ok(status(StatusCode::BAD_REQUEST));
     };
     let mut ms = Multistatus::new();
-    let max = cx.dav.cfg.max_response_items;
     match target {
         Target::Root => {
             emit(cx, &mut ms, &Res::Root, &want);
@@ -545,27 +719,27 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
         Target::Principals => {
             emit(cx, &mut ms, &Res::Principals, &want);
             if depth1 {
-                let addresses = cx.addresses().await?;
-                emit(cx, &mut ms, &Res::Principal(&addresses), &want);
+                let view = principal_view(cx).await?;
+                emit(cx, &mut ms, &Res::Principal(&view), &want);
             }
         }
         Target::Principal(_) => {
-            let addresses = cx.addresses().await?;
-            emit(cx, &mut ms, &Res::Principal(&addresses), &want);
+            let view = principal_view(cx).await?;
+            emit(cx, &mut ms, &Res::Principal(&view), &want);
+            if depth1 && cx.own() && cx.dav.sharing().is_some() {
+                for write in [false, true] {
+                    crate::proxy::emit_group(cx, &mut ms, write, &want).await?;
+                }
+            }
         }
+        Target::Proxy(_, write) => crate::proxy::emit_group(cx, &mut ms, *write, &want).await?,
         Target::Home(kind, _) => {
-            ensure_defaults(cx, *kind).await?;
+            if cx.own() {
+                ensure_defaults(cx, *kind).await?;
+            }
             emit(cx, &mut ms, &Res::Home(*kind), &want);
             if depth1 {
-                let mut list = cx.store().list_collections(cx.scope, *kind).await?;
-                // Книга GAL — последней (сортировка устойчива).
-                list.sort_by_key(Collection::is_gal);
-                for c in list.iter().take(max) {
-                    emit(cx, &mut ms, &Res::Collection(c), &want);
-                }
-                if list.len() > max {
-                    truncated(&mut ms, &target.href(cx.login()));
-                }
+                home_children(cx, &mut ms, *kind, &want).await?;
             }
         }
         Target::Collection(kind, _, name) => {
@@ -577,8 +751,13 @@ pub(crate) async fn propfind(cx: &Cx<'_>, target: &Target, body: Body) -> Result
                 }
                 return Ok(status(StatusCode::NOT_FOUND));
             };
-            emit(cx, &mut ms, &Res::Collection(&c), &want);
-            if depth1 {
+            let invite = if want.wants(CS, "invite") {
+                share::invite(cx, c.id).await?
+            } else {
+                None
+            };
+            emit(cx, &mut ms, &Res::Collection(&c, invite.as_deref()), &want);
+            if depth1 && cx.rights.read {
                 children(cx, &mut ms, &c, &want).await?;
             }
         }
@@ -659,6 +838,54 @@ pub(crate) async fn defaults(
             Ok(_) | Err(Error::Conflict) => {}
             Err(e) => return Err(e),
         }
+    }
+    Ok(())
+}
+
+/// Коллекции дома вида `kind` (`Depth: 1`), не больше `dav.max_response_items`: свой дом — свои коллекции, общие
+/// с вошедшим ([`share::shared`]), книга GAL — последней; чужой — коллекции владельца с правами вошедшего.
+async fn home_children(
+    cx: &Cx<'_>,
+    ms: &mut Multistatus,
+    kind: CollectionKind,
+    want: &Want,
+) -> Result<()> {
+    let max = cx.dav.cfg.max_response_items;
+    let list = cx.store().list_collections(cx.scope, kind).await?;
+    let home = path::home(kind, cx.login());
+    if !cx.own() {
+        let open = share::foreign_home(cx, list).await?;
+        for s in open.iter().take(max) {
+            emit(cx, ms, &Res::Shared(s), want);
+        }
+        if open.len() > max {
+            truncated(ms, &home);
+        }
+        return Ok(());
+    }
+    let (gal, own): (Vec<Collection>, Vec<Collection>) =
+        list.into_iter().partition(Collection::is_gal);
+    let shared = share::shared(cx, kind).await?;
+    let invites = want.wants(CS, "invite");
+    let mut left = max;
+    for c in own.iter().take(left) {
+        let invite = if invites {
+            share::invite(cx, c.id).await?
+        } else {
+            None
+        };
+        emit(cx, ms, &Res::Collection(c, invite.as_deref()), want);
+    }
+    left = left.saturating_sub(own.len());
+    for s in shared.iter().take(left) {
+        emit(cx, ms, &Res::Shared(s), want);
+    }
+    left = left.saturating_sub(shared.len());
+    for c in gal.iter().take(left) {
+        emit(cx, ms, &Res::Collection(c, None), want);
+    }
+    if own.len() + shared.len() + gal.len() > max {
+        truncated(ms, &home);
     }
     Ok(())
 }

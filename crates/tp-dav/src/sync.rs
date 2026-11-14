@@ -111,6 +111,13 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, body: Body) -> Result<R
     let Target::Collection(kind, _, name) = target else {
         return Ok(unsupported());
     };
+    if !cx.rights.read {
+        return Ok(crate::share::need_privileges(
+            target,
+            cx.login(),
+            "<d:read/>",
+        ));
+    }
     let Some(c) = cx.store().collection_by_name(cx.scope, *kind, name).await? else {
         return Ok(status(StatusCode::NOT_FOUND));
     };

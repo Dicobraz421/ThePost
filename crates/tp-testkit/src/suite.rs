@@ -2,7 +2,7 @@
 //! (`tp-meta` — `Membership`, `AbuseBlocks`, сигналы `EventBus`, `AclStore`, `AppPasswordStore`, `DeliveryLog`, `GroupStore`, сжатие и GC по шардам `BlobIndex`,
 //! «очистить корзину» `TrashStore::purge` с настройкой `trash.purge`, `TransportStore` и его таблица переписывания,
 //! перенос получателей `QueueStore::postpone`, статусы `Outbound::submit` (`tp-smtp` — `Queue`, `Delivery`),
-//! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`) проходят одни и те же проверки.
+//! `tp-platform` — `SecretStore`, `tp-cluster` — `Rpc`, `tp-auth` — `SharingAuthorizer`) проходят одни и те же проверки.
 //!
 //! Время в наборах идёт через [`Wait`]: для testkit — [`ManualClock`] (сдвиг без ожидания), для PostgreSQL
 //! и OpenBao — [`RealTime`] (сон), тогда сроки выбирают с запасом на задержки.
@@ -299,12 +299,14 @@ pub mod freebusy;
 pub mod itip;
 pub mod lifecycle;
 pub mod sharing;
+pub mod sharing_authorizer;
 pub mod sieve;
 
 pub use dav::dav;
 pub use freebusy::freebusy;
 pub use freebusy::recurring as freebusy_recurring;
 pub use itip::itip;
+pub use sharing_authorizer::{SharingAuthorizerFixture, sharing_authorizer};
 pub use sieve::sieve;
 
 // ---------- EventBus: сигналы ----------

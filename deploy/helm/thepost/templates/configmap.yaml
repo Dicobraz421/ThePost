@@ -6,4 +6,5 @@ metadata:
     {{- include "thepost.labels" . | nindent 4 }}
 data:
   config.yaml: |
+    # thepost: managed-by=helm
     {{- include "thepost.config" . | nindent 4 }}

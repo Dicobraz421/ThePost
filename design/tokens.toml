@@ -1,0 +1,266 @@
+# Токены фирменного стиля IT Task (решение 119, DES-01). Единственный источник цветов: из него берут тему
+# веб-консоль (тема antd, UI-19), текстовый интерфейс (tp-tui, TUI-06) и подсветка вывода CLI (раздел [cli]).
+# Значения ролей — по брендбуку-макету текстового интерфейса. Контраст пар ролей проверяет
+# scripts/design_contrast.py в CI: текст на фоне не ниже 4,5:1 (WCAG AA), рамки и значки — не ниже 3:1.
+# Цвет — шестнадцатеричный #RRGGBB в верхнем регистре.
+
+schema = 1
+
+# Цвета бренда. Розовый и синий — также концы градиента строки меню (TUI-06) и грани знака (logo.svg).
+[brand]
+pink = "#E4107F"  # акцент: выделение, главное действие
+blue = "#177CAA"  # основной: рамка активной панели, F-клавиши, информационные сообщения
+light = "#D8E7F4" # светло-голубой: фон и подложки
+
+# Шрифты: имена семейств и начертания. Файлы woff2 вшиваются в поставку (UI-19), CDN не используется.
+[fonts.heading]
+family = "Bebas Neue"
+weights = [700]
+style = "normal"
+
+[fonts.text]
+family = "Evolventa"
+weights = [400, 700]
+style = "normal"
+
+# Знаки состояний: смысл не держится на одном цвете.
+[signs]
+ok = "●"
+warn = "▲"
+err = "×"
+
+# Роли и их смысл. Роли карточки DES-01: акцент — sel, основной — fkBg и frameA, фон — screen, подложка — panel,
+# текст — text, рамка активной панели — frameA, норма — ok, внимание — warn, ошибка — err.
+[roles]
+screen = "фон экрана"
+panel = "фон панели (подложка)"
+text = "текст"
+muted = "вторичный текст, счётчики"
+frame = "рамка неактивной панели (декоративная, как в макете: активную панель отличает frameA)"
+frameA = "рамка активной панели, прокрутка"
+titleA = "заголовок активной панели, текст-акцент"
+head = "заголовки колонок"
+sel = "выделенная строка, фон (акцент)"
+selFg = "текст выделенной строки"
+selI = "выделенная строка неактивной панели, фон"
+selIFg = "текст выделенной строки неактивной панели"
+fkBg = "подписи F-клавиш, фон (основной)"
+fkFg = "подписи F-клавиш, текст"
+ok = "норма ●"
+warn = "внимание ▲"
+err = "ошибка, блокировка ×"
+
+# Атрибуты ролей во всех цветных режимах (в монохроме — [mode.mono]).
+[attrs]
+selFg = ["bold"]
+
+# Красный — только у этих ролей (ошибки; роль безопасности добавится сюда же).
+[rules]
+red_roles = ["err"]
+
+# Режимы текстового интерфейса (TUI-06). truecolor — #RRGGBB; c256 — номер цвета xterm-256 (16–255);
+# c16 — номер цвета 0–15 палитры [palette16]; mono — атрибуты вместо цвета.
+
+[mode.dark]
+screen = "#0F1317"
+panel = "#141A20"
+text = "#D8E7F4"
+muted = "#7E8A96"
+frame = "#3A4652"
+frameA = "#3A9BD5"
+titleA = "#FB5FB0"
+head = "#2EBCBA"
+sel = "#E4107F"
+selFg = "#FFFFFF"
+selI = "#26313B"
+selIFg = "#D8E7F4"
+fkBg = "#177CAA"
+fkFg = "#FFFFFF"
+ok = "#2EBCBA"
+warn = "#E7B512"
+err = "#FF5C5C"
+
+# ok — #0E8483, а не #0F8A88: на белой панели #0F8A88 даёт 4,19:1.
+[mode.light]
+screen = "#E9EEF3"
+panel = "#FFFFFF"
+text = "#161616"
+muted = "#5F6B78"
+frame = "#BAC1C6"
+frameA = "#177CAA"
+titleA = "#C0106B"
+head = "#177CAA"
+sel = "#E4107F"
+selFg = "#FFFFFF"
+selI = "#D7E2EA"
+selIFg = "#161616"
+fkBg = "#177CAA"
+fkFg = "#FFFFFF"
+ok = "#0E8483"
+warn = "#9A6F00"
+err = "#C62828"
+
+# Ближайшие к тёмной теме цвета xterm-256 (куб 6×6×6 и серая шкала). fkBg — 26 (#005FD7): у ближайшего 31
+# (#0087AF) белый текст даёт 4,13:1.
+[mode.c256]
+screen = 233
+panel = 234
+text = 189
+muted = 102
+frame = 238
+frameA = 74
+titleA = 205
+head = 37
+sel = 162
+selFg = 231
+selI = 236
+selIFg = 189
+fkBg = 26
+fkFg = 231
+ok = 37
+warn = 178
+err = 203
+
+# Номера цветов палитры [palette16]. Выделение неактивной панели — тёмно-серый 8 с белым текстом 15 (решение
+# владельца 14.11): оно видно и в 16 цветах. Поэтому 8 тёмный, а muted — 7: на тёмно-сером 8 вторичный текст не
+# набирает 4,5:1 на фоне экрана; в 16 цветах вторичный текст цветом не отличается.
+[mode.c16]
+screen = 0
+panel = 0
+text = 7
+muted = 7
+frame = 8
+frameA = 12
+titleA = 13
+head = 14
+sel = 5
+selFg = 15
+selI = 8
+selIFg = 15
+fkBg = 4
+fkFg = 15
+ok = 10
+warn = 11
+err = 9
+
+# Монохром (NO_COLOR, TERM=dumb): bold, dim, reverse, underline; пустой список — обычный текст.
+[mode.mono]
+screen = []
+panel = []
+text = []
+muted = ["dim"]
+frame = ["dim"]
+frameA = ["bold"]
+titleA = ["bold"]
+head = ["bold"]
+sel = ["reverse"]
+selFg = ["bold"]
+selI = []
+selIFg = ["underline"]
+fkBg = ["reverse"]
+fkFg = []
+ok = []
+warn = ["bold"]
+err = ["bold"]
+
+# 16 цветов консоли Linux под бренд: TUI-06 ставит их через ESC ] P nrrggbb и возвращает ESC ] R при выходе.
+# Номер — индекс ANSI: 0 чёрный, 1 красный, 2 зелёный, 3 жёлтый, 4 синий, 5 пурпурный, 6 бирюзовый, 7 серый,
+# 8–15 — яркие. Красные (1, 9) — только у err.
+[palette16]
+colors = [
+  "#0F1317", "#C62828", "#0E8483", "#9A6F00", "#177CAA", "#E4107F", "#1A9694", "#D8E7F4",
+  "#4A5562", "#FF5C5C", "#2EBCBA", "#E7B512", "#3A9BD5", "#FB5FB0", "#2EBCBA", "#FFFFFF",
+]
+
+# Пары «передний план на фоне» для каждого цветного режима: min = 4,5 у текста, 3 у рамок и значков. Другой min —
+# только с exception (причина), его допускает проверка.
+# frame (рамка неактивной панели) не проверяется: декоративная, остаётся как в макете — решение владельца 14.11.
+[[contrast]]
+fg = "text"
+bg = ["screen", "panel"]
+min = 4.5
+
+[[contrast]]
+fg = "selIFg"
+bg = ["selI"]
+min = 4.5
+
+[[contrast]]
+fg = "muted"
+bg = ["screen", "panel"]
+min = 4.5
+
+[[contrast]]
+fg = "head"
+bg = ["panel"]
+min = 4.5
+
+[[contrast]]
+fg = "titleA"
+bg = ["panel"]
+min = 4.5
+
+# Белый на #E4107F — 4,49:1 (точно 4,488), ниже 4,5: фирменный цвет, решение владельца 14.11. Текст выделенной
+# строки — жирный ([attrs]).
+[[contrast]]
+fg = "selFg"
+bg = ["sel"]
+min = 4.48
+exception = "фирменный цвет, решение владельца 14.11"
+
+[[contrast]]
+fg = "fkFg"
+bg = ["fkBg"]
+min = 4.5
+
+[[contrast]]
+fg = "ok"
+bg = ["panel"]
+min = 4.5
+
+[[contrast]]
+fg = "warn"
+bg = ["panel"]
+min = 4.5
+
+[[contrast]]
+fg = "err"
+bg = ["panel"]
+min = 4.5
+
+[[contrast]]
+fg = "frameA"
+bg = ["screen", "panel"]
+min = 3.0
+
+[[contrast]]
+fg = "sel"
+bg = ["panel"]
+min = 3.0
+
+[[contrast]]
+fg = "fkBg"
+bg = ["screen"]
+min = 3.0
+
+# Подсветка вывода CLI (`thepost admin`, `doctor`, `config check`, справка) — добавлено по запросу владельца.
+# CLI не знает фон терминала: по умолчанию — коды ANSI (ansi, параметры SGR) из палитры терминала; фирменные
+# значения (brand, с атрибутами attrs) — только при COLORTERM=truecolor. Каждый brand не ниже min на обоих фонах.
+# ok и json_number — #1A9694, а не #1FA5A3 (решение 120): на #FAFAFA #1FA5A3 даёт 2,89:1.
+[cli]
+backgrounds = ["#0C0C0C", "#FAFAFA"]
+min = 3.0
+
+[cli.roles]
+head = { ansi = "1;94", brand = "#2A8BC4", attrs = ["bold"] }
+accent = { ansi = "95", brand = "#E4107F", attrs = [] }
+ok = { ansi = "92", brand = "#1A9694", attrs = [] }
+warn = { ansi = "1;33", brand = "#B07D00", attrs = ["bold"] }
+err = { ansi = "1;91", brand = "#E5484D", attrs = ["bold"] }
+muted = { ansi = "2", brand = "#7E8A96", attrs = ["dim"] }
+json_key = { ansi = "94", brand = "#2A8BC4", attrs = [] }
+json_number = { ansi = "96", brand = "#1A9694", attrs = [] }
+json_bool = { ansi = "95", brand = "#E4107F", attrs = [] }
+
+[cli.rules]
+red_roles = ["err"]

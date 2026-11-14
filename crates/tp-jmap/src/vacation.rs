@@ -191,7 +191,10 @@ mod tests {
     #[tokio::test]
     async fn session_lists_capability() {
         let env = Env::new().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         assert!(s["capabilities"][USING[1]].is_object(), "{s}");
         assert_eq!(s["primaryAccounts"][USING[1]], env.account());
     }
@@ -316,7 +319,10 @@ mod tests {
     #[tokio::test]
     async fn absent_without_store() {
         let env = Env::bare().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         assert!(s["capabilities"][USING[1]].is_null(), "{s}");
         let resp = env
             .request(json!({"using": USING, "methodCalls": [

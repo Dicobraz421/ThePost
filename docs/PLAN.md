@@ -12,8 +12,8 @@
 | Этап | Содержание | Волны | Карточки | Статус | Критерий завершения |
 |---|---|---|---|---|---|
 | Ф0. Основа | Платформа, хранилище метаданных и BLOB, CI, стенд SMB | 38/38 | 87/87 | ✅ готово | Узел SMB запускается из одного бинарного файла; метаданные и BLOB с тестами; CI ≤ 7 мин; стенд SMB поднимается |
-| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 280/306 | 389/424 | в работе, 92 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
-| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 94/106 | 157/178 | в работе, 88 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
+| Ф1. MVP SMB | SMTP с очередью и Milter, IMAP, JMAP Mail, поиск, LDAP, Kerberos, OAUTHBEARER, корзина, Admin API, CLI | 282/327 | 391/448 | в работе, 87 % карточек | Почта SMB целиком на стенде: приём и отправка, IMAP и JMAP, поиск, вход; проверка клиентами Thunderbird и Postman; нагрузка Д.6 для SMB |
+| Ф2. Совместная работа | CalDAV, CardDAV, JMAP Calendars и Contacts, scheduling, free/busy, Sieve, веб-консоль администратора | 94/114 | 157/186 | в работе, 84 % карточек | Календари, контакты, правила и автоответы проверены клиентами; консоль администратора покрывает Admin API |
 | Ф3. Enterprise | S3, кластерные роли, межузловое взаимодействие, edge, шарды, Legal Hold, экспорт и импорт | 0/0 | 0/0 | карточки — после Ф1 | Схемы Enterprise-ВМ и Enterprise-K8s (приложение З) на стенде; переключение СУБД ≤ 30 с; нагрузка Д.6 для Enterprise |
 | Ф4. Выпуск | Стабилизация, аудит безопасности, фаззинг парсеров, документация администратора | 1/2 | 1/2 | в работе, 50 % карточек | Аудит безопасности без открытых критичных находок; фаззинг парсеров; документация; выпуск 1.0 |
 
@@ -124,6 +124,16 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
      `admin-21`, `imap-12`, `jmap-24` (блокировка рвёт сеансы); `console-06`.
      Приёмка шага: `docs/manual-tests/UI-09.md` (консоль тремя ролями), `docs/manual-tests/AUTH-05.md` шаг 5 (GSSAPI на
      живом Kerberos, после `ci-10`).
+   - 4.2б Текстовый интерфейс и единая канва управления (решение 118): `deps-14` (DEPS-14), `admin-30` (ADM-44,
+     общий клиент) → `tui-01` (TUI-01, TUI-02) → `tui-02` (TUI-03, TUI-04, после `deploy-41`/DEP-55), `app-65` (TUI-05),
+     `ci-14` (CI-16) → `docs-08` (DOC-08). Фирменный стиль IT Task и мышь (решение 119): `design-01` (DES-01, токены
+     и контраст в CI) → `tui-03` (TUI-06, тема и пять режимов, после `tui-01`), `console-10` (UI-19, тема antd и шрифты
+     без CDN); `deps-15` (DEPS-15, `ratatui-image`) → `tui-04` (TUI-07, мышь и плавный курсор, после `tui-03`). Раздел
+     «Очередь»: `contracts-57` (CTR-85) → `admin-31` (ADM-45) → `console-11` (UI-20). Хвосты: `contracts-58` (CTR-86
+     хранилище `ShareNotification`, CTR-87 `contacts_since` без тела по умолчанию), `app-66` (APP-69, представители в
+     доставке). Подсветка вывода CLI (решение 120): `deps-16` (DEPS-16, `anstream`, `anstyle`, после `admin-30`) →
+     `admin-32` (ADM-46, подсветка `thepost admin` и модуль `tp-admin-client::style`, после `design-01`) → `app-67`
+     (APP-70, справка всех команд, `doctor`, `config check`).
    - 4.3 Встречи: `contracts-34` (CTR-47) → `meta-32`, `dav-04` (RFC 6638, iMIP, занятость), `smtp-13`, `jmap-18` → `app-27`;
      хвосты — `app-36` (APP-38, подключения в узле) после `dav-07`, `jmap-20`, `admin-13`, `app-26`;
      `meta-35` (META-54, разворот повторов) — после `meta-32` (META-51) и `contracts-42` (CTR-59), решение 59;
@@ -132,7 +142,9 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
    - Приёмка этапа: `deploy-18` (CMP-10) — критерий Ф2 на бете.
    - 4.4 «Рюшечки» Ф2 (после приёмки): `contracts-35` (общий доступ, представители, ресурсы) → `meta-33`, `auth-07`, `dav-05`,
      `jmap-19`, `admin-11` → `console-04`, `jmap-22` (тип `resource` в Principal), `smtp-19` (`SENT-BY`); `dav-06` (публикация ICS, FBURL, оргструктура в GAL) — после `contracts-23`, `contracts-24`,
-     `meta-16`, `auth-05` этапа 3.
+     `meta-16`, `auth-05` этапа 3. Решение 121: `app-68` (APP-71, подключение общего доступа, представителей и
+     бронирования в узле), `docs-09` (DOC-09) — после `dav-05`; тип ресурса — `contracts-59` (CTR-88) → `meta-54`
+     (META-81), `admin-33` (ADM-47) → `console-12` (UI-21), `dav-17` (DAV-38, после `dav-05`), `jmap-28` (JMAP-45).
 
 ## Ф0. Основа (≈3 мес.)
 
@@ -581,6 +593,27 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ deploy-39 | DEP-53 | A | sys-11 | 2 |
 | ✅ docs-06 | DOC-06 | A | admin-25 | 1 |
 | ✅ deploy-40 | DEP-54 | A | deploy-29 | 1 |
+| ✅ deps-14 (ветка `x/deps-14`) | DEPS-14 | B | — | 1 |
+| admin-30 (ветка `x/admin-30`) | ADM-44 | B | — | 1 |
+| tui-01 | TUI-01, TUI-02 | A | deps-14, admin-30 | 1 |
+| ✅ deploy-41 | DEP-55 | A | — | 1 |
+| tui-02 | TUI-03, TUI-04 | A | tui-01, deploy-41 | 1 |
+| app-65 | TUI-05 | A | tui-01 | 1 |
+| ci-14 (ветка `x/ci-14`) | CI-16 | B | tui-01 | 1 |
+| docs-08 | DOC-08 | A | tui-02 | 1 |
+| design-01 (ветка `x/design-01`) | DES-01 | B | — | 1 |
+| deps-15 (ветка `x/deps-15`) | DEPS-15 | B | deps-14 | 1 |
+| tui-03 | TUI-06 | A | tui-01, design-01 | 1 |
+| tui-04 | TUI-07 | A | tui-03, deps-15 | 1 |
+| console-10 | UI-19 | A | design-01 | 1 |
+| contracts-57 (ветка `x/contracts-57`) | CTR-85 | B | — | 1 |
+| admin-31 | ADM-45 | A | contracts-57 | 1 |
+| console-11 | UI-20 | A | admin-31 | 1 |
+| contracts-58 (ветка `x/contracts-58`) | CTR-86, CTR-87 | B | — | 1 |
+| app-66 (ветка `x/app-66`) | APP-69 | B | — | 1 |
+| deps-16 (ветка `x/deps-16`) | DEPS-16 | B | admin-30 | 1 |
+| admin-32 | ADM-46 | A | admin-30, design-01, deps-16 | 1 |
+| app-67 | APP-70 | A | admin-32 | 1 |
 | ✅ app-47 | APP-54 | A | — | 2 |
 | ✅ contracts-46 (ветка `x/contracts-46`) | CTR-25, CTR-67, CTR-68, CTR-70 | B | contracts-37 | 1 |
 | ✅ contracts-51 (ветка `x/contracts-51`) | CTR-79 | B | contracts-46 | 1 |
@@ -737,6 +770,14 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 | ✅ app-46 | APP-53 | A | jmap-18, dav-10 | 2 |
 | smtp-19 | SMTP-38 | A | smtp-13, contracts-35 | 4 |
 | ✅ app-51 | APP-58 | A | deps-12 | 2 |
+| app-68 | APP-71 | A | dav-05 | 2 |
+| docs-09 | DOC-09 | A | dav-05 | 1 |
+| contracts-59 (ветка `x/contracts-59`) | CTR-88 | B | — | 1 |
+| meta-54 | META-81 | A | contracts-59 | 3 |
+| admin-33 | ADM-47 | A | contracts-59, admin-30 | 3 |
+| console-12 | UI-21 | A | admin-33 | 1 |
+| dav-17 | DAV-38 | A | contracts-59, dav-05 | 4 |
+| jmap-28 | JMAP-45 | A | contracts-59 | 3 |
 
 Выход Ф2: `docs/manual-tests/CMP-10.md` на бете без «не прошёл» — календари, контакты, правила и автоответы проверены клиентами
 (Thunderbird, iOS и macOS, DAVx5, Evolution, Postman); консоль покрывает Admin API (`console/coverage-pending.txt` пуст, UI-09).
@@ -744,7 +785,7 @@ Admin API — 500), `smtp-17` (FIX-01) → `app-44` (FIX-02, одобрение 
 Строки от `auth-08` до `app-36` — хвосты облачных волн 2026-11-12 (PR #426, #427, #428, #429, #431, #439–#442, #444); карточки с
 пометкой «Требует подтверждения владельца» — перед запуском — ответ владельца. Строки от `contracts-40` до `jmap-22` — хвосты
 PR 10–12.11 (#293, #443, #449). Строки от `contracts-41` до `smtp-16` — синк 12.11, часть 2 (решения 68–78). Строки от
-`meta-41` до `smtp-19` — реестр недоделок облачных волн 12.11, п. 26–55 (`smtp-19` — шаг 4.4). Строка `app-51` — п. 62–91 (шаг 4.2).
+`meta-41` до `smtp-19` — реестр недоделок облачных волн 12.11, п. 26–55 (`smtp-19` — шаг 4.4). Строка `app-51` — п. 62–91 (шаг 4.2). Строки от `app-68` до `jmap-28` — решение 121 и хвосты dav-05 (#756), шаг 4.4.
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 

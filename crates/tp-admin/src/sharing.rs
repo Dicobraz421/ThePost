@@ -12,8 +12,8 @@
 //!   права отзывают запись.
 //!
 //! Выдача прав и назначение представителя — в пределах политики организации: проверяет единый слой прав
-//! (`tp_auth::CollectionAuthorizer::check_grant`, `check_delegate`) от имени владельца — администратор действует за
-//! него; сверх политики — 409 с пояснением. Ужесточение политики уже выданное не удаляет: его ограничивает слой авторизации
+//! (`SharingAuthorizer::check_grant`, `check_delegate` в `tp_auth::CollectionAuthorizer`) от имени владельца —
+//! администратор действует за него; сверх политики — 409 с пояснением. Ужесточение политики уже выданное не удаляет: его ограничивает слой авторизации
 //! (`SharingPolicy::limit`, `tp-auth`). Ресурсы и правила бронирования — [`crate::resources`]. Хранилища подключает
 //! [`Admin::with_sharing`]; без них маршруты отвечают 503. Изменения пишет в журнал аудита слой доступа
 //! ([`crate::server`]).
@@ -21,10 +21,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, put};
-use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tp_auth::CollectionAuthorizer;
 use tp_contracts::auth::Principal;
@@ -32,13 +32,14 @@ use tp_contracts::dav::{CollectionId, CollectionKind, DavStore};
 use tp_contracts::meta::{Account, AccountScope};
 use tp_contracts::sharing::{
     ANYONE, CollectionAcl, CollectionAclEntry, CollectionRights, Delegate, DelegateLevel,
-    DelegateStore, ResourceStore, SharingPolicy, SharingPolicyStore, SharingScope,
-    validate_identifier,
+    DelegateStore, ResourceStore, SharingAuthorizer, SharingPolicy, SharingPolicyStore,
+    SharingScope, validate_identifier,
 };
 use tp_contracts::{AccountId, Error, GroupId, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::accounts::account;
+use crate::extract::{Json, Path};
 use crate::server::{Admin, ApiResult, Problem, Refused};
 
 /// Хранилища общего доступа, представителей и ресурсов (CTR-48; реализации — `tp-meta`).

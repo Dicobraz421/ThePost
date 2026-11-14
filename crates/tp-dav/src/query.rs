@@ -37,6 +37,7 @@ use calcard::icalendar::{
 use time::{Date, Month, OffsetDateTime};
 use tp_contracts::Result;
 use tp_contracts::dav::{Collection, CollectionKind, Component, DavObject, TimeRange};
+use tp_contracts::sharing::CollectionRights;
 
 use crate::path::{self, Target};
 use crate::props::{self, Res, Want, content_type};
@@ -846,6 +847,19 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
     let Some(c) = cx.store().collection_by_name(cx.scope, kind, name).await? else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
+    // Чужой календарь: отчёт занятости — с правом занятости, остальные — с правом чтения (DAV-17).
+    let need = if root.name == "free-busy-query" {
+        CollectionRights::FREE_BUSY
+    } else {
+        CollectionRights::READ
+    };
+    if !cx.rights.contains(need) {
+        return Ok(crate::share::need_privileges(
+            target,
+            cx.login(),
+            "<d:read/>",
+        ));
+    }
     match root.name.as_str() {
         "calendar-query" => calendar_query(cx, &c, root).await,
         "calendar-multiget" => multiget(cx, &c, root).await,

@@ -261,7 +261,7 @@ async fn run_query(ctx: &Ctx<'_>, a: &QueryArgs) -> MethodResult<Vec<String>> {
     let store = ctx.jmap.dav_store()?;
     let mut zones = Zones::new(request);
     let mut items = Vec::new();
-    for cal in calendar_ids(store.as_ref(), ctx.scope).await? {
+    for cal in calendar_ids(ctx).await? {
         let tz = zones.of(store.as_ref(), ctx.scope, cal).await?;
         for obj in candidates(ctx, cal, range).await? {
             let json = event_json(&obj);
@@ -335,7 +335,7 @@ pub(crate) async fn query(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: QueryArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     let st = state(ctx.jmap.dav_store()?.as_ref(), ctx.scope).await?;
     let ids = run_query(ctx, &a).await?;
     let mut out = object(json!({
@@ -360,7 +360,7 @@ pub(crate) async fn query_changes(
     let mut rest = args;
     rest.retain(|k, _| !matches!(k.as_str(), "expandRecurrences" | "timeZone"));
     let qc: QueryChangesArgs = parse_args(rest)?;
-    ctx.check_account(&qc.account_id)?;
+    ctx.open_dav(&qc.account_id).await?;
     if expand {
         return Err(MethodError::new("cannotCalculateChanges"));
     }

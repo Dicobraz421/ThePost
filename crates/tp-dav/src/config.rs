@@ -55,7 +55,8 @@ pub struct DavConfig {
     pub max_photo_size: usize,
     /// Отображаемое имя глобальной адресной книги (каталог организации, только для чтения; [`crate::gal::sync`]).
     pub gal_name: String,
-    /// Записей каталога в одной порции при построении глобальной адресной книги.
+    /// Записей каталога в одной порции при построении глобальной адресной книги и учётных записей — при поиске
+    /// принципалов.
     pub gal_page_size: usize,
     /// Отображаемое имя адресной книги по умолчанию (создаётся при первом обращении к дому адресных книг).
     pub default_addressbook_name: String,
@@ -74,6 +75,11 @@ pub struct DavConfig {
     pub schedule_write_attempts: usize,
     /// Участников в одном запросе занятости (`POST` VFREEBUSY в `schedule-outbox`); больше — 403.
     pub max_freebusy_attendees: usize,
+    /// Учётных записей, просматриваемых одним поиском принципалов (`principal-property-search`,
+    /// `calendarserver-principal-search`; DAV-19); остальные не ищутся.
+    pub principal_search_scan: usize,
+    /// Найденных принципалов в одном ответе поиска; клиент может запросить меньше (`cs:nresults`).
+    pub principal_search_results: usize,
 }
 
 impl Default for DavConfig {
@@ -99,6 +105,8 @@ impl Default for DavConfig {
             schedule_processed_ttl: Duration::from_secs(30 * 24 * 3600),
             schedule_write_attempts: 3,
             max_freebusy_attendees: 100,
+            principal_search_scan: 10_000,
+            principal_search_results: 50,
         }
     }
 }

@@ -10,7 +10,8 @@
 //! - [`oidc`] — [`Authenticator`] для токенов OpenID Connect (Bearer);
 //! - [`authz`] — [`Authorizer`](tp_contracts::auth::Authorizer) поверх ACL папок (RFC 4314), групп и
 //!   делегирования отправки (Send As / Send on Behalf);
-//! - [`sharing`] — права на календари и адресные книги ([`CollectionAuthorizer`]): владелец, общий доступ,
+//! - [`sharing`] — права на календари и адресные книги ([`CollectionAuthorizer`] —
+//!   [`SharingAuthorizer`](tp_contracts::sharing::SharingAuthorizer)): владелец, общий доступ,
 //!   представители, политика организации;
 //! - [`gssapi`] — Kerberos: механизм SASL GSSAPI (системная MIT Kerberos — feature `gssapi`) и
 //!   [`KerberosAuthenticator`] (принципал → учётная запись);

@@ -211,7 +211,9 @@ async fn event_id(
 /// Событие JSCalendar из сообщения входящих.
 fn message_event(item: &InboxItem) -> Map<String, Value> {
     let msg = &item.message;
-    let mut event = split(&msg.body).map(|(_, e)| e).unwrap_or_default();
+    let mut event = split(&msg.body, "Event")
+        .map(|(_, e)| e)
+        .unwrap_or_default();
     event.entry("@type").or_insert_with(|| json!("Event"));
     event.entry("uid").or_insert_with(|| json!(msg.uid));
     event
@@ -295,7 +297,7 @@ pub(crate) async fn notification_get(
             out
         }
     };
-    let cals = calendar_ids(store.as_ref(), ctx.scope).await?;
+    let cals = calendar_ids(ctx).await?;
     for item in picked {
         list.push(select(
             notification(ctx, store.as_ref(), &cals, item).await?,
@@ -415,7 +417,7 @@ pub(crate) async fn notification_query(
     let inbox = store.inbox_list(ctx.scope).await?;
     // `calendarEventId` ищется по календарям, только если фильтр по нему.
     let cals = match filter {
-        Some(f) if uses(f, "calendarEventIds") => calendar_ids(store.as_ref(), ctx.scope).await?,
+        Some(f) if uses(f, "calendarEventIds") => calendar_ids(ctx).await?,
         _ => Vec::new(),
     };
     let mut found = Vec::new();

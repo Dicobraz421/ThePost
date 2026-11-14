@@ -166,6 +166,9 @@ async fn ios_snapshot() {
     <d:href>/dav/principals/ivan@example.org/</d:href>
     </d:current-user-principal>
     <d:displayname>ivan@example.org</d:displayname>
+    <cs:email-address-set>
+    <cs:email-address>ivan@example.org</cs:email-address>
+    </cs:email-address-set>
     <d:principal-URL>
     <d:href>/dav/principals/ivan@example.org/</d:href>
     </d:principal-URL>
@@ -176,7 +179,6 @@ async fn ios_snapshot() {
     <d:propstat>
     <d:prop>
     <cs:dropbox-home-URL/>
-    <cs:email-address-set/>
     <d:resource-id/>
     </d:prop>
     <d:status>HTTP/1.1 404 Not Found</d:status>

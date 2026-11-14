@@ -58,12 +58,18 @@ paths = ["crates/tp-search/*"]
 # Остальные файлы крейта thepost — полоса app.
 paths = ["crates/tp-admin/*", "crates/tp-admin-client/*", "crates/thepost/src/admin_cli.rs"]
 
+[lane.tui]
+paths = ["crates/tp-tui/*"]
 [lane.app]
 paths = ["crates/thepost/*"]
 
 [lane.console]
 # Веб-консоль (SRS 5.2, CI-06): Refine, сборка console/dist вшивается в бинарный файл.
 paths = ["console/*"]
+
+[lane.design]
+# Фирменный стиль (решение 119, DES-01): токены design/tokens.toml и знак — общий источник консоли, tp-tui и CLI.
+paths = ["design/*"]
 
 [lane.deploy]
 paths = ["deploy/*"]

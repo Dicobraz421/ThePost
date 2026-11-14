@@ -36,11 +36,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -56,7 +56,8 @@ use tp_contracts::transport::{AcceptedDomain, DomainKind};
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::server::{Admin, AdminRole, ApiError, Caller, Problem};
+use crate::extract::Json;
+use crate::server::{Admin, AdminRole, ApiError, Caller, Problem, Refused};
 
 /// Маршрут сессии: способы входа (`GET`), вход по паролю и обмен локального токена (`POST`).
 pub const SESSION_ROUTE: &str = "/api/v1/session";
@@ -710,6 +711,7 @@ async fn session_info(State(a): State<Arc<Admin>>) -> Json<SessionInfo> {
         (status = 401, description = "неверный пароль или токен, блокировка перебора", body = Problem),
         (status = 403, description = "у учётной записи нет ролей администрирования", body = Problem),
         (status = 404, description = "вход по паролю выключен (`admin.password_login`)", body = Problem),
+        (status = 413, description = "тело больше `admin.max_body_size`", body = Problem),
         (status = 503, body = Problem)))]
 async fn create_session(State(a): State<Arc<Admin>>, req: Request) -> Response {
     // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`): по нему — защита от перебора.
@@ -724,7 +726,8 @@ async fn create_session(State(a): State<Arc<Admin>>, req: Request) -> Response {
         Ok(body) => password_login(&a, &body, peer, now).await,
         Err(_) => Attempt::anonymous(
             String::new(),
-            Err(Denied::Invalid(
+            Err(Denied::Request(
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "тело запроса больше admin.max_body_size".into(),
             )),
         ),
@@ -759,7 +762,7 @@ async fn create_session(State(a): State<Arc<Admin>>, req: Request) -> Response {
         }
         Err(Denied::Credentials(e)) => crate::server::auth_error(&e),
         Err(Denied::Disabled) => ApiError(Error::NotFound).into_response(),
-        Err(Denied::Invalid(m)) => ApiError(Error::Invalid(m)).into_response(),
+        Err(Denied::Request(status, m)) => Refused::Problem(status, m).into_response(),
         Err(Denied::NoRole) => ApiError(Error::Forbidden).into_response(),
     }
 }
@@ -769,8 +772,9 @@ async fn create_session(State(a): State<Arc<Admin>>, req: Request) -> Response {
 enum Denied {
     /// Вход по паролю выключен (`admin.password_login`).
     Disabled,
-    /// Тело запроса.
-    Invalid(String),
+    /// Тело запроса не разобрано ([`crate::extract::json_body`]) или не по смыслу: код (400, больше
+    /// `admin.max_body_size` — 413) и пояснение.
+    Request(StatusCode, String),
     /// Учётные данные не приняты (`Forbidden` — 401) или временная ошибка (её код).
     Credentials(Error),
     /// Учётные данные верны, ролей администрирования нет.
@@ -800,7 +804,7 @@ impl Attempt {
         match &self.result {
             Ok(_) => StatusCode::CREATED,
             Err(Denied::Disabled) => StatusCode::NOT_FOUND,
-            Err(Denied::Invalid(_)) => StatusCode::BAD_REQUEST,
+            Err(Denied::Request(status, _)) => *status,
             Err(Denied::Credentials(e)) if e.is_retryable() => StatusCode::SERVICE_UNAVAILABLE,
             Err(Denied::Credentials(_)) => StatusCode::UNAUTHORIZED,
             Err(Denied::NoRole) => StatusCode::FORBIDDEN,
@@ -815,15 +819,10 @@ async fn password_login(
     peer: Option<IpAddr>,
     now: OffsetDateTime,
 ) -> Attempt {
-    let req = match serde_json::from_slice::<PasswordLogin>(body) {
+    let req = match crate::extract::json_body::<PasswordLogin>(body) {
         Ok(r) => r,
-        Err(e) => {
-            return Attempt::anonymous(
-                String::new(),
-                Err(Denied::Invalid(format!(
-                    "тело запроса — не PasswordLogin: {e}"
-                ))),
-            );
+        Err((status, m)) => {
+            return Attempt::anonymous(String::new(), Err(Denied::Request(status, m)));
         }
     };
     let login: String = req.login.trim().chars().take(MAX_LOGIN_CHARS + 1).collect();
@@ -832,7 +831,7 @@ async fn password_login(
     }
     if login.is_empty() || login.chars().count() > MAX_LOGIN_CHARS || req.password.is_empty() {
         let m = format!("login — от 1 до {MAX_LOGIN_CHARS} символов, password — непустой");
-        return Attempt::anonymous(login, Err(Denied::Invalid(m)));
+        return Attempt::anonymous(login, Err(Denied::Request(StatusCode::BAD_REQUEST, m)));
     }
     let Some(local) = a.local.as_deref() else {
         return Attempt::anonymous(login, Err(Denied::Credentials(Error::UNAVAILABLE)));
@@ -1221,17 +1220,25 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(env.auth.peers(), vec![Some(peer.ip())]);
 
-        for bad in [
-            json!({"login": "admin@example.org"}),
-            json!({"login": "a@b.test", "password": "x", "otp": "1"}),
-            json!({"login": " ", "password": "x"}),
-            json!({"login": "a@b.test", "password": ""}),
-            json!({"login": "a".repeat(400), "password": "x"}),
+        // Ошибка разбора — тот же отказ, что у остальных маршрутов (`crate::extract`): 400 problem+json, поле в `detail`.
+        for (bad, field) in [
+            (json!({"login": "admin@example.org"}), "password"),
+            (
+                json!({"login": "a@b.test", "password": "x", "otp": "1"}),
+                "otp",
+            ),
+            (json!({"login": 7, "password": "x"}), "login"),
+            (json!({"login": " ", "password": "x"}), "login"),
+            (json!({"login": "a@b.test", "password": ""}), "password"),
+            (json!({"login": "a".repeat(400), "password": "x"}), "login"),
         ] {
-            let (s, _, b) = env
+            let (s, h, b) = env
                 .call("POST", SESSION_ROUTE, None, Some(bad.clone()))
                 .await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {b}");
+            assert_eq!(h[header::CONTENT_TYPE], "application/problem+json");
+            let detail = b["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains(field), "{bad}: {detail}");
         }
         assert_eq!(
             env.auth.peers().len(),

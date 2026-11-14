@@ -23,10 +23,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::routing::{get, put};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use tp_contracts::config::duration;
 use tp_contracts::meta::{
@@ -37,6 +37,7 @@ use tp_contracts::transport::normalize_domain;
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::extract::{Json, Path, Query};
 use crate::retention::TrashPurgeRuleBody;
 use crate::server::{Admin, ApiResult, Caller, Problem, Refused};
 
@@ -320,7 +321,7 @@ async fn list_orgs(
     Extension(c): Extension<Caller>,
 ) -> ApiResult<Json<Vec<Organization>>> {
     let mut out = Vec::new();
-    for org in [TenantId::DEFAULT] {
+    for &org in &a.organizations {
         if c.permits(Some(org), &Method::GET, "/api/v1/orgs/{org}") {
             out.push(organization(&a, org).await?);
         }
@@ -716,7 +717,7 @@ async fn put_account_policy(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use axum::http::{StatusCode, header};
     use serde_json::{Value, json};
     use tp_contracts::TenantId;
 
@@ -728,19 +729,34 @@ mod tests {
         format!("/api/v1/orgs/{}", TenantId::DEFAULT)
     }
 
-    /// Приёмка ADM-26: администратор инсталляции и организации видят организацию по умолчанию, без прав — 403.
+    /// Приёмка ADM-26: администратор инсталляции видит все организации инсталляции, администратор и оператор
+    /// организации — свою, без прав — 403.
     #[tokio::test]
     async fn list_orgs() {
         let env = Env::new();
-        for token in ["root", "org", "operator"] {
+        let ids = |b: &Value| -> Vec<String> {
+            b.as_array()
+                .into_iter()
+                .flatten()
+                .map(|o| o["id"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        };
+        let (s, _, b) = env.call("GET", "/api/v1/orgs", Some("root"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let all = [TenantId::DEFAULT, env.other_tenant].map(|t| t.to_string());
+        assert_eq!(ids(&b), all, "{b}");
+        for token in ["org", "operator"] {
             let (s, _, b) = env.call("GET", "/api/v1/orgs", Some(token), None).await;
             assert_eq!(s, StatusCode::OK, "{token}");
-            assert_eq!(b.as_array().map(Vec::len), Some(1), "{token}: {b}");
-            assert_eq!(b[0]["id"], TenantId::DEFAULT.to_string());
+            assert_eq!(ids(&b), [TenantId::DEFAULT.to_string()], "{token}: {b}");
             assert_eq!(b[0]["default"], true);
         }
         let (_, _, b) = env.call("GET", "/api/v1/orgs", Some("other"), None).await;
-        assert_eq!(b, json!([]), "администратор другой организации");
+        assert_eq!(
+            ids(&b),
+            [env.other_tenant.to_string()],
+            "администратор другой организации"
+        );
         for token in ["user", "auditor"] {
             let (s, _, _) = env.call("GET", "/api/v1/orgs", Some(token), None).await;
             assert_eq!(s, StatusCode::FORBIDDEN, "{token}");
@@ -767,7 +783,7 @@ mod tests {
 
         for bad in [json!({"trash_retention": "14 days"}), json!({"quota": 1})] {
             let (s, _, _) = env.call("PUT", &policy, Some("org"), Some(bad)).await;
-            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(s, StatusCode::BAD_REQUEST);
         }
     }
 
@@ -787,6 +803,30 @@ mod tests {
         let bad = "/api/v1/orgs/not-a-uuid";
         let (s, _, _) = env.call("GET", bad, Some("root"), None).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Приёмка ADM-43: организации нет — 404 на любом маршруте `{org}` (изменение её не создаёт); администратору
+        // другой организации — 403, а не 404: существование чужих не раскрывается.
+        let ghost = format!("/api/v1/orgs/{}", TenantId::new());
+        for (method, path, body) in [
+            ("GET", ghost.clone(), None),
+            ("GET", format!("{ghost}/accounts"), None),
+            ("GET", format!("{ghost}/audit"), None),
+            (
+                "PUT",
+                format!("{ghost}/policy"),
+                Some(json!({"quota_bytes": 1})),
+            ),
+        ] {
+            let (s, h, b) = env.call(method, &path, Some("root"), body).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{method} {path}: {b}");
+            assert_eq!(h[header::CONTENT_TYPE], "application/problem+json");
+        }
+        let last = env.audit.records().pop().expect("audit");
+        assert_eq!((last.method.as_str(), last.status), ("PUT", 404));
+        let (_, _, b) = env.call("GET", "/api/v1/orgs", Some("root"), None).await;
+        assert_eq!(b.as_array().map(Vec::len), Some(2), "призрака нет: {b}");
+        let (s, _, _) = env.call("GET", &ghost, Some("org"), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
 
         let policy = format!("{other}/policy");
         let (s, _, _) = env.call("PUT", &policy, Some("org"), Some(json!({}))).await;
@@ -1329,11 +1369,12 @@ mod tests {
         );
         assert_eq!(b["id"], scope.account.to_string(), "запись та же");
 
-        // Пустое тело и неизвестное поле — 422; пустое имя — 400.
-        for bad in [json!({}), json!({"login": "x@example.org"})] {
-            let (s, _, _) = env.call("PATCH", &one, Some("org"), Some(bad)).await;
-            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-        }
+        // Пустое тело — 422; неизвестное поле (разбор тела) и пустое имя — 400.
+        let (s, _, _) = env.call("PATCH", &one, Some("org"), Some(json!({}))).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        let bad = json!({"login": "x@example.org"});
+        let (s, _, _) = env.call("PATCH", &one, Some("org"), Some(bad)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
         for bad in [
             json!({"display_name": "  "}),
             json!({"display_name": "a\nb"}),

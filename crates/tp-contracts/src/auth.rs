@@ -462,7 +462,8 @@ pub enum SendRight {
 }
 
 /// Проверка прав субъекта (ACL RFC 4314 папок, делегирование отправки). Реализация — `tp-auth`
-/// поверх ACL в метаданных; владелец учётной записи имеет [`Rights::ALL`].
+/// поверх ACL в метаданных; владелец учётной записи имеет [`Rights::ALL`]. Права на календари и адресные книги —
+/// [`SharingAuthorizer`](crate::sharing::SharingAuthorizer) (CTR-84).
 #[async_trait]
 pub trait Authorizer: Send + Sync + 'static {
     /// Действующие права субъекта на объект (IMAP MYRIGHTS, JMAP `myRights`).

@@ -14,6 +14,8 @@ FROM node:${NODE_VERSION}-bookworm-slim AS console-1
 WORKDIR /console
 COPY console/package.json console/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-fund --no-audit
+# Токены фирменного стиля (решение 119, DES-01): консоль читает ../design/tokens.toml и знак при сборке (UI-19).
+COPY design/ /design/
 COPY console/ ./
 RUN npm run build && test -f dist/index.html && mv dist /dist
 

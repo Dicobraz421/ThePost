@@ -196,6 +196,9 @@ Admin API — `thepost_admin_listen` (`127.0.0.1:8443`).
 его в памяти, `files` — с управляющей машины), при `acme` — сам узел (политика `thepost` разрешает ему запись только
 этого пути). Новая версия секрета узел подхватывает без перезапуска.
 Дополнительные параметры `config.yaml` — `thepost_config_extra` (рекурсивно поверх эталона).
+Первая строка `config.yaml` из роли — метка `# thepost: managed-by=ansible` (из чарта `helm/thepost` —
+`# thepost: managed-by=helm`, DEP-55): файл правят через инвентарь или значения чарта, текстовый интерфейс открывает
+его только на чтение. Для YAML это комментарий, `thepost config check` его не читает.
 Системная библиотека MIT Kerberos (`thepost_system_packages`: apt — `libgssapi-krb5-2`, dnf — `krb5-libs`) ставится до
 бинарного файла: выпуск и бета собраны с фичей `gssapi`, без неё `thepost` не запускается. Вход по Kerberos —
 `thepost_gssapi_keytab_src` (раздел «Вход по Kerberos (GSSAPI)» ниже).

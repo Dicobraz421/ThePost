@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use tp_contracts::TenantId;
 use tp_contracts::dav::{Collection, CollectionKind, DavStore};
 use tp_contracts::meta::AccountScope;
-use tp_testkit::{FakeAuthenticator, FakeDirectory, MemDav, MemGroups, principal};
+use tp_testkit::{FakeAuthenticator, FakeDirectory, MemAddressBook, MemDav, MemGroups, principal};
 
 use crate::{DavConfig, Deps, GalDeps, router};
 
@@ -28,6 +28,7 @@ mod propfind;
 mod query;
 mod resource;
 mod schedule;
+mod sharing;
 mod sync;
 
 /// Вошедший пользователь.
@@ -48,6 +49,8 @@ pub(crate) struct Env {
     pub dir: FakeDirectory,
     /// Группы рассылки (скрытие из адресной книги).
     pub groups: MemGroups,
+    /// Почтовые контакты (скрытие из адресной книги).
+    pub contacts: MemAddressBook,
     /// Настройки сервера.
     pub cfg: DavConfig,
 }
@@ -71,10 +74,12 @@ impl Env {
         let store = MemDav::new();
         let dir = FakeDirectory::default();
         let groups = MemGroups::new();
+        let contacts = MemAddressBook::new();
         let app = router(
             Deps {
                 auth: Arc::new(auth.clone()),
                 store: Arc::new(store.clone()),
+                sharing: None,
             },
             cfg.clone(),
         );
@@ -84,6 +89,7 @@ impl Env {
             auth,
             dir,
             groups,
+            contacts,
             cfg,
             scope: AccountScope {
                 tenant,
@@ -92,11 +98,13 @@ impl Env {
         }
     }
 
-    /// Книга GAL организации из каталога [`Env::dir`] и групп [`Env::groups`] ([`crate::gal::sync`]).
+    /// Книга GAL организации из каталога [`Env::dir`], групп [`Env::groups`] и контактов [`Env::contacts`]
+    /// ([`crate::gal::sync`]).
     pub(crate) async fn sync_gal(&self) {
         let source = GalDeps {
             directory: Arc::new(self.dir.clone()),
             groups: Some(Arc::new(self.groups.clone())),
+            contacts: Some(Arc::new(self.contacts.clone())),
         };
         crate::gal::sync(&source, &self.store, self.scope.tenant, &self.cfg)
             .await

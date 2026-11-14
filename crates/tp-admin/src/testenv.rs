@@ -467,11 +467,12 @@ impl Env {
         };
         let sieve = MemSieve::new();
         let held_blobs = MemBlobStore::new(Arc::new(SystemClock));
-        let admin = Arc::new(
-            admin
-                .with_sieve(Arc::new(sieve.clone()), check_script)
-                .with_held_blobs(Arc::new(held_blobs.clone())),
-        );
+        let mut admin = admin
+            .with_sieve(Arc::new(sieve.clone()), check_script)
+            .with_held_blobs(Arc::new(held_blobs.clone()));
+        // Вторая организация инсталляции — для проверок области ролей.
+        admin.organizations.insert(other_tenant);
+        let admin = Arc::new(admin);
         let app_passwords = stores.app_passwords();
         let Stores {
             meta,

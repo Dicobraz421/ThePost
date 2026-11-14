@@ -489,6 +489,13 @@ pub(crate) async fn report(cx: &Cx<'_>, target: &Target, root: &Element) -> Resu
     let Target::Collection(CollectionKind::AddressBook, _, name) = target else {
         return Ok(unsupported());
     };
+    if !cx.rights.read {
+        return Ok(crate::share::need_privileges(
+            target,
+            cx.login(),
+            "<d:read/>",
+        ));
+    }
     let kind = CollectionKind::AddressBook;
     let Some(c) = cx.store().collection_by_name(cx.scope, kind, name).await? else {
         return Ok(status(StatusCode::NOT_FOUND));

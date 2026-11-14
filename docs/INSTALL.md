@@ -218,6 +218,8 @@ Ansible — `thepost_cli_oidc` (например `{ client_id: thepost-cli }`), 
 | `maintenance.verify.lease_ttl` | `2m` | срок лизы; продлевается во время прохода и держится после него — должен покрывать расхождение часов узлов |
 | `dav.schedule_keep_processed` | `true` | хранить применённые сервером сообщения iTIP для ленты уведомлений JMAP (`CalendarEventNotification`); во входящих планирования CalDAV они не видны, их удаляет очистка по сроку (роль maintenance). `false` — не хранить, лента пуста |
 | `dav.schedule_processed_ttl` | `30d` | срок хранения этих сообщений при `dav.schedule_keep_processed: true` |
+| `dav.principal_search_scan` | `10000` | сколько учётных записей организации просматривает один поиск принципалов (`principal-property-search`, `calendarserver-principal-search`: выбор участников и переговорных в клиенте); остальные не ищутся. Целое число. Если в организации записей больше, часть сотрудников и переговорных не находится — увеличьте значение |
+| `dav.principal_search_results` | `50` | сколько найденных принципалов отдаётся в одном ответе поиска. В `calendarserver-principal-search` клиент может запросить меньше (`cs:nresults`), больше этого значения — не получит; при превышении ответ содержит найденное и статус `507` (`number-of-matches-within-limits`). Целое число |
 
 `thepost config check` отклоняет нулевые `purge_interval`, `gal_interval`, `verify.interval`, `verify.lease_ttl`,
 пустой `verify.lease_name` и `verify.at` не в виде `ЧЧ:ММ`. Удалённые ключи `smtp.queue.poll_interval` и

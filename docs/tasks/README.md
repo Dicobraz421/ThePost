@@ -596,6 +596,30 @@
 | [DEP-53](DEP-53.md) | развёртывание: KRB5RCACHEDIR — каталог кэша повторов Kerberos узла | deploy | A | deploy-39 | done | SYS-16 |
 | [DOC-06](DOC-06.md) | INSTALL: `admin transport domain` вместо `admin domain`, вход `admin login --oidc` | docs | A | docs-06 | done | ADM-38,ADM-39 |
 | [DEP-54](DEP-54.md) | развёртывание: принципал `pop/<узел>` в keytab для входа GSSAPI по POP3 | deploy | A | deploy-40 | done | DEP-39 |
+| [DEPS-14](DEPS-14.md) | зависимости текстового интерфейса — `ratatui`, `crossterm` | deps | B | deps-14 | done | — |
+| [ADM-44](ADM-44.md) | клиент Admin API — общий крейт для CLI и текстового интерфейса | admin | B | admin-30 | ready | — |
+| [TUI-01](TUI-01.md) | каркас текстового интерфейса — две панели, клавиши, вход | tui | A | tui-01 | todo | DEPS-14,ADM-44 |
+| [TUI-02](TUI-02.md) | общий движок списков и форм по схеме Admin API | tui | A | tui-01 | todo | TUI-01 |
+| [DEP-55](DEP-55.md) | метка «управляется Ansible/Helm» в config.yaml | deploy | A | deploy-41 | done | — |
+| [TUI-03](TUI-03.md) | раскладки главных разделов | tui | A | tui-02 | todo | TUI-02 |
+| [TUI-04](TUI-04.md) | конфигурация узла в текстовом интерфейсе | tui | A | tui-02 | todo | TUI-02,DEP-55 |
+| [TUI-05](TUI-05.md) | подкоманда `thepost admin tui` в узле | app | A | app-65 | todo | TUI-01 |
+| [CI-16](CI-16.md) | покрытие Admin API тремя клиентами | ci | B | ci-14 | todo | TUI-02 |
+| [DOC-08](DOC-08.md) | руководство по текстовому интерфейсу | docs | A | docs-08 | todo | TUI-03,TUI-04 |
+| [DES-01](DES-01.md) | файл токенов фирменного стиля и проверка контраста в CI | design | B | design-01 | ready | — |
+| [DEPS-15](DEPS-15.md) | зависимости картинок и мыши текстового интерфейса — `ratatui-image`, `evdev` | deps | B | deps-15 | ready | DEPS-14 |
+| [TUI-06](TUI-06.md) | тема текстового интерфейса по токенам — пять режимов, палитра консоли Linux, знак IT TASK | tui | A | tui-03 | todo | TUI-01,DES-01 |
+| [TUI-07](TUI-07.md) | мышь в текстовом интерфейсе — щелчки, прокрутка, граница панелей, плавный курсор | tui | A | tui-04 | todo | TUI-06,DEPS-15 |
+| [UI-19](UI-19.md) | веб-консоль на токенах фирменного стиля — тема antd, шрифты в статике | console | A | console-10 | todo | DES-01 |
+| [CTR-85](CTR-85.md) | очередь исходящей почты — список записей и повтор доставки в контракте `QueueStore` | contracts | B | contracts-57 | ready | — |
+| [ADM-45](ADM-45.md) | Admin API очереди — `GET /orgs/{org}/queue`, `POST /orgs/{org}/queue/{id}/retry` | admin | A | admin-31 | todo | CTR-85 |
+| [UI-20](UI-20.md) | консоль — экран «Очередь» | console | A | console-11 | todo | ADM-45 |
+| [CTR-86](CTR-86.md) | хранилище уведомлений о доступе (`ShareNotification`) в контракте | contracts | B | contracts-58 | ready | — |
+| [CTR-87](CTR-87.md) | `Directory::contacts_since` без тела по умолчанию | contracts | B | contracts-58 | ready | — |
+| [APP-69](APP-69.md) | представители (`DelegateStore`) в доставке — приглашения «от имени» по `schedule_on_behalf` | app | B | app-66 | ready | — |
+| [DEPS-16](DEPS-16.md) | зависимости подсветки вывода CLI — `anstream`, `anstyle`, `toml` | deps | B | deps-16 | todo | ADM-44 |
+| [ADM-46](ADM-46.md) | подсветка вывода `thepost admin` — таблицы, ошибки, изменения, JSON; модуль стилей `tp-admin-client::style` | admin | A | admin-32 | todo | ADM-44,DES-01,DEPS-16 |
+| [APP-70](APP-70.md) | подсветка справки всех команд `thepost`, цветные `doctor` и `config check` | app | A | app-67 | todo | ADM-46 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
@@ -822,6 +846,14 @@
 | [APP-53](APP-53.md) | узел: планирование в JMAP и очистка входящих | app | A | app-46 | done | JMAP-31,DAV-32 |
 | [SMTP-38](SMTP-38.md) | iMIP: отправитель «от имени» (`SENT-BY`) | smtp | A | smtp-19 | ready | SMTP-33,CTR-48 |
 | [APP-58](APP-58.md) | узел: вход GSSAPI | app | A | app-51 | done | DEPS-12 |
+| [APP-71](APP-71.md) | узел — общий доступ, представители и бронирование CalDAV (хвост dav-05) | app | A | app-68 | todo | DAV-17,DAV-18,DAV-19 |
+| [DOC-09](DOC-09.md) | INSTALL — ключи поиска принципалов `dav.principal_search_scan`, `dav.principal_search_results` | docs | A | docs-09 | todo | DAV-19 |
+| [CTR-88](CTR-88.md) | тип ресурса бронирования — помещение или оборудование — в контракте | contracts | B | contracts-59 | ready | — |
+| [META-81](META-81.md) | тип ресурса бронирования в PostgreSQL — миграция и хранилище | meta | A | meta-54 | todo | CTR-88 |
+| [ADM-47](ADM-47.md) | тип ресурса бронирования в Admin API и CLI | admin | A | admin-33 | todo | CTR-88,ADM-44 |
+| [UI-21](UI-21.md) | консоль — тип ресурса бронирования | console | A | console-12 | todo | ADM-47 |
+| [DAV-38](DAV-38.md) | `calendar-user-type` по типу ресурса — `ROOM` или `RESOURCE` | dav | A | dav-17 | todo | CTR-88,DAV-19 |
+| [JMAP-45](JMAP-45.md) | `Principal.type` по типу ресурса — `location` или `resource` | jmap | A | jmap-28 | todo | CTR-88 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
@@ -834,5 +866,13 @@
 
 | Задача | Суть | Полоса | Класс | Зависит |
 |---|---|---|---|---|
+| [ADM-41](ADM-41.md) | вход администратора по паролю | admin | B | — |
+| [ADM-42](ADM-42.md) | псевдонимы и скрытие из книги «Организация» учётной записи без LDAP — Admin API, CLI, консоль | admin | B | — |
+| [ADM-43](ADM-43.md) | организация должна существовать; ошибки разбора запроса — 400 problem+json | admin | B | — |
 | [AUTH-09](AUTH-09.md) | пароли приложений на контракте AppPasswordStore | auth | A | CTR-22 |
 | [CTR-22](CTR-22.md) | контракт AppPasswordStore (пароли приложений) | contracts | B | CTR-19,AUTH-02 |
+| [CTR-84](CTR-84.md) | контракт проверки прав на коллекции — `SharingAuthorizer` | contracts | B | CTR-48 |
+| [DAV-36](DAV-36.md) | `dav.schedule_keep_processed` по умолчанию включён | dav | A | DAV-32,APP-53 |
+| [DAV-37](DAV-37.md) | GAL: почтовые контакты в книге «Организация» | dav | B | META-80,DAV-27 |
+| [DOC-07](DOC-07.md) | ожидания APP-28 и CMP-10 по `inbox/`/`outbox/` и ленте уведомлений; значение по умолчанию в INSTALL | docs | A | DAV-36 |
+| [META-80](META-80.md) | почтовые контакты в каталоге PostgreSQL (`Directory::contacts_since`) | meta | A | META-65 |

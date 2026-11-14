@@ -19,6 +19,11 @@
 //! Применённые сообщения во входящих планирования (`dav.schedule_keep_processed`) удаляет по сроку роль maintenance
 //! (`crate::roles::ItipPurge`, APP-53).
 //!
+//! Общий доступ к календарям и книгам (DAV-17, DAV-18, APP-71) — один слой прав на узел ([`Services::collections`]);
+//! CalDAV принимает выдачу прав `POST` (`cs:share`, `share-resource`) и состав групп представителей
+//! (`calendar-proxy`) в хранилища `PgMeta`. Приглашения переговорным и другим ресурсам (DAV-19) решает приём iTIP
+//! узла по правилам бронирования ресурса: ответ организатору организации — в его календарь, внешнему — письмом iMIP.
+//!
 //! Организация — `TenantId::DEFAULT`: несколько организаций на узле — модуль «Мультитенантность» (SRS 1.3).
 
 use std::net::IpAddr;
@@ -39,6 +44,7 @@ use tp_contracts::meta::{AccountScope, AccountStore, MailboxStore, MessageQuery,
 use tp_contracts::queue::Outbound;
 use tp_contracts::sasl::SaslServer;
 use tp_contracts::secrets::SecretStore;
+use tp_contracts::sharing::SharingAuthorizer;
 use tp_contracts::transport::MailFlow;
 use tp_contracts::{Error, Result, TenantId};
 use tp_meta::PgMeta;
@@ -84,6 +90,10 @@ pub struct Services {
     pub sasl: Arc<dyn SaslServer>,
     /// Права на папки и отправку от имени.
     pub authz: Arc<dyn Authorizer>,
+    /// Права на календари и адресные книги (AUTH-12, CTR-84): владелец, записи прав, представители, политика
+    /// организации поверх `PgMeta` — один слой для CalDAV и CardDAV (`tp_dav::Deps::sharing`) и JMAP
+    /// (`Jmap::with_sharing`); Admin API — `Admin::with_sharing` поверх тех же хранилищ.
+    pub collections: Arc<dyn SharingAuthorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL (книгу GAL тогда строит каталог `PgMeta`,
     /// [`Services::gal`]).
     pub directory: Option<Arc<dyn Directory>>,
@@ -259,6 +269,15 @@ impl Services {
             Arc::new(meta.clone()),
             Arc::new(meta.clone()),
         ));
+        let collections: Arc<dyn SharingAuthorizer> =
+            Arc::new(tp_auth::CollectionAuthorizer::new(tp_auth::SharingStores {
+                acl: Arc::new(meta.clone()),
+                delegates: Arc::new(meta.clone()),
+                policy: Arc::new(meta.clone()),
+                dav: Arc::new(meta.clone()),
+                groups: Arc::new(meta.clone()),
+                accounts: Arc::new(meta.clone()),
+            }));
         let directory = ldap.map(|l| l as Arc<dyn Directory>);
 
         // Поиск: индексы на узле, сегменты в BlobStore, кэш; счётчики кэша — в /metrics.
@@ -311,10 +330,22 @@ impl Services {
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
         // Приём iTIP — с настройками секции `dav` (календарь по умолчанию, входящие планирования, лимиты).
-        let itip = Arc::new(tp_dav::ItipInbox::new(
-            Arc::new(meta.clone()),
-            (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
-        ));
+        // Бронирование ресурсов (DAV-19, APP-71): правила, занятость и группы бронирующих — `PgMeta`; ответ внешнему
+        // организатору — письмом iMIP в очередь исходящей почты (с подписью DKIM). Доставка узла здесь не подходит:
+        // она сама держит этот приём iTIP (`Delivery::with_itip`).
+        let itip = Arc::new(
+            tp_dav::ItipInbox::new(
+                Arc::new(meta.clone()),
+                (*cfg.section::<tp_dav::DavConfig>(DAV)?).clone(),
+            )
+            .with_booking(tp_dav::BookingDeps {
+                accounts: Arc::new(meta.clone()),
+                resources: Arc::new(meta.clone()),
+                freebusy: Arc::new(meta.clone()),
+                group_store: Arc::new(meta.clone()),
+                sender: Some(Arc::new(tp_dav::ImipSender::new(queue.clone()))),
+            }),
+        );
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
         // Метка узла в `Received` (`by <smtp.hostname>`) — защита `redirect` от петли.
         let sieve = (*cfg.section::<tp_sieve::SieveConfig>(SIEVE)?).clone();
@@ -337,6 +368,7 @@ impl Services {
             authn,
             sasl,
             authz,
+            collections,
             gal_push,
             directory,
             oidc_issuer: auth.oidc.as_ref().map(|o| o.issuer.clone()),
@@ -417,7 +449,7 @@ impl Services {
             .with_authz(self.authz.clone()))
     }
 
-    /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_with`) и JMAP (`Jmap::with_schedule`): учётным
+    /// Планирование встреч (APP-28) для CalDAV (`tp_dav::router_shared`) и JMAP (`Jmap::with_schedule`): учётным
     /// записям организации сообщения iTIP кладутся прямо в календарь ([`Services::itip`]), остальным адресам —
     /// письмом iMIP через `outbound` (локальные получатели — в ящики, внешние — в очередь с подписью DKIM);
     /// занятость и группы рассылки (раскрытие вложенных групп участника, DAV-35) — из `PgMeta`.
@@ -567,7 +599,12 @@ impl Services {
             .with_dav(Some(Arc::new(self.meta.clone())))
             .with_freebusy(Some(Arc::new(self.meta.clone())))
             // Приглашения из JMAP (`sendSchedulingMessages`, JMAP-31) — теми же зависимостями, что у CalDAV.
-            .with_schedule(Some(self.schedule(outbound))))
+            .with_schedule(Some(self.schedule(outbound)))
+            // Общий доступ к календарям и книгам (JMAP-32): права — единый слой `collections`, записи — `PgMeta`.
+            .with_sharing(Some(tp_jmap::SharingDeps {
+                authz: self.collections.clone(),
+                acl: Arc::new(self.meta.clone()),
+            })))
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
@@ -577,6 +614,7 @@ impl Services {
     /// (RFC 6764 §5): для слушателя без JMAP, который отдаёт их сам по `jmap.autoconfig`.
     /// Планирование встреч (APP-28): приглашения, ответы и отмены рассылает сервер ([`Services::schedule`]);
     /// письма iMIP уходят через доставку SMTP с настройками `smtp`.
+    /// Общий доступ (APP-71): выдача прав `POST` и группы представителей `calendar-proxy` — в `PgMeta`.
     pub fn dav(
         &self,
         cfg: tp_dav::DavConfig,
@@ -586,10 +624,17 @@ impl Services {
         let deps = tp_dav::Deps {
             auth: self.authn.clone(),
             store: Arc::new(self.meta.clone()),
+            // Общий доступ и представители (DAV-17, DAV-18) — тот же слой прав, что у JMAP.
+            sharing: Some(self.collections.clone()),
         };
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
+        // Права на коллекции и представители (DAV-17, DAV-18) — записи `PgMeta`, те же, что читает `collections`.
+        let stores = tp_dav::SharingStores {
+            acl: Arc::new(self.meta.clone()),
+            delegates: Arc::new(self.meta.clone()),
+        };
         // Книгу GAL маршруты читают из хранилища, заполняет её `Services::gal`.
-        let router = tp_dav::router_with(deps, Some(self.schedule(outbound)), cfg);
+        let router = tp_dav::router_shared(deps, Some(self.schedule(outbound)), Some(stores), cfg);
         if !well_known {
             return Ok(router);
         }
@@ -625,6 +670,7 @@ impl Services {
             tp_dav::GalDeps {
                 directory: self.org_directory(),
                 groups: Some(Arc::new(self.meta.clone())),
+                contacts: Some(Arc::new(self.meta.clone())),
             },
             Arc::new(self.meta.clone()),
             self.tenant,
@@ -690,7 +736,16 @@ impl Services {
             .with_held_blobs(Arc::new(tp_blob::Decompressing::new(
                 self.blob.clone(),
                 Arc::new(self.meta.clone()),
-            ))))
+            )))
+            // Общий доступ, представители, ресурсы и политика (ADM-*, CTR-48) — хранилища `PgMeta`, те же, что у
+            // единого слоя прав `collections`.
+            .with_sharing(tp_admin::SharingStores {
+                acl: Arc::new(self.meta.clone()),
+                delegates: Arc::new(self.meta.clone()),
+                resources: Arc::new(self.meta.clone()),
+                policy: Arc::new(self.meta.clone()),
+                collections: Arc::new(self.meta.clone()),
+            }))
     }
 
     /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»
@@ -2024,7 +2079,7 @@ mod tests {
         let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
         let jmap_cfg = (*cfg.section::<tp_jmap::JmapConfig>(JMAP).expect("jmap")).clone();
         let jmap = services.jmap(&ext, jmap_cfg, &smtp, None).expect("jmap");
-        let session = jmap.session(&p, "https://mail.corp.example");
+        let session = jmap.session(&p, "https://mail.corp.example").await;
         let account = session["primaryAccounts"][SIEVE_CAP]
             .as_str()
             .expect("account")
@@ -2168,7 +2223,7 @@ mod tests {
         let smtp = cfg.section::<SmtpConfig>(SMTP).expect("smtp");
         let jmap_cfg = (*cfg.section::<tp_jmap::JmapConfig>(JMAP).expect("jmap")).clone();
         let jmap = services.jmap(&ext, jmap_cfg, &smtp, None).expect("jmap");
-        let session = jmap.session(&p, "https://mail.corp.example");
+        let session = jmap.session(&p, "https://mail.corp.example").await;
         let account = session["primaryAccounts"][CALENDARS]
             .as_str()
             .unwrap_or_else(|| panic!("{session}"))
