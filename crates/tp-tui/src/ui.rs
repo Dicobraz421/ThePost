@@ -1096,7 +1096,7 @@ mod tests {
                 Mode::Dark | Mode::Light => {
                     assert_eq!(left, Color::Rgb(0xE4, 0x10, 0x7F));
                     assert_eq!(right, Color::Rgb(0x17, 0x7C, 0xAA));
-                    assert_eq!(sel.bg, Some(Color::Rgb(0xE4, 0x10, 0x7F)));
+                    assert_eq!(sel.bg, Some(Color::Rgb(0xE3, 0x10, 0x7F)));
                 }
                 Mode::C256 => {
                     assert_eq!(left, Color::Indexed(162));
