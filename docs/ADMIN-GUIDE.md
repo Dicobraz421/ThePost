@@ -101,7 +101,7 @@ thepost admin whoami
 | `--insecure` | — | выкл. | не проверять сертификат (как `curl -k`), только для loopback |
 | `--timeout <сек>` | — | 30 | предельное время запроса |
 | `-c, --config <путь>` | `THEPOST_CONFIG` | `/etc/thepost/config.yaml` | откуда брать адрес и настройки OIDC |
-| `--color auto\|always\|never` | `NO_COLOR`, `CLICOLOR_FORCE` | `auto` | цвет вывода; **появится с PR #791** |
+| `--color auto\|always\|never` | `NO_COLOR`, `CLICOLOR_FORCE` | `auto` | цвет вывода: в файл и конвейер при `auto` — без цвета; `NO_COLOR` сильнее `CLICOLOR_FORCE`, `TERM=dumb` — без цвета |
 
 Учётная запись в аргументах — UUID или имя входа (без учёта регистра), группа — UUID, имя или адрес, домен — UUID или имя.
 
@@ -124,7 +124,7 @@ thepost admin whoami
 
 ## Справочник: команды `thepost admin`
 
-Синтаксис: `thepost admin [общие ключи] <ресурс> <действие> <аргументы> [ключи]`. 43 команды в 12 группах; все изменения пишутся в журнал аудита.
+Синтаксис: `thepost admin [общие ключи] <ресурс> <действие> <аргументы> [ключи]`. 43 команды в 12 группах; все изменения пишутся в журнал аудита. Команды `set` выводят только изменённые поля (`-` было, `+` стало) и итог «✓ Сохранено · запись аудита …».
 
 ### Вход — `login`, `whoami`
 
@@ -139,7 +139,7 @@ thepost admin whoami
 | Команда | Что делает | Ключи |
 | --- | --- | --- |
 | `account create <вход>` | новая учётная запись в принятом домене; пароль для почты — отдельно, `app-password create` | `--name <имя>` |
-| `account list` | список по имени входа, страницы проходит сам | `--login`, `--prefix`, `--after <вход>`, `--limit N` |
+| `account list` | список по имени входа, страницы проходит сам; столбец «СОСТОЯНИЕ»: ● норма, ▲ квота, × заблокирована | `--login`, `--prefix`, `--after <вход>`, `--limit N` |
 | `account get <учётка>` | карточка: псевдонимы, домен, занято, квота, скрытие из книги «Организация» | — |
 | `account block <учётка>` | запрет входа; сеансы IMAP и POP3 закрываются сразу | — |
 | `account unblock <учётка>` | снятие блокировки входа | — |
@@ -405,8 +405,8 @@ thepost admin app-password create ivanov@example.ru --label Thunderbird
 | `THEPOST_ADMIN_URL` | `thepost admin`, `tui` | адрес Admin API |
 | `THEPOST_ADMIN_TOKEN` | `thepost admin`, `tui` | сессия `tps_…` или токен OIDC |
 | `THEPOST_ADMIN_ORG` | `thepost admin` | UUID организации |
-| `NO_COLOR` | `tui`; CLI — с PR #791 | без цвета |
-| `CLICOLOR_FORCE`, `COLORTERM` | CLI — с PR #791 | цвет в конвейере; фирменные цвета при `truecolor` |
+| `NO_COLOR` | CLI, `tui` | без цвета |
+| `CLICOLOR_FORCE`, `COLORTERM` | CLI | цвет и в конвейере; фирменные цвета при `COLORTERM=truecolor` или `24bit`, иначе 16 цветов |
 
 Пустое значение переменной считается отсутствующим.
 
@@ -423,10 +423,11 @@ thepost admin app-password create ivanov@example.ru --label Thunderbird
 Данные идут в stdout, ошибки и подсказки — в stderr. Отказ Admin API выглядит так:
 
 ```
-thepost: admin: <МЕТОД> <ПУТЬ>: <код> <title>: <detail> (<подсказка>)
+ошибка: POST /api/v1/orgs/{org}/accounts: 409 Conflict: login a@example.ru занят
+подсказка: thepost admin account get a@example.ru
 ```
 
-С PR #791 формат меняется на две строки: «ошибка: …» и «подсказка: …» с командой, которая поможет (например, `thepost admin account get <адрес>` при `409`). Ошибки в тексте Sieve выводятся строками «строка N, столбец M: …».
+Первая строка — метод, путь, код HTTP и текст узла; вторая, если есть, — команда, которая поможет. Ошибки в тексте Sieve выводятся строками «строка N, столбец M: …».
 
 | Код | Чаще всего означает |
 | --- | --- |
