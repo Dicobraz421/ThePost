@@ -9,9 +9,10 @@
 //!   [`AccountKind::Resource`] ([`Account::kind`](crate::meta::Account::kind)); решение по приглашению —
 //!   [`BookingPolicy::decide`].
 //! - [`SharingPolicy`] — политика организации на общий доступ (APP-I «Политики общего доступа к календарям»).
+//! - [`SharingAuthorizer`] — проверка прав на коллекции (CTR-84): владелец, записи, представители, политика.
 //!
-//! Права проверяет единый слой авторизации (`tp-auth`), хранилища только хранят записи; реализации — `tp-meta`,
-//! in-memory — `tp-testkit`.
+//! Права проверяет единый слой авторизации — [`SharingAuthorizer`] (`tp-auth`), хранилища только хранят записи;
+//! реализации хранилищ — `tp-meta`, in-memory и фейк [`SharingAuthorizer`] — `tp-testkit`.
 
 use std::collections::BTreeSet;
 use std::ops::{BitOr, BitOrAssign};
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, PrimitiveDateTime, Time, Weekday};
 
 pub use crate::acl::{ANYONE, validate_identifier};
+use crate::auth::Principal;
 use crate::config::duration;
 use crate::dav::CollectionId;
 use crate::error::{Error, Result};
@@ -654,6 +656,71 @@ pub trait SharingPolicyStore: Send + Sync + 'static {
     async fn set_sharing_policy(&self, tenant: TenantId, policy: SharingPolicy) -> Result<()>;
 }
 
+// ---------- Проверка прав ----------
+
+/// Проверка прав субъекта на коллекции (CTR-84) — единый слой прав на календари и адресные книги для CalDAV, CardDAV,
+/// JMAP и Admin API; реализация — `tp-auth` поверх [`CollectionAcl`], [`DelegateStore`], [`SharingPolicyStore`].
+///
+/// Правила: владелец имеет [`CollectionRights::ALL`] на свои коллекции без записей; прочие — по записям
+/// [`CollectionAcl`] (имя входа, группы [`Principal::groups`], [`ANYONE`]) и представительству ([`Delegate::rights`] на
+/// каждый календарь владельца, не на адресные книги); действующие права ограничивает [`SharingPolicy::limit`].
+/// «Только занятость» — `free_busy` без `read`. Права на папки и отправку от имени —
+/// [`Authorizer`](crate::auth::Authorizer).
+#[async_trait]
+pub trait SharingAuthorizer: Send + Sync + 'static {
+    /// Действующие права субъекта на коллекцию `collection` учётной записи `owner` ([`CollectionRights::effective`];
+    /// WebDAV `current-user-privilege-set`, JMAP `myRights`). Нет коллекции у чужой учётной записи —
+    /// [`CollectionRights::NONE`].
+    async fn rights(
+        &self,
+        principal: &Principal,
+        owner: AccountId,
+        collection: CollectionId,
+    ) -> Result<CollectionRights>;
+
+    /// Есть все права `required` ([`CollectionRights::contains`] действующих прав), иначе `Error::Forbidden`.
+    async fn check(
+        &self,
+        principal: &Principal,
+        owner: AccountId,
+        collection: CollectionId,
+        required: CollectionRights,
+    ) -> Result<()>;
+
+    /// Чужие коллекции организации, доступные субъекту по записям прав, с действующими правами (дом коллекций
+    /// получателя в CalDAV и CardDAV, список JMAP); по (`owner`, `collection`). Свои коллекции и коллекции, права на
+    /// которые политика сняла целиком, не входят. Календари по представительству — [`SharingAuthorizer::delegations`].
+    async fn shared_with(&self, principal: &Principal) -> Result<Vec<SharedCollection>>;
+
+    /// Учётные записи, представителем которых является субъект (CalDAV `calendar-proxy-read-for`,
+    /// `calendar-proxy-write-for`), с уровнем и планированием в пределах политики: урезанная до чтения —
+    /// [`DelegateLevel::Read`], снятая целиком — не входит. По `owner`.
+    async fn delegations(&self, principal: &Principal) -> Result<Vec<Delegation>>;
+
+    /// Субъект `grantor` может выдать права `rights` на коллекцию `collection` учётной записи `owner` субъекту
+    /// `identifier` ([`CollectionAcl::set_collection_acl`]): выдаёт владелец или субъект с правом `admin`, в пределах
+    /// политики ([`SharingPolicy::check`]); пустые права (отзыв) политика не ограничивает. Недопустимый идентификатор
+    /// (в том числе отрицательный) — `Error::Invalid`; нет права или политика не допускает — `Error::Forbidden`.
+    async fn check_grant(
+        &self,
+        grantor: &Principal,
+        owner: AccountId,
+        collection: CollectionId,
+        identifier: &str,
+        rights: CollectionRights,
+    ) -> Result<()>;
+
+    /// Субъект может назначить представителя `delegate` учётной записи `owner` ([`DelegateStore::set_delegate`]):
+    /// назначает только сам владелец, права представителя — в пределах политики. Иначе — `Error::Forbidden`. Отзыв
+    /// ([`DelegateStore::remove_delegate`]) политика не ограничивает — достаточно быть владельцем.
+    async fn check_delegate(
+        &self,
+        principal: &Principal,
+        owner: AccountId,
+        delegate: &Delegate,
+    ) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +735,7 @@ mod tests {
         fn _delegates(_: Arc<dyn DelegateStore>) {}
         fn _resources(_: Arc<dyn ResourceStore>) {}
         fn _policy(_: Arc<dyn SharingPolicyStore>) {}
+        fn _authz(_: Arc<dyn SharingAuthorizer>) {}
     }
 
     #[test]

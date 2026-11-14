@@ -418,7 +418,8 @@ SRS 5.1. `Authenticator`: `verify(Credentials, peer: Option<IpAddr>) -> Result<P
 Протоколы передают адрес соединения (`ConnInfo::client` — из заголовка PROXY или адрес TCP-собеседника), HTTP (Basic, Bearer: `tp-dav`,
 `tp-jmap`, `tp-admin`) — адрес из расширения запроса `ConnectInfo<SocketAddr>`, которое ставит `tp_platform::service_http`.
 `Authorizer`: `rights(&Principal, &Resource) -> Rights`, `check(.., required)` (по умолчанию через `rights`),
-`send_right(&Principal, from) -> Option<SendRight::{SendAs, SendOnBehalf}>`; `Resource::{ Account, Mailbox }`.
+`send_right(&Principal, from) -> Option<SendRight::{SendAs, SendOnBehalf}>`; `Resource::{ Account, Mailbox }`. Права на календари и
+адресные книги — `SharingAuthorizer` (раздел Sharing).
 `Rights` — RFC 4314, строка `lrswipkxtea` в каноническом порядке; `c`/`d` (RFC 2086) разворачивает IMAP.
 SASL (код — `sasl.rs`, RFC 4422): механизмы `Mechanism::{ Plain, Login, OauthBearer, Xoauth2, Gssapi }` (`name()`, разбор без учёта регистра,
 `plaintext()` — без TLS не предлагается) — `tp-auth` поверх `Authenticator`; `SaslServer { mechanisms(tls) -> Vec<Mechanism>,
@@ -806,6 +807,17 @@ Decline(DeclineReason), Tentative}` — чистая функция; прове�
 — при вычислении действующих прав (ужесточение политики действует на выданные записи). `SharingPolicyStore`: `sharing_policy(tenant)`,
 `set_sharing_policy(tenant, policy)`. Реализации — `tp-meta`, in-memory и наборы — `tp-testkit`; проверка прав — `tp-auth`; CalDAV, CardDAV,
 JMAP (`shareWith`, `myRights`) — `tp-dav`, `tp-jmap`; Admin API — `tp-admin`.
+Проверка прав (CTR-84): `SharingAuthorizer` — единый слой прав на коллекции для протоколов, отдельно от `Authorizer` (папки и отправка);
+реализация — `tp_auth::CollectionAuthorizer` поверх `CollectionAcl`, `DelegateStore`, `SharingPolicyStore`, `DavStore`, `GroupStore`,
+`AccountStore`; узел — `Services::collections`. Методы обязательные: `rights(&Principal, owner: AccountId, collection) -> CollectionRights`
+(владелец — `ALL` без записей, прочие — записи по имени входа, группам и `anyone` и представительство на календари, ограниченные
+`SharingPolicy::limit`; нет коллекции — `NONE`), `check(.., required)` (`Forbidden`), `shared_with(&Principal) -> Vec<SharedCollection>`
+(чужие коллекции с действующими правами, по (`owner`, `collection`); снятые политикой не входят), `delegations(&Principal) ->
+Vec<Delegation>` (уровень в пределах политики, по `owner`), `check_grant(grantor, owner, collection, identifier, rights)` (владелец или
+`admin`, в пределах `SharingPolicy::check`, отзыв — всегда; недопустимый идентификатор — `Invalid`, иначе `Forbidden`),
+`check_delegate(&Principal, owner, &Delegate)` (только владелец, в пределах политики). Набор — `suite::sharing_authorizer`
+(`SharingAuthorizerFixture` — хранилища реализации, организация набора — новая); фейк для протоколов — `FakeSharingAuthorizer` (права по
+таблице, без политики).
 
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
@@ -1123,3 +1135,10 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `thepost admin init`». Без реализации по умолчанию: `PgMeta` (таблица `installation_admins`, миграция 0040 переносит роль учётной
   записи `admin init` по прежнему признаку), `MemMetadata`; набор `suite::account_installation_admin`. Несовместимо: новые
   обязательные методы `AccountStore`.
+- 2026-11-13 — CTR-84 (волна contracts-56): `sharing::SharingAuthorizer` — проверка прав на коллекции для протоколов (`rights`, `check`,
+  `shared_with`, `delegations`, `check_grant`, `check_delegate`), все методы обязательные. Новый трейт, а не расширение `Authorizer`: у
+  папок и коллекций разные хранилища и реализации, CalDAV и CardDAV права на папки не нужны. `tp_auth::CollectionAuthorizer` реализует
+  трейт (собственных методов с теми же именами больше нет); узел — `Services::collections` поверх `PgMeta`. `tp-testkit`: набор
+  `suite::sharing_authorizer` (проверки AUTH-12) — прогон в `tp-auth` на `MemDav` и `MemMetadata` вместо временных хранилищ тестов;
+  `FakeSharingAuthorizer`. Несовместимо: вызовы методов `CollectionAuthorizer` требуют трейта в области видимости (вызовов вне
+  `tp-auth` не было).
