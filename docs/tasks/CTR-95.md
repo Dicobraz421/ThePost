@@ -35,10 +35,16 @@ manual: no
   Previous, Rejected { report }}`.
 - Источники TI: `TiSource { id: SourceId, tier: Bundled|CustomerKey|Import, kind, format, ttl, stale: StaleAction,
   license: License { terms_url, attribution: Option<String>, commercial: bool }, tenants: All|Only(Vec<TenantId>),
-  key: Option<SecretRef> }`; `kind` — `Http { url }`, `Taxii { api_root, collection }`, `File`;
-  `format` — `Txt|Csv { column }|Rpz|MispFeed|Stix21`; `StaleAction::{Reduce { percent }, Report}` (по умолчанию
-  `Reduce { 50 }`, «отключить» нет). `FORBIDDEN_BUNDLED` — константа хостов и имён фидов из решения 126 ж; `Bundled`
-  с запрещённым источником или с `commercial: false` — `Invalid`.
+  key: Option<SecretRef>, auth: HttpAuth, origin: TiOrigin }`; `kind` — `Http { url }`, `Taxii { api_root,
+  collection }`, `File`; `HttpAuth::{None, Header { name }, Basic { user }, Bearer, ClientCert}` — секрет из `key`
+  (заголовок `X-Api-Key` у RST Cloud и `Auth-Key` у abuse.ch, Basic `taxii` у TAXII Kaspersky, сертификат клиента у
+  HTTPS-фидов Kaspersky; решение 126 з–и); `TiOrigin::{Vendor, GosSopka, FinCert, Own}` — происхождение для журнала
+  и отчётов (126 к); `format` — `Txt|Csv { column }|Rpz|MispFeed|Stix21`; `StaleAction::{Reduce { percent }, Report}`
+  (по умолчанию `Reduce { 50 }`, «отключить» нет). `FORBIDDEN_BUNDLED` — константа хостов и имён фидов из решения
+  126 ж, а также российских фидов (126 з) и `api.rstcloud.net` (126 и) до договора — снять запрет можно только
+  решением владельца и изменением константы. `Bundled` с запрещённым источником, с `commercial: false` или с
+  `origin` `GosSopka`/`FinCert` — `Invalid`; `Import` с `origin` `GosSopka`/`FinCert` без `tenants: Only` — `Invalid`.
+  У версии списка — маркировка TLP из источника (`Tlp::{Clear, Green, Amber, AmberStrict, Red}`, `Option`).
 - `RiskStore`: пакеты (`put_package`, `activate`, `rollback(version)`, `packages()` — активный и N прошлых,
   `risk.package.keep`), `policy(level)`/`set_policy`/`reset_policy`, источники (`sources`, `put_source`,
   `delete_source`), версии списков (`put_list_version { source, sha256, blob, entries, fetched_at }`, `list_current`),
@@ -64,6 +70,8 @@ manual: no
 - `apply_update`: изменение администратора переживает обновление; признак, удалённый из пакета, — в
   `orphaned_overrides`; новый признак — `Mode::Report`.
 - `Verdict::combine`: самое строгое из балла, действий признаков и Rspamd; `Report`-признак не меняет балл.
-- `TiSource` `Bundled` с хостом из `FORBIDDEN_BUNDLED` — `Invalid`; `StaleAction` без варианта «отключить».
+- `TiSource` `Bundled` с хостом из `FORBIDDEN_BUNDLED` (в том числе `taxii.tip.kaspersky.com`, `api.rstcloud.net`) —
+  `Invalid`; `Bundled` с `origin: FinCert` — `Invalid`; `Import` с `origin: GosSopka` и `tenants: All` — `Invalid`;
+  `StaleAction` без варианта «отключить».
 - Набор `suite::risk` проходит `MemRisk`: пакеты растут по номеру, `rollback` на хранимую версию, хранится не больше
   N прошлых, чужая организация не видит политику и срабатывания другой.

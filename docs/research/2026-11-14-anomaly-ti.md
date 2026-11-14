@@ -5,6 +5,7 @@
 - Ни один готовый формат не даёт сразу три вещи: «признак + вес», безопасное расширение администратором и подписанные обновления. Ближе всего модели Rspamd (символы, баллы, карты с подписью) и Stalwart (вендорский набор правил плюс локальные правила, которые обновление не трогает).
 - Стандартный Sieve не умеет считать: в нём нет арифметики и весов. Нужно своё расширение.
 - По TI картина хуже, чем принято считать. Большинство «бесплатных» фидов бесплатны только для некоммерческого использования. Явно разрешены в коммерческом продукте лишь Feodo Tracker, SSLBL, Spamhaus DROP, PhishTank и SaneSecurity (у SaneSecurity с оговорками).
+- Российские фиды (Kaspersky, PT, BI.ZONE, F6, Солар, RST Cloud) по публичным условиям — только для внутреннего использования, либо условия не опубликованы. Раздавать их без OEM-договора нельзя. НКЦКИ и ФинЦЕРТ доступны только самому субъекту: к нам их данные приходят импортом из TIP заказчика или файлом. Подробно — раздел (ж).
 
 ## (а) Форматы справочника
 
@@ -135,3 +136,71 @@
   модуль `rbl` Rspamd проверяет домены ссылок (SURBL, URIBL) и IP, для DQS Spamhaus публикует готовую конфигурацию
   Rspamd с ключом заказчика (https://github.com/spamhaus/rspamd-dqs) — свой DNS-клиент для них не пишем.
 - **ClamAV** у нас уже через `clamav-milter` и `clamd` по сокету (роль `clamav_milter`), libclamav не линкуется.
+
+## (ж) Российские фиды (дополнение 14.11 по просьбе владельца)
+
+Как искал: страницы вендоров, их условия и открытые репозитории на GitHub. Сайты bi.zone, ptsecurity.com,
+rvision.ru, f6.ru, anti-malware.ru из нашей сети открываются через раз, поэтому часть сведений взята из поисковой
+выдачи по страницам вендора. Такие места помечены «по выдаче». **Вывод одной строкой:** ни один российский
+коммерческий фид по публичным условиям не разрешает раздавать индикаторы третьим лицам. Все они — уровень «ключ
+заказчика», а раздача возможна только по отдельному OEM-договору. Государственные НКЦКИ и ФинЦЕРТ машинного фида
+для вендоров не дают: их данные приходят к нам только импортом из TIP или из файла заказчика.
+
+| Фид | Что даёт почте | Формат и доставка | Частота | Бесплатно | Коммерция, MSSP, раздача, кэш | Уровень у нас |
+|---|---|---|---|---|---|---|
+| RST Cloud Threat Feed | IP, домены, URL, хэши MD5/SHA-1/SHA-256 с баллом и связями (ВПО, группы, CVE); 260+ источников, ~250–300 тыс. новых в сутки | CSV, JSON (подробнее) и STIX 2.1. REST: `GET https://api.rstcloud.net/v1/{тип}?type=csv\|json\|stix&date=latest`, заголовок `X-Api-Key`, ответ gzip (по клиенту `rstapi-python`, MIT; тип `url` в примере, `ip`, `domain`, `hash` — по описанию продукта). Ещё есть STIX/TAXII (интеграция с Sentinel), Lookup API, агент выгрузки | полная выгрузка раз в 24 ч | пробный период на месяц; на GitHub `rstcloud/rstthreats` (MIT) лежат случайные 1000 бесплатных и 100 платных индикаторов — это образец, обновлялся до 19.08.2024 | Публичные ToS: §1 — только для своей деятельности, «shall not authorize any third party to access or use»; §7 — запрет перепродажи и сублицензии; §9 — лицензия «non-sublicensable». EULA §4.6 — ключ не передавать третьим лицам. Право Нового Южного Уэльса (RST Cloud Pty Ltd). В РФ, по прессе, работает ООО «Технологии киберугроз». Прецедент OEM: фиды RST встроены в NGFW «Континент 4» («Код Безопасности», 2023), значит, отдельный договор на встраивание возможен | ключ заказчика; наш ключ — стенды и демонстрации; «в поставке» — только если договор разрешит раздачу |
+| RST Noise Control | вердикт «заведомо безопасно» для IP, доменов, URL и хэшей — убирает ложные срабатывания TI (CDN, публичные DNS) | REST `GET /v1/benign/lookup?value=…`, пакетно `POST /v1/benign/batch/{тип}` и `GET /v1/benign/result/{тип}`, JSON `{value, type, benign, reason}` | по запросу | нет; AWS Marketplace — $0,002 за запрос, общая подписка с IoC Lookup и Whois API | те же ToS | позже: фильтр ложных срабатываний при загрузке списков, после договора |
+| RST Report Hub | отчёты об угрозах в STIX 2.1 с извлечёнными IoC | `GET /v1/reports?date=…`, `GET /v1/reports/?id=…&format=json\|stix\|pdf` | ежедневно | нет | те же ToS | не для почтового узла: это источник для TIP заказчика, к нам приходит импортом |
+| Kaspersky Threat Data Feeds | Malicious URL, Phishing URL, Botnet C&C URL, Ransomware URL, Malicious Hash, IP Reputation, APT IP/URL/Hash и другие | JSON (Enterprise), plain text (OEM); утилита переводит в STIX, OpenIOC, CSV. HTTPS с сертификатом клиента; популярные фиды — TAXII 2.1 `https://taxii.tip.kaspersky.com/v2`, Basic-авторизация `taxii` + токен (коннектор OpenCTI от KasperskyLab, Apache-2.0) | URL, хэши, IP — каждые 20 мин; C&C и APT — 60 мин; демо — 24 ч | демо-фиды (IP Reputation, Botnet C&C URL, Malicious Hash и др.) с «lower detection rates»; бесплатный портал OpenTIP с ключом API и ограничением частоты (условия использования — н/п) | T&C §2.1: «solely for Customer's internal business purposes»; §3.4: передавать третьим лицам «strictly prohibited» платно и бесплатно; §3.5: нельзя использовать фиды для создания своего продукта для обнаружения угроз. Есть отдельная программа Technology Alliances и OEM: Data Streams для вендоров, plain text | ключ заказчика (TAXII 2.1 или HTTPS); раздача — только по OEM-договору |
+| PT Threat Intelligence Feeds (PT ESC), портал PT Fusion | домены, URL, IP, хэши; наборы фидов: APT, фишинг, классы ВПО, severity, белые списки, CDN | REST API сервисов PT и SDK; из PT Fusion — STIX, JSON (с контекстом, для продуктов PT), CSV (по выдаче). TAXII — н/п | н/п | пилот | условия лицензии публично — н/п | ключ заказчика (REST или файл STIX/CSV в импорт) |
+| BI.ZONE Threat Intelligence | 70+ млн IoC на портале, кластеры активности | готовые модули портала, STIX/TAXII 2.1 и собственный API портала | н/п | бесплатная версия портала с базовой информацией о кластерах; бесплатный пилот | «Условия приобретения»: цена индивидуально по параметрам лицензирования, правообладатель ООО «БИЗон»; про раздачу и MSSP — н/п | ключ заказчика (TAXII 2.1) |
+| F6 Threat Intelligence и TI Feeds (бывший F.A.C.C.T., ранее Group-IB TI) | IP, домены, URL, хэши; 3+ млн подтверждённых индикаторов | STIX/TAXII 2 и REST API, готовые интеграции с SIEM и SOAR (блог и брошюра F6, по выдаче); версия TAXII — н/п | н/п | н/п | н/п | ключ заказчика (TAXII или REST) |
+| Solar TI Feeds (ГК «Солар»: Solar JSOC, 4RAYS, сенсоры «Ростелекома») | IoC (адреса, хэши), сигнатуры Suricata, правила Sigma, YARA, ModSec | через «TI Agent» и коннекторы к EDR, SIEM, NTA (брошюра и white paper 2026, по выдаче); открытый API и TAXII — н/п | н/п | пилот | н/п | ключ заказчика через импорт (файл или TIP) |
+| R-Vision TIP, Security Vision TIP | платформы заказчика, не фиды: собирают Kaspersky, BI.ZONE, F6, RST и др. (у Security Vision это из коробки), принимают TXT и CSV (у R-Vision — конструктор CSV); у R-Vision есть сервис фида ФинЦЕРТ (3.16), Security Vision получает данные НКЦКИ, ФСТЭК и ФинЦЕРТ (12.2025) | выгрузка в СЗИ через API и правила экспорта (по выдаче); TAXII-сервер — н/п | по расписанию TIP | — | условия лицензий исходных фидов действуют и после TIP | импорт: клиент TAXII 2.1, если TIP его отдаёт, иначе файл CSV, TXT или STIX в каталог импорта |
+| НКЦКИ / ГосСОПКА | бюллетени и индикаторы компрометации для субъектов КИИ | приказ ФСБ от 25.12.2025 № 548 (в силе с 30.01.2026): обмен через личный кабинет в технической инфраструктуре НКЦКИ; API с токеном организации (так его подключают KUMA и Kaspersky XDR); инциденты — JSON. Формат IoC в API публично — н/п; на safe-surf.ru — бюллетени PDF и JSON | по мере выпуска | для субъектов КИИ и центров ГосСОПКА | третьим лицам не предназначено; раздавать нельзя; для вендора доступа нет | импорт: TIP заказчика (STIX/TAXII, MISP) или файл |
+| ФинЦЕРТ Банка России (АСОИ ФинЦЕРТ) | сведения об угрозах и атаках, рекомендации, база переводов без согласия клиента | личный кабинет `lk.fincert.cbr.ru`, API `api.fincert.cbr.ru`, отдельная учётная запись и TLS-сертификат сотрудника, крипто-API для электронной подписи (инструкция ЦБ по API, по выдаче). Подключение — карточка участника на info_fincert@cbr.ru и материалы `ASOI_docs.zip`. STIX — н/п | по мере выпуска | для участников финрынка и компаний ИБ финсферы; разработчикам ПО учётки для проверки интеграции — индивидуально | раздавать нельзя; правила TLP публично — н/п | импорт: TIP заказчика (R-Vision и Security Vision его принимают) или файл |
+| Гарда TI Feeds, Angara (ACRC) и другие | Гарда — коммерческие фиды; Angara — подключение к ГосСОПКА как центр | н/п | н/п | н/п | н/п | при запросе заказчика — импорт |
+
+**Что следует для архитектуры.**
+- Своих протоколов у российских вендоров почти нет. Kaspersky, BI.ZONE и F6 дают TAXII 2.1 / STIX 2.1, RST отдаёт
+  STIX 2.1 по REST, остальные — REST или файлы STIX и CSV. Поэтому отдельный парсер на каждого вендора не нужен:
+  коннектор — это пресет к уже запланированным `Taxii` и `Http` с форматом `Stix21` или `Csv`. Различаются только
+  способы авторизации: заголовок (`X-Api-Key` у RST, `Auth-Key` у abuse.ch), Basic (Kaspersky TAXII: `taxii` +
+  токен), Bearer и сертификат клиента (Kaspersky HTTPS).
+- Сама TI-платформа заказчика (R-Vision, Security Vision, Kaspersky CyberTrace) — главный путь для ГосСОПКА
+  и ФинЦЕРТ. Прямой клиент к НКЦКИ или АСОИ не пишем: доступ есть только у субъекта, формат IoC закрыт, нужна
+  отечественная криптография, а данные нельзя выносить из организации.
+- **RST Cloud с нашим ключом.** По публичным условиям раздавать индикаторы нельзя, ключ третьим лицам не передаётся,
+  а автоматическое «periodic caching» запрещено (§7). Значит, до отдельного договора наш ключ годится только для
+  наших стендов и демонстраций. Для уровня «в поставке» в договоре должно быть прямо написано:
+  (1) разрешена раздача индикаторов заказчикам в составе нашего продукта, в том числе в закрытый контур;
+  (2) разрешено хранить и раздавать снимок списков;
+  (3) атрибуция;
+  (4) поведение после окончания договора: §9 ToS требует удалить ПО;
+  (5) MSSP;
+  (6) применимое право — российское юрлицо или австралийское.
+  Прецедент «Континента 4» показывает, что такой договор возможен.
+
+**Источники (ж).**
+- RST Cloud: https://www.rstcloud.com/terms ; https://www.rstcloud.com/eula ; https://www.rstcloud.com/rst-threat-feed/ ;
+  https://www.rstcloud.com/rst-noise-control/ ; https://www.rstcloud.com/ ; https://github.com/rstcloud/rstapi-python
+  (`rstapi/threatfeed.py`, `noisecontrol.py`, `reporthub.py`) ; https://github.com/rstcloud/rstthreats (`feeds/README.md`) ;
+  «Континент 4» и RST — https://www.anti-malware.ru/news/2023-07-18-111332/41582 (вторичный)
+- Kaspersky: https://media.kaspersky.com/en/Terms_and_Conditions_Threat_Data_Feeds.pdf ; https://support.kaspersky.com/13849 ;
+  https://github.com/KasperskyLab/threat-intelligence (`kaspersky-feeds-for-opencti`) ; https://www.kaspersky.com/partners/technology/feeds ;
+  https://opentip.kaspersky.com/Help/Doc_data/AboutTermsOfUse.htm (текст условий OpenTIP не открыл — н/п)
+- Positive Technologies: https://global.ptsecurity.com/products/threat-intelligence-feeds ;
+  https://help.ptsecurity.com/en-US/projects/feeds/2.1.0/help (не открылась) ; презентация вебинара PT Feeds, 2023
+  (https://www.ptsecurity.com/upload/corporate/ru-ru/webinars/ics/Prezentaciya-pt-feeds-kak-povysit-zashchishchennost-pri-pomoshchi-ti.pdf) ;
+  PT Fusion 1.5 — https://www.securitylab.ru/news/570503.php (вторичный)
+- BI.ZONE: https://bi.zone/catalog/products/threat-intelligence/ ; «Условия приобретения» (PDF на той же странице)
+- F6: https://www.f6.ru/products/threat-intelligence/ ; https://www.f6.ru/products/threat-intelligence-feeds/ ; https://www.f6.ru/blog/ti-siem/ (по выдаче)
+- Солар: https://rt-solar.ru/upload/iblock/aa8/nnydzvxmeff7gfxhx2k286v8xfjcdbm0/Brochure-Solar-Threat-Feeds.pdf (по выдаче)
+- R-Vision TIP 3.16 и фид ФинЦЕРТ — https://www.anti-malware.ru/news/2023-12-06-111332/42425 ; Security Vision и НКЦКИ, ФСТЭК,
+  ФинЦЕРТ — https://www.anti-malware.ru/news/2025-12-17-111332/48458 (вторичные)
+- НКЦКИ: приказ ФСБ России от 25.12.2025 № 548 (обзор — https://ppt.ru/obzory/vstupaet-v-silu/prikaz-fsb-25-12-2025-548-o-poryadke-vzaimodeystviya-subektov-kii-s-gossopka) ;
+  интеграция KUMA — https://support.kaspersky.com/help/KUMA/3.0.1/ru-RU/221777.htm ; Kaspersky XDR — https://support.kaspersky.com/help/XDR/1.4/ru-RU/252732.htm
+- ФинЦЕРТ: https://cbr.ru/information_security/fincert/ ; инструкция по API АСОИ ФинЦЕРТ (копия у стороннего разработчика —
+  docs-beta.brainysoft.ru, не открылась; по выдаче)
+- Не найдено (н/п): цены RST и всех российских вендоров; условия MSSP и раздачи у PT, BI.ZONE, F6, Солара; TAXII у PT
+  и Солара; TAXII-сервер у R-Vision и Security Vision; формат IoC в API НКЦКИ; STIX и TLP в АСОИ ФинЦЕРТ; условия OpenTIP.
