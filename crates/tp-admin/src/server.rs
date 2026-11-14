@@ -41,6 +41,7 @@ use tp_contracts::ext::{AdminRequest, AdminRoutes};
 use tp_contracts::groups::GroupStore;
 use tp_contracts::mailstore::MailStore;
 use tp_contracts::meta::{AccountStore, PolicyResolver, PolicyStore};
+use tp_contracts::queue::QueueStore;
 use tp_contracts::retention::{Quota, TrashStore};
 use tp_contracts::senders::SenderLists;
 use tp_contracts::transport::TransportStore;
@@ -391,6 +392,8 @@ pub struct Admin {
     pub(crate) held_blobs: Option<Arc<dyn BlobStore>>,
     /// Общий доступ, представители, ресурсы; `None` — не подключено (маршруты отвечают 503).
     pub(crate) sharing: Option<crate::sharing::SharingStores>,
+    /// Очередь исходящей почты ([`crate::queue`]); `None` — не подключено (маршруты отвечают 503).
+    pub(crate) queue: Option<Arc<dyn QueueStore>>,
     /// Организации инсталляции: без модуля «Мультитенантность» — только организация по умолчанию (решение 10).
     /// Маршрут `/api/v1/orgs/{org}/...` другой организации — 404 ([`guard`]).
     pub(crate) organizations: BTreeSet<TenantId>,
@@ -406,6 +409,7 @@ impl fmt::Debug for Admin {
             .field("sieve", &self.sieve.is_some())
             .field("held_blobs", &self.held_blobs.is_some())
             .field("sharing", &self.sharing.is_some())
+            .field("queue", &self.queue.is_some())
             .field("organizations", &self.organizations)
             .finish()
     }
@@ -442,6 +446,7 @@ impl Admin {
             sieve: None,
             held_blobs: None,
             sharing: None,
+            queue: None,
             organizations: BTreeSet::from([TenantId::DEFAULT]),
         })
     }
@@ -449,6 +454,12 @@ impl Admin {
     /// Подключает настройки транспорта ([`crate::transport`]).
     pub fn with_transport(mut self, transport: Arc<dyn TransportStore>) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Подключает очередь исходящей почты ([`crate::queue`]: список записей и повтор доставки).
+    pub fn with_queue(mut self, queue: Arc<dyn QueueStore>) -> Self {
+        self.queue = Some(queue);
         self
     }
 
@@ -475,6 +486,7 @@ impl Admin {
         api = crate::mailboxes::routes(api);
         api = crate::sharing::routes(api);
         api = crate::resources::routes(api);
+        api = crate::queue::routes(api);
         for m in &self.d.modules {
             let prefix = m.prefix().to_owned();
             let handler = {
@@ -830,6 +842,7 @@ pub fn openapi_spec() -> utoipa::openapi::OpenApi {
     api.merge(crate::mailboxes::Doc::openapi());
     api.merge(crate::sharing::Doc::openapi());
     api.merge(crate::resources::Doc::openapi());
+    api.merge(crate::queue::Doc::openapi());
     CommonErrors.modify(&mut api);
     api
 }
