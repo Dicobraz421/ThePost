@@ -6368,6 +6368,10 @@ dependencies = [
  "evdev",
  "ratatui",
  "ratatui-image",
+ "serde_json",
+ "tokio",
+ "tp-admin",
+ "tp-admin-client",
 ]
 
 [[package]]
