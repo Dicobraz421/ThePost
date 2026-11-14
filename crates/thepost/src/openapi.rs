@@ -65,10 +65,8 @@ pub async fn command(output: Option<&Path>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
     use super::*;
-    use crate::cli::{AdminAction, Cli, Command};
+    use crate::cli::{AdminAction, Command, try_parse_from};
 
     /// Ключи объектов на всех уровнях идут по алфавиту.
     fn is_sorted(value: &Value) -> bool {
@@ -106,7 +104,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("openapi.json");
         let missing = dir.path().join("нет.yaml");
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "thepost".as_ref(),
             "--config".as_ref(),
             missing.as_os_str(),
@@ -128,7 +126,7 @@ mod tests {
         assert_eq!(written, render().expect("render"));
 
         // Без `--output` — stdout; каталога для файла нет — ошибка с кодом 1.
-        let cli = Cli::try_parse_from(["thepost", "admin", "openapi"]).expect("cli");
+        let cli = try_parse_from(["thepost", "admin", "openapi"]).expect("cli");
         assert!(matches!(
             cli.command,
             Command::Admin {
