@@ -1,9 +1,10 @@
-# Контекст сборки — корень репозитория; в образ — исходники Rust и консоли (без node_modules и dist).
+# Контекст сборки — корень репозитория; в образ — исходники Rust, консоли (без node_modules и dist) и токены design/.
 **
 !Cargo.toml
 !Cargo.lock
 !rust-toolchain.toml
 !crates/**
+!design/**
 crates/**/target
 !console/**
 console/node_modules
