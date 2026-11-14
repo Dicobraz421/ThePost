@@ -150,6 +150,28 @@ pub(crate) async fn find_uid(
     Ok(None)
 }
 
+/// Объект `existing` можно заменить приглашением `it` (`REQUEST`): у него тот же организатор, `SEQUENCE` приглашения
+/// не меньше. Возвращает разобранный объект; иначе — причина отказа. Проверка — до любого изменения календаря
+/// получателя, в том числе до снятия прежней брони ресурса ([`crate::booking`], DAV-40).
+pub(crate) fn replaceable(
+    existing: &DavObject,
+    it: &Itip,
+) -> std::result::Result<ICalendar, &'static str> {
+    let Some((ical, m)) = ICalendar::parse(&existing.body)
+        .ok()
+        .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
+    else {
+        return Err("чужой UID организатора");
+    };
+    if m.organizer != it.meeting.organizer {
+        return Err("чужой UID организатора");
+    }
+    if it.meeting.sequence < m.sequence {
+        return Err("устаревший SEQUENCE");
+    }
+    Ok(ical)
+}
+
 fn hash(parts: &[&str]) -> String {
     itip::hash_hex(
         &parts
@@ -336,23 +358,9 @@ impl ItipInbox {
         attempt: usize,
         forced: Option<&ICalendarParticipationStatus>,
     ) -> Result<Step> {
-        let old = match existing {
-            None => None,
-            Some(o) => {
-                let Some((ical, m)) = ICalendar::parse(&o.body)
-                    .ok()
-                    .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
-                else {
-                    return ignored("чужой UID организатора");
-                };
-                if m.organizer != it.meeting.organizer {
-                    return ignored("чужой UID организатора");
-                }
-                if it.meeting.sequence < m.sequence {
-                    return ignored("устаревший SEQUENCE");
-                }
-                Some(ical)
-            }
+        let old = match existing.map(|o| replaceable(o, it)).transpose() {
+            Ok(old) => old,
+            Err(reason) => return ignored(reason),
         };
         let mut msg = it.ical.clone();
         if let Some(root) = msg.components.first_mut() {
