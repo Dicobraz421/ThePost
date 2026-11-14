@@ -1930,6 +1930,7 @@ async fn sharing_delegates_and_booking() {
                     aliases: Vec::new(),
                     kind,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
