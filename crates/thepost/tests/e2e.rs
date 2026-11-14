@@ -1285,6 +1285,11 @@ async fn transport_settings_without_restart() {
     let (code, body) = http(admin, "GET", &format!("{org}/audit"), &bearer, None).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let audit: Value = serde_json::from_slice(&body).expect("audit");
+    // APP-74: очередь исходящей почты подключена к Admin API (`with_queue`), не 503; список — JSON-массив.
+    let (code, body) = http(admin, "GET", &format!("{org}/queue"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let queue: Value = serde_json::from_slice(&body).expect("queue");
+    assert!(queue.is_array(), "{queue}");
     let changes: Vec<(&str, &str, u64)> = audit["entries"]
         .as_array()
         .expect("entries")
