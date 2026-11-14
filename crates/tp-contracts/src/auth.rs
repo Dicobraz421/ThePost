@@ -172,21 +172,14 @@ pub trait Directory: Send + Sync + 'static {
     /// Имена атрибутов, публикуемых в адресной книге (`title`, `department`, `telephoneNumber`, ...).
     async fn gal_attributes(&self, tenant: TenantId) -> Result<Vec<String>>;
 
-    /// Изменения почтовых контактов после `cursor`, не более `limit` (CTR-35). По умолчанию — каталог без контактов:
-    /// пустая порция с прежним курсором.
+    /// Изменения почтовых контактов после `cursor`, не более `limit` (CTR-35). Без реализации по умолчанию (CTR-87):
+    /// контакты есть у всех каталогов (LDAP, PostgreSQL), каталог без контактов отдаёт пустую порцию сам.
     async fn contacts_since(
         &self,
         tenant: TenantId,
         cursor: Option<&DirCursor>,
         limit: usize,
-    ) -> Result<DirPage<DirContact>> {
-        let _ = (tenant, limit);
-        Ok(DirPage {
-            changes: Vec::new(),
-            next: cursor.cloned().unwrap_or_else(|| DirCursor(String::new())),
-            has_more: false,
-        })
-    }
+    ) -> Result<DirPage<DirContact>>;
 
     /// Подразделения (полный список, CTR-35). По умолчанию — пусто.
     async fn units(&self, tenant: TenantId) -> Result<Vec<DirUnit>> {

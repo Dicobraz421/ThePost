@@ -10,6 +10,8 @@
 //!   [`BookingPolicy::decide`].
 //! - [`SharingPolicy`] — политика организации на общий доступ (APP-I «Политики общего доступа к календарям»).
 //! - [`SharingAuthorizer`] — проверка прав на коллекции (CTR-84): владелец, записи, представители, политика.
+//! - [`ShareNotificationStore`] — уведомления получателям об изменении их прав на коллекции (CTR-86; JMAP
+//!   `ShareNotification`, RFC 9670 §5).
 //!
 //! Права проверяет единый слой авторизации — [`SharingAuthorizer`] (`tp-auth`), хранилища только хранят записи;
 //! реализации хранилищ — `tp-meta`, in-memory и фейк [`SharingAuthorizer`] — `tp-testkit`.
@@ -27,7 +29,7 @@ use crate::auth::Principal;
 use crate::config::duration;
 use crate::dav::CollectionId;
 use crate::error::{Error, Result};
-use crate::ids::{AccountId, GroupId, TenantId};
+use crate::ids::{AccountId, GroupId, ShareNotificationId, TenantId};
 #[cfg(doc)]
 use crate::meta::AccountKind;
 use crate::meta::AccountScope;
@@ -721,6 +723,151 @@ pub trait SharingAuthorizer: Send + Sync + 'static {
     ) -> Result<()>;
 }
 
+// ---------- Уведомления о доступе ----------
+
+/// Вид общего объекта уведомления (JMAP `ShareNotification.objectType`): календарь, список задач — коллекции
+/// календаря, адресная книга.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SharedObjectType {
+    /// `Calendar`.
+    Calendar,
+    /// `TaskList`.
+    TaskList,
+    /// `AddressBook`.
+    AddressBook,
+}
+
+/// Кто изменил права (JMAP `ShareNotification.changedBy`, RFC 9670 §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareChangedBy {
+    /// Имя для показа.
+    pub name: String,
+    /// Адрес; `None` — неизвестен.
+    pub email: Option<String>,
+    /// Учётная запись организации (JMAP `principalId`); `None` — изменение не от учётной записи (Admin API, каталог).
+    pub account: Option<AccountId>,
+}
+
+/// Уведомление получателю об изменении его прав на коллекцию (JMAP `ShareNotification`, RFC 9670 §5). Уведомления
+/// не меняются: только запись и удаление.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareNotification {
+    /// Идентификатор: задаёт вызывающий ([`ShareNotificationId::new`]).
+    pub id: ShareNotificationId,
+    /// Момент изменения прав.
+    pub created: OffsetDateTime,
+    /// Кто изменил.
+    pub changed_by: ShareChangedBy,
+    /// Вид объекта.
+    pub object_type: SharedObjectType,
+    /// Владелец коллекции (JMAP `objectAccountId`).
+    pub owner: AccountId,
+    /// Коллекция (JMAP `objectId`); может быть уже удалена.
+    pub collection: CollectionId,
+    /// Права до изменения, как выданы ([`CollectionRights::NONE`] — не было; JMAP `oldRights` = `null`).
+    pub old_rights: CollectionRights,
+    /// Права после изменения ([`CollectionRights::NONE`] — отозваны; JMAP `newRights` = `null`).
+    pub new_rights: CollectionRights,
+    /// Имя коллекции в момент изменения.
+    pub name: String,
+}
+
+impl ShareNotification {
+    /// Права не изменились (`old_rights` = `new_rights`) — `Error::Invalid`.
+    pub fn validate(&self) -> Result<()> {
+        if self.old_rights == self.new_rights {
+            return Err(Error::invalid("share notification: rights did not change"));
+        }
+        Ok(())
+    }
+}
+
+/// Условие выборки уведомлений (JMAP `ShareNotification/query`, FilterCondition RFC 9670 §5.4); `None` — без
+/// условия, условия объединяются по «и».
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ShareNotificationFilter {
+    /// `created` не раньше (`after`, включительно).
+    pub after: Option<OffsetDateTime>,
+    /// `created` раньше (`before`, не включительно).
+    pub before: Option<OffsetDateTime>,
+    /// Вид объекта (`objectType`).
+    pub object_type: Option<SharedObjectType>,
+    /// Владелец коллекции (`objectAccountId`).
+    pub owner: Option<AccountId>,
+}
+
+impl ShareNotificationFilter {
+    /// Уведомление удовлетворяет условиям.
+    pub fn matches(&self, n: &ShareNotification) -> bool {
+        self.after.is_none_or(|t| n.created >= t)
+            && self.before.is_none_or(|t| n.created < t)
+            && self.object_type.is_none_or(|t| t == n.object_type)
+            && self.owner.is_none_or(|o| o == n.owner)
+    }
+}
+
+/// Изменения уведомлений учётной записи после состояния (JMAP `ShareNotification/changes`); изменённых нет —
+/// уведомления не меняются.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ShareNotificationChanges {
+    /// Записанные после `since` и существующие (по возрастанию).
+    pub created: Vec<ShareNotificationId>,
+    /// Удалённые, существовавшие в `since` (по возрастанию); записанные и удалённые после `since` не входят.
+    pub destroyed: Vec<ShareNotificationId>,
+    /// Состояние, до которого учтены изменения.
+    pub new_state: u64,
+    /// Учтены не все изменения: повторить с `new_state`.
+    pub has_more: bool,
+}
+
+/// Уведомления получателям об изменении их прав на коллекции (CTR-86; JMAP `ShareNotification`). Уведомление
+/// записывает вызывающий, изменивший права ([`CollectionAcl::set_collection_acl`]), — каждой учётной записи, чьи права
+/// изменились; видит его только получатель. Общие для узлов и переживают перезапуск. Удаление учётной записи удаляет
+/// её уведомления. Реализация — `tp-meta`; in-memory — `tp-testkit`.
+#[async_trait]
+pub trait ShareNotificationStore: Send + Sync + 'static {
+    /// Записывает уведомление получателю `recipient`. Недопустимое ([`ShareNotification::validate`]) — `Error::Invalid`;
+    /// идентификатор занят у получателя — `Error::Conflict`. Возвращает новое состояние.
+    async fn record(&self, recipient: AccountScope, notification: ShareNotification)
+    -> Result<u64>;
+
+    /// Уведомления учётной записи по `created`, затем по `id` (JMAP `/get` без `ids`, `/query`: фильтр —
+    /// [`ShareNotificationFilter::matches`], сортировка и окно — у вызывающего).
+    async fn notifications(&self, scope: AccountScope) -> Result<Vec<ShareNotification>>;
+
+    /// Уведомление по идентификатору; нет (в том числе у другой учётной записи) — `None`.
+    async fn notification(
+        &self,
+        scope: AccountScope,
+        id: ShareNotificationId,
+    ) -> Result<Option<ShareNotification>>;
+
+    /// Удаляет уведомление (JMAP `/set destroy`); нет — `Error::NotFound`. Возвращает новое состояние.
+    async fn destroy_notification(
+        &self,
+        scope: AccountScope,
+        id: ShareNotificationId,
+    ) -> Result<u64>;
+
+    /// Состояние уведомлений учётной записи (JMAP `state`): растёт при каждой записи и удалении, у новой — 0.
+    async fn notification_state(&self, scope: AccountScope) -> Result<u64>;
+
+    /// Изменения после состояния `since`: не более `limit` уведомлений (`limit` ≥ 1, иначе `Error::Invalid`),
+    /// остальные — `has_more`. Состояние больше текущего или старше хранимой истории — `Error::Conflict` (JMAP
+    /// `cannotCalculateChanges`).
+    async fn notification_changes(
+        &self,
+        scope: AccountScope,
+        since: u64,
+        limit: usize,
+    ) -> Result<ShareNotificationChanges>;
+
+    /// Срок хранения: удаляет уведомления с `created` раньше `before` во всех организациях, не более `limit`
+    /// (старшие первыми); состояние получателей растёт, удалённые — в `destroyed` изменений. Возвращает число
+    /// удалённых. Срок задаёт вызывающий (настройка протокола).
+    async fn expire_notifications(&self, before: OffsetDateTime, limit: usize) -> Result<usize>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +883,65 @@ mod tests {
         fn _resources(_: Arc<dyn ResourceStore>) {}
         fn _policy(_: Arc<dyn SharingPolicyStore>) {}
         fn _authz(_: Arc<dyn SharingAuthorizer>) {}
+        fn _notices(_: Arc<dyn ShareNotificationStore>) {}
+    }
+
+    /// Уведомление о доступе (CTR-86): права должны измениться; фильтр — время (`after` включительно, `before` нет),
+    /// вид и владелец; сериализация без потерь.
+    #[test]
+    fn share_notification_validate_filter() {
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let n = ShareNotification {
+            id: ShareNotificationId::new(),
+            created: t0,
+            changed_by: ShareChangedBy {
+                name: "Алиса".into(),
+                email: Some("alice@example.org".into()),
+                account: Some(AccountId::new()),
+            },
+            object_type: SharedObjectType::Calendar,
+            owner: AccountId::new(),
+            collection: CollectionId::new(),
+            old_rights: CollectionRights::NONE,
+            new_rights: CollectionRights::READ,
+            name: "Работа".into(),
+        };
+        assert_eq!(n.validate(), Ok(()));
+        let same = ShareNotification {
+            new_rights: CollectionRights::NONE,
+            ..n.clone()
+        };
+        assert!(matches!(same.validate(), Err(Error::Invalid(_))));
+
+        let f = ShareNotificationFilter::default;
+        let sec = time::Duration::seconds;
+        assert!(f().matches(&n));
+        let at = |after, before| ShareNotificationFilter {
+            after,
+            before,
+            ..f()
+        };
+        assert!(at(Some(t0), Some(t0 + sec(1))).matches(&n));
+        assert!(!at(None, Some(t0)).matches(&n), "before — не включительно");
+        assert!(!at(Some(t0 + sec(1)), None).matches(&n));
+        let ty = |object_type| ShareNotificationFilter {
+            object_type: Some(object_type),
+            ..f()
+        };
+        assert!(ty(SharedObjectType::Calendar).matches(&n));
+        assert!(!ty(SharedObjectType::TaskList).matches(&n));
+        let owner = |owner| ShareNotificationFilter {
+            owner: Some(owner),
+            ..f()
+        };
+        assert!(owner(n.owner).matches(&n));
+        assert!(!owner(AccountId::new()).matches(&n));
+
+        let s = serde_json::to_string(&n).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ShareNotification>(&s).expect("parse"),
+            n
+        );
     }
 
     #[test]
