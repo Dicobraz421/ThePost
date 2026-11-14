@@ -34,6 +34,7 @@ use tp_contracts::transport::MailFlow;
 use tp_contracts::{AccountId, Error, MailboxId, ModSeq, Result, TenantId};
 
 use crate::autoconfig::sign::ProfileSigner;
+use crate::sharing::{Access, SharingDeps};
 
 pub mod config;
 pub mod error;
@@ -69,6 +70,9 @@ pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
 pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
 /// Capability владельца учётной записи (RFC 9670 §1.5.2); объявляется вместе с [`PRINCIPALS`].
 pub const PRINCIPALS_OWNER: &str = "urn:ietf:params:jmap:principals:owner";
+/// Capability задач (draft-ietf-jmap-tasks, JMAP-33): `TaskList`, `Task` поверх `VTODO`; доступна при подключённом
+/// [`Jmap::with_dav`].
+pub const TASKS: &str = "urn:ietf:params:jmap:tasks";
 /// Capability занятости участников (draft-ietf-jmap-calendars); доступна при подключённом
 /// [`Jmap::with_freebusy`].
 pub const AVAILABILITY: &str = "urn:ietf:params:jmap:principals:availability";
@@ -82,13 +86,14 @@ pub const ORG_CHART: &str = "urn:thepost:orgchart";
 /// Встроенные capability.
 const BUILTIN: [&str; 5] = [CORE, MAIL, SUBMISSION, WEBSOCKET, SETTINGS];
 /// Встроенные capability, доступные при подключённом хранилище (URI заняты всегда).
-const OPTIONAL: [&str; 9] = [
+const OPTIONAL: [&str; 10] = [
     SENDER_LISTS,
     ORG_CHART,
     VACATION,
     SIEVE,
     CONTACTS,
     CALENDARS,
+    TASKS,
     PRINCIPALS,
     PRINCIPALS_OWNER,
     AVAILABILITY,
@@ -181,6 +186,10 @@ pub struct Jmap {
     pub(crate) sender_lists: Option<Arc<dyn SenderLists>>,
     /// Оргструктура; `None` — capability `urn:thepost:orgchart` не объявляется.
     pub(crate) org: Option<Arc<dyn OrgStore>>,
+    /// Общий доступ к календарям и адресным книгам (JMAP-32); `None` — только свои коллекции.
+    pub(crate) sharing: Option<SharingDeps>,
+    /// `ShareNotification` учётных записей (в памяти узла).
+    pub(crate) notices: crate::sharing::Notices,
     stop: watch::Sender<bool>,
     /// Открытые соединения push: закрытие по `AccountDisabled` (JMAP-41).
     pub(crate) push: crate::disable::Sessions,
@@ -197,6 +206,7 @@ impl fmt::Debug for Jmap {
             .field("dav", &self.dav.is_some())
             .field("sender_lists", &self.sender_lists.is_some())
             .field("org", &self.org.is_some())
+            .field("sharing", &self.sharing.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -206,6 +216,8 @@ pub(crate) struct Ctx<'a> {
     pub jmap: &'a Jmap,
     pub principal: &'a Principal,
     pub scope: AccountScope,
+    /// Права на коллекции аккаунта `scope`: свой — все; чужой ([`Ctx::open_dav`]) — на общие коллекции.
+    pub access: Access,
     /// Созданные в запросе объекты: creation id → id (ссылки `#cid`).
     pub created: &'a mut HashMap<String, String>,
     /// Ответы неявных вызовов (`EmailSubmission/set` → `Email/set`): после ответа метода, с тем же callId.
@@ -225,6 +237,20 @@ impl Ctx<'_> {
         } else {
             Err(MethodError::new("accountNotFound"))
         }
+    }
+
+    /// Открывает аккаунт календарей, задач и контактов: свой или владельца общих коллекций (JMAP-32) — тогда
+    /// `scope` — аккаунт владельца, `access` — права на его общие коллекции. Иначе — `accountNotFound`.
+    pub async fn open_dav(&mut self, account_id: &str) -> MethodResult<()> {
+        if account_id == self.account_id() {
+            return Ok(());
+        }
+        let rights = crate::sharing::open(self.jmap, self.principal, account_id).await?;
+        self.scope.account = account_id
+            .parse()
+            .map_err(|_| MethodError::new("accountNotFound"))?;
+        self.access = Access::Shared(rights);
+        Ok(())
     }
 
     /// Проверяет число объектов в `/get`.
@@ -304,6 +330,8 @@ impl Jmap {
             schedule: None,
             sender_lists: None,
             org: None,
+            sharing: None,
+            notices: crate::sharing::Notices::default(),
             stop: watch::channel(false).0,
             push: crate::disable::Sessions::default(),
         })
@@ -395,6 +423,16 @@ impl Jmap {
         self
     }
 
+    /// Подключает общий доступ к календарям и адресным книгам (CONTRACTS.md#Sharing, JMAP-32): чужие коллекции с
+    /// правами субъекта — в аккаунтах владельцев (`isPersonal` = `false`), `shareWith` и `myRights` по
+    /// [`tp_contracts::sharing::CollectionAcl`], выдача — в пределах политики организации, `ShareNotification`.
+    /// `None` — только свои коллекции, `shareWith` — `null`.
+    #[must_use]
+    pub fn with_sharing(mut self, sharing: Option<SharingDeps>) -> Self {
+        self.sharing = sharing;
+        self
+    }
+
     /// Списки отправителей для метода; не подключены — `unknownMethod`.
     pub(crate) fn sender_lists_store(&self) -> MethodResult<&Arc<dyn SenderLists>> {
         self.sender_lists
@@ -418,7 +456,7 @@ impl Jmap {
             SENDER_LISTS => self.sender_lists.is_some(),
             ORG_CHART => self.org.is_some(),
             VACATION | SIEVE => self.sieve.is_some(),
-            CONTACTS | CALENDARS | PRINCIPALS | PRINCIPALS_OWNER => self.dav.is_some(),
+            CONTACTS | CALENDARS | TASKS | PRINCIPALS | PRINCIPALS_OWNER => self.dav.is_some(),
             AVAILABILITY => self.dav.is_some() && self.freebusy.is_some(),
             _ => false,
         }
@@ -446,8 +484,9 @@ impl Jmap {
             || self.d.capabilities.iter().any(|c| c.uri() == uri)
     }
 
-    /// Объект сессии (RFC 8620 §2) для субъекта; `base` — внешний адрес сервера без `/` в конце.
-    pub fn session(&self, p: &Principal, base: &str) -> Value {
+    /// Объект сессии (RFC 8620 §2) для субъекта; `base` — внешний адрес сервера без `/` в конце. Аккаунты владельцев
+    /// общих календарей и адресных книг ([`Jmap::with_sharing`]) — с `isPersonal` = `false`.
+    pub async fn session(&self, p: &Principal, base: &str) -> Value {
         let c = &self.cfg;
         let account = p.account.to_string();
         let mut caps = Map::new();
@@ -526,14 +565,17 @@ impl Jmap {
         }
         if self.dav.is_some() {
             caps.insert(CONTACTS.into(), json!({}));
-            account_caps.insert(CONTACTS.into(), crate::contacts::account_capability());
+            account_caps.insert(CONTACTS.into(), crate::contacts::account_capability(true));
             primary.insert(CONTACTS.into(), json!(account));
             caps.insert(CALENDARS.into(), json!({}));
             account_caps.insert(
                 CALENDARS.into(),
-                crate::calendars::account_capability(&self.cfg.calendars),
+                crate::calendars::account_capability(&self.cfg.calendars, true),
             );
             primary.insert(CALENDARS.into(), json!(account));
+            caps.insert(TASKS.into(), json!({}));
+            account_caps.insert(TASKS.into(), crate::tasks::account_capability(true));
+            primary.insert(TASKS.into(), json!(account));
             caps.insert(PRINCIPALS.into(), json!({}));
             account_caps.insert(
                 PRINCIPALS.into(),
@@ -569,6 +611,28 @@ impl Jmap {
                 "accountCapabilities": account_caps,
             }),
         );
+        for shared in crate::sharing::session_accounts(self, p).await {
+            let mut caps = Map::new();
+            if shared.calendars {
+                caps.insert(
+                    CALENDARS.into(),
+                    crate::calendars::account_capability(&self.cfg.calendars, false),
+                );
+                caps.insert(TASKS.into(), crate::tasks::account_capability(false));
+            }
+            if shared.books {
+                caps.insert(CONTACTS.into(), crate::contacts::account_capability(false));
+            }
+            accounts.insert(
+                shared.owner.to_string(),
+                json!({
+                    "name": shared.name,
+                    "isPersonal": false,
+                    "isReadOnly": shared.read_only,
+                    "accountCapabilities": caps,
+                }),
+            );
+        }
         let mut session = json!({
             "capabilities": caps,
             "accounts": accounts,
@@ -584,8 +648,8 @@ impl Jmap {
         session
     }
 
-    fn session_state(&self, p: &Principal) -> String {
-        self.session(p, "")["state"]
+    async fn session_state(&self, p: &Principal) -> String {
+        self.session(p, "").await["state"]
             .as_str()
             .unwrap_or_default()
             .to_owned()
@@ -625,6 +689,7 @@ impl Jmap {
                     tenant: p.tenant,
                     account: p.account,
                 },
+                access: Access::Own,
                 created: &mut created,
                 implicit: Vec::new(),
             };
@@ -648,7 +713,7 @@ impl Jmap {
         Ok(Response {
             method_responses: responses,
             created_ids: echo_created.then_some(created),
-            session_state: self.session_state(p),
+            session_state: self.session_state(p).await,
         })
     }
 

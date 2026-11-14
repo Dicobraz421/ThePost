@@ -10,10 +10,13 @@
 //!   `default`, иначе первый по порядку (`tp_contracts::dav::default_of`);
 //! - `includeInAvailability` — `all` или `none` (`schedule-calendar-transp` CalDAV, `Collection::transparent`);
 //!   `attending` — `invalidProperties`;
-//! - `shareWith`, `myRights` — права владельца, общий доступ — JMAP-32; `participantIdentities`,
-//!   `CalendarEventNotification`, `Principal` — JMAP-30, JMAP-31.
+//! - `shareWith`, `myRights` — права учётных записей и субъекта по `CollectionAcl` (JMAP-32, `crate::sharing`):
+//!   свойства, права и удаление календаря — при праве `admin`, в чужом аккаунте календарь не создаётся;
+//!   `participantIdentities`, `CalendarEventNotification`, `Principal` — JMAP-30, JMAP-31.
 //!
-//! `name` — отображаемое имя коллекции, сегмент URL нового календаря — его `id`. Состояние —
+//! Календарь — коллекция с `VEVENT` среди компонентов; коллекция только с `VTODO` — список задач (`crate::tasks`,
+//! JMAP-33), в `Calendar/get` и `/changes` её нет. `name` — отображаемое имя коллекции, сегмент URL нового
+//! календаря — его `id`. Состояние —
 //! [`DavStore::state`] вида (общее для `Calendar` и `CalendarEvent`); push — по `DavChanged`.
 
 use std::str::FromStr;
@@ -22,7 +25,9 @@ use calcard::common::timezone::Tz;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore, default_of};
+use tp_contracts::dav::{
+    Collection, CollectionId, CollectionKind, Component, DavStore, default_of,
+};
 use tp_contracts::meta::AccountScope;
 
 use crate::contacts::{set_default, store_error};
@@ -33,27 +38,33 @@ use crate::core::request::{
     ChangesArgs, GetArgs, SetArgs, SetOutcome, changes_response, map_changes, object, parse_args,
     parse_state, select, state_string,
 };
+use crate::sharing::{
+    ObjectType, calendar_rights, commit_share, prepare_share, share_with, split_share,
+};
 
 pub(crate) const KIND: CollectionKind = CollectionKind::Calendar;
 
 /// Сегмент URL календаря по умолчанию.
 const DEFAULT_NAME: &str = tp_contracts::dav::DEFAULT_COLLECTION_NAME;
 
-/// Значение capability учётной записи: событие — в одном календаре (объект CalDAV).
-pub(crate) fn account_capability(cfg: &CalendarsConfig) -> Value {
+/// Значение capability аккаунта: событие — в одном календаре (объект CalDAV); `may_create` — свой аккаунт (в
+/// чужом календари не создаются).
+pub(crate) fn account_capability(cfg: &CalendarsConfig, may_create: bool) -> Value {
     json!({
         "maxCalendarsPerEvent": 1,
         "minDateTime": "0001-01-01T00:00:00",
         "maxDateTime": "9999-12-31T23:59:59",
         "maxExpandedQueryDuration": format!("PT{}S", cfg.max_expanded_query_duration.as_secs()),
         "maxParticipantsPerEvent": null,
-        "mayCreateCalendar": true,
+        "mayCreateCalendar": may_create,
     })
 }
 
-/// Календарь по умолчанию среди `books` — правило контракта [`default_of`]: назначенный, иначе прежнее правило.
+/// Календарь по умолчанию среди календарей событий `books` ([`is_calendar`]) — правило контракта [`default_of`]:
+/// назначенный, иначе прежнее правило.
 pub(crate) fn default_calendar(books: &[Collection]) -> Option<CollectionId> {
-    default_of(books).map(|b| b.id)
+    let cals: Vec<Collection> = books.iter().filter(|b| is_calendar(b)).cloned().collect();
+    default_of(&cals).map(|b| b.id)
 }
 
 /// Оповещения по умолчанию календаря (текст JSON-объекта `Id[Alert]`) — значением JMAP; нет — `null`.
@@ -67,20 +78,27 @@ pub(crate) async fn state(store: &dyn DavStore, scope: AccountScope) -> MethodRe
     Ok(state_string(store.state(scope, KIND).await?))
 }
 
+/// Коллекция — календарь событий (`VEVENT`); коллекция только задач — список задач (`crate::tasks`).
+pub(crate) fn is_calendar(c: &Collection) -> bool {
+    c.components.contains(&Component::Event)
+}
+
 /// `includeInAvailability`: календарь вне занятости (`schedule-calendar-transp: transparent`) — `none`.
 fn availability(c: &Collection) -> &'static str {
     if c.transparent { "none" } else { "all" }
 }
 
-fn rights() -> Value {
-    json!({
-        "mayReadFreeBusy": true, "mayReadItems": true, "mayWriteAll": true, "mayWriteOwn": true,
-        "mayUpdatePrivate": true, "mayRSVP": true, "mayShare": false, "mayDelete": true,
-    })
+/// `myRights` календаря `c` для вызова.
+fn rights(ctx: &Ctx<'_>, c: CollectionId) -> Value {
+    calendar_rights(ctx.access.rights(c), ctx.jmap.sharing.is_some())
 }
 
-fn calendar_object(b: &Collection, default: Option<CollectionId>) -> Map<String, Value> {
-    object(json!({
+async fn calendar_object(
+    ctx: &Ctx<'_>,
+    b: &Collection,
+    default: Option<CollectionId>,
+) -> MethodResult<Map<String, Value>> {
+    Ok(object(json!({
         "id": b.id.to_string(),
         "name": b.display_name,
         "description": b.description,
@@ -93,9 +111,9 @@ fn calendar_object(b: &Collection, default: Option<CollectionId>) -> Map<String,
         "defaultAlertsWithTime": alerts(b.alerts_with_time.as_deref()),
         "defaultAlertsWithoutTime": alerts(b.alerts_without_time.as_deref()),
         "timeZone": b.timezone,
-        "shareWith": null,
-        "myRights": rights(),
-    }))
+        "shareWith": share_with(ctx, ObjectType::Calendar, b).await?,
+        "myRights": rights(ctx, b.id),
+    })))
 }
 
 /// `Calendar/get`.
@@ -104,21 +122,21 @@ pub(crate) async fn get(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: GetArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     ctx.check_get_limit(a.ids.as_ref())?;
     let store = ctx.jmap.dav_store()?;
     let st = state(store.as_ref(), ctx.scope).await?;
-    let books = store.list_collections(ctx.scope, KIND).await?;
+    let mut books = store.list_collections(ctx.scope, KIND).await?;
+    books.retain(is_calendar);
     let default = default_calendar(&books);
+    books.retain(|b| ctx.access.sees(b.id));
     let (mut list, mut not_found) = (Vec::new(), Vec::new());
     let props = a.properties.as_deref();
     match &a.ids {
         None => {
-            list.extend(
-                books
-                    .iter()
-                    .map(|b| select(calendar_object(b, default), props)),
-            );
+            for b in &books {
+                list.push(select(calendar_object(ctx, b, default).await?, props));
+            }
         }
         Some(ids) => {
             let mut seen: Vec<&str> = Vec::new();
@@ -129,7 +147,7 @@ pub(crate) async fn get(
                 }
                 seen.push(id);
                 match books.iter().find(|b| b.id.to_string() == id) {
-                    Some(b) => list.push(select(calendar_object(b, default), props)),
+                    Some(b) => list.push(select(calendar_object(ctx, b, default).await?, props)),
                     None => not_found.push(id.to_owned()),
                 }
             }
@@ -149,16 +167,16 @@ pub(crate) async fn changes(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: ChangesArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
     let since = parse_state(&a.since_state)?;
-    let c = ctx
-        .jmap
-        .dav_store()?
+    let store = ctx.jmap.dav_store()?;
+    let c = store
         .collection_changes(ctx.scope, KIND, since, limit)
         .await
         .map_err(changes_error)?;
-    let c = map_changes(c, ToString::to_string);
+    let mut c = map_changes(c, ToString::to_string);
+    crate::sharing::retain_collections(ctx, store.as_ref(), &mut c, is_calendar).await?;
     let mut out = changes_response(&a.account_id, &a.since_state, &c);
     out.insert("updatedProperties".into(), Value::Null);
     Ok(out)
@@ -253,7 +271,6 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
             ("defaultAlertsWithoutTime", v) => {
                 default_alerts(v).map(|a| c.alerts_without_time = a).is_ok()
             }
-            ("shareWith", Value::Null) => true,
             _ => false,
         };
         if !ok {
@@ -273,7 +290,7 @@ fn apply_props(c: &mut Collection, v: &Value, create: bool) -> Result<(), Value>
 }
 
 /// `Calendar/set`: создание, изменение (имя, описание, цвет, порядок, пояс, `includeInAvailability`, подписка,
-/// видимость, оповещения по умолчанию), удаление (`onDestroyRemoveEvents`), календарь по умолчанию
+/// видимость, оповещения по умолчанию, `shareWith`), удаление (`onDestroyRemoveEvents`), календарь по умолчанию
 /// (`onSuccessSetIsDefault`).
 pub(crate) async fn set(
     ctx: &mut Ctx<'_>,
@@ -285,7 +302,7 @@ pub(crate) async fn set(
     let mut base = args;
     base.retain(|k, _| !k.starts_with("on"));
     let a: SetArgs = parse_args(base)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     a.check_limit(ctx.jmap.cfg.max_objects_in_set)?;
     let store = ctx.jmap.dav_store()?.clone();
     let old = state(store.as_ref(), ctx.scope).await?;
@@ -294,18 +311,32 @@ pub(crate) async fn set(
     }
     let mut out = SetOutcome::default();
     for (cid, v) in a.create.unwrap_or_default() {
+        if !ctx.access.is_own() {
+            out.not_created
+                .insert(cid, set_error("forbidden", None, &[]));
+            continue;
+        }
+        let (props, share) = split_share(&v);
         let mut c = Collection::new(KIND, DEFAULT_NAME);
         c.name = c.id.to_string();
-        if let Err(e) = apply_props(&mut c, &v, true) {
+        if let Err(e) = apply_props(&mut c, &Value::Object(props), true) {
             out.not_created.insert(cid, e);
             continue;
         }
+        let grants = match prepare_share(ctx, ObjectType::Calendar, None, &share).await? {
+            Ok(g) => g,
+            Err(e) => {
+                out.not_created.insert(cid, e);
+                continue;
+            }
+        };
         let (id, include) = (c.id, availability(&c));
         let (subscribed, visible) = (c.subscribed, c.visible);
         let with_time = alerts(c.alerts_with_time.as_deref());
         let without_time = alerts(c.alerts_without_time.as_deref());
-        match store.create_collection(ctx.scope, c).await {
+        match store.create_collection(ctx.scope, c.clone()).await {
             Ok(_) => {
+                commit_share(ctx, ObjectType::Calendar, &c, grants).await?;
                 ctx.created.insert(cid.clone(), id.to_string());
                 let books = store.list_collections(ctx.scope, KIND).await?;
                 out.created.insert(
@@ -318,8 +349,8 @@ pub(crate) async fn set(
                         "includeInAvailability": include,
                         "defaultAlertsWithTime": with_time,
                         "defaultAlertsWithoutTime": without_time,
-                        "shareWith": null,
-                        "myRights": rights(),
+                        "shareWith": share_with(ctx, ObjectType::Calendar, &c).await?,
+                        "myRights": rights(ctx, id),
                     }),
                 );
             }
@@ -334,21 +365,38 @@ pub(crate) async fn set(
             Ok(cid) => store
                 .get_collection(ctx.scope, cid)
                 .await?
-                .filter(|c| c.kind == KIND),
+                .filter(|c| c.kind == KIND && is_calendar(c)),
             Err(_) => None,
         };
-        let Some(mut c) = cur else {
+        let Some(mut c) = cur.filter(|c| ctx.access.sees(c.id)) else {
             out.not_updated.insert(id, set_error("notFound", None, &[]));
             continue;
         };
-        if let Err(e) = apply_props(&mut c, &patch, false) {
+        if !ctx.access.admins(c.id) {
+            out.not_updated
+                .insert(id, set_error("forbidden", None, &[]));
+            continue;
+        }
+        let (props, share) = split_share(&patch);
+        if let Err(e) = apply_props(&mut c, &Value::Object(props.clone()), false) {
             out.not_updated.insert(id, e);
             continue;
         }
-        match store.update_collection(ctx.scope, c).await {
-            Ok(_) => out.updated.insert(id, Value::Null),
-            Err(e) => out.not_updated.insert(id, store_error(e)?),
+        let grants = match prepare_share(ctx, ObjectType::Calendar, Some(c.id), &share).await? {
+            Ok(g) => g,
+            Err(e) => {
+                out.not_updated.insert(id, e);
+                continue;
+            }
         };
+        if !props.is_empty()
+            && let Err(e) = store.update_collection(ctx.scope, c.clone()).await
+        {
+            out.not_updated.insert(id, store_error(e)?);
+            continue;
+        }
+        commit_share(ctx, ObjectType::Calendar, &c, grants).await?;
+        out.updated.insert(id, Value::Null);
     }
     for id in a.destroy.unwrap_or_default() {
         let rid = ctx.resolve_id(&id).to_owned();
@@ -356,14 +404,19 @@ pub(crate) async fn set(
             Ok(cid) => store
                 .get_collection(ctx.scope, cid)
                 .await?
-                .filter(|c| c.kind == KIND),
+                .filter(|c| c.kind == KIND && is_calendar(c)),
             Err(_) => None,
         };
-        let Some(c) = cur else {
+        let Some(c) = cur.filter(|c| ctx.access.sees(c.id)) else {
             out.not_destroyed
                 .insert(id, set_error("notFound", None, &[]));
             continue;
         };
+        if !ctx.access.admins(c.id) {
+            out.not_destroyed
+                .insert(id, set_error("forbidden", None, &[]));
+            continue;
+        }
         if !extra.on_destroy_remove_events && !store.list_objects(ctx.scope, c.id).await?.is_empty()
         {
             out.not_destroyed
@@ -450,7 +503,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn session_lists_capability() {
         let env = Env::new().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let acc = env.account();
         assert!(s["capabilities"][USING[1]].is_object(), "{s}");
         let cap = &s["accounts"][&acc]["accountCapabilities"][USING[1]];
@@ -462,7 +518,8 @@ pub(crate) mod tests {
         let bare = Env::bare().await;
         let s = bare
             .jmap
-            .session(&bare.principal, "https://mail.example.org");
+            .session(&bare.principal, "https://mail.example.org")
+            .await;
         assert!(s["capabilities"][USING[1]].is_null(), "{s}");
     }
 

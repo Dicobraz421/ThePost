@@ -3,8 +3,9 @@
 //!
 //! Хранится vCard — тот же объект, что читает и пишет CardDAV; JSContact ↔ vCard — calcard, индекс объекта —
 //! `tp_dav::index::card`. Карточка — в одной адресной книге (`maxAddressBooksPerCard` = 1); смена `addressBookIds`
-//! переносит её в другую книгу с прежним `id` ([`DavStore::move_object`], JMAP-34). `/copy` — между учётными
-//! записями, а доступна только своя: чужая — `fromAccountNotFound`. Фильтры запроса — RFC 9610 §3.3.1 (`text` — имя,
+//! переносит её в другую книгу с прежним `id` ([`DavStore::move_object`], JMAP-34). `/copy` между аккаунтами не
+//! поддерживается: `fromAccountNotFound`. В аккаунте владельца общих книг (JMAP-32) видны карточки книг с правом
+//! чтения, меняются — с правом записи (иначе — `forbidden`). Фильтры запроса — RFC 9610 §3.3.1 (`text` — имя,
 //! псевдонимы, организации, адреса, телефоны, сервисы, почтовые адреса, заметки). Условие `name`, `name/given`,
 //! `name/surname` или `email` (само или внутри `AND`) берёт кандидатов из поискового индекса
 //! ([`DavStore::find_cards`]: полное имя, части имени, псевдонимы, адреса e-mail) и проверяется по карточке; прочие
@@ -108,26 +109,31 @@ pub(crate) async fn load(
     Ok(out)
 }
 
-async fn book_ids(store: &dyn DavStore, scope: AccountScope) -> MethodResult<Vec<CollectionId>> {
-    Ok(store
-        .list_collections(scope, KIND)
+/// Адресные книги аккаунта вызова с правом чтения.
+async fn book_ids(ctx: &Ctx<'_>) -> MethodResult<Vec<CollectionId>> {
+    Ok(ctx
+        .jmap
+        .dav_store()?
+        .list_collections(ctx.scope, KIND)
         .await?
         .into_iter()
         .map(|b| b.id)
+        .filter(|b| ctx.access.reads(*b))
         .collect())
 }
 
-/// Объект карточки по `id` JMAP; чужой формат, нет объекта или объект календаря — `None`.
-async fn find(
-    store: &dyn DavStore,
-    scope: AccountScope,
-    id: &str,
-) -> MethodResult<Option<DavObject>> {
+/// Объект карточки по `id` JMAP; чужой формат, нет объекта, объект календаря или книга без права чтения — `None`.
+async fn find(ctx: &Ctx<'_>, id: &str) -> MethodResult<Option<DavObject>> {
     let Ok(oid) = DavObjectId::from_str(id) else {
         return Ok(None);
     };
-    let obj = store.objects_by_id(scope, &[oid]).await?.into_iter().next();
-    Ok(obj.filter(|o| o.index.component.fits(KIND)))
+    let store = ctx.jmap.dav_store()?;
+    let obj = store
+        .objects_by_id(ctx.scope, &[oid])
+        .await?
+        .into_iter()
+        .next();
+    Ok(obj.filter(|o| o.index.component.fits(KIND) && ctx.access.reads(o.collection)))
 }
 
 /// `ContactCard/get`.
@@ -136,7 +142,7 @@ pub(crate) async fn get(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: GetArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     ctx.check_get_limit(a.ids.as_ref())?;
     let store = ctx.jmap.dav_store()?;
     let st = state(store.as_ref(), ctx.scope).await?;
@@ -144,7 +150,7 @@ pub(crate) async fn get(
     let (mut list, mut not_found) = (Vec::new(), Vec::new());
     match &a.ids {
         None => {
-            let books = book_ids(store.as_ref(), ctx.scope).await?;
+            let books = book_ids(ctx).await?;
             let all = load(store.as_ref(), ctx.scope, &books).await?;
             list.extend(all.iter().map(|o| select(card_json(o), props)));
         }
@@ -156,7 +162,7 @@ pub(crate) async fn get(
                     continue;
                 }
                 seen.push(id);
-                match find(store.as_ref(), ctx.scope, id).await? {
+                match find(ctx, id).await? {
                     Some(o) => list.push(select(card_json(&o), props)),
                     None => not_found.push(id.to_owned()),
                 }
@@ -172,7 +178,8 @@ pub(crate) async fn get(
 }
 
 /// Изменения карточек после `since` (не больше `limit`): сначала своих книг ([`DavStore::account_changes`]), затем
-/// книги GAL ([`DavStore::gal_changes`]); вместе с состоянием после возвращённых изменений.
+/// книги GAL ([`DavStore::gal_changes`]); вместе с состоянием после возвращённых изменений. В аккаунте владельца
+/// общих книг — только карточки книг с правом чтения, без книги GAL.
 async fn card_changes(
     ctx: &Ctx<'_>,
     since: State,
@@ -188,6 +195,13 @@ async fn card_changes(
         own: c.new_state,
         gal: since.gal,
     };
+    if !ctx.access.is_own() {
+        crate::sharing::retain_objects(ctx, store.as_ref(), &mut c, |o| {
+            ctx.access.reads(o.collection)
+        })
+        .await?;
+        return Ok((c, new));
+    }
     if c.has_more {
         return Ok((c, new));
     }
@@ -221,7 +235,7 @@ pub(crate) async fn changes(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: ChangesArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
     let since = State::parse(&a.since_state)?;
     let (c, new) = card_changes(ctx, since, limit).await?;
@@ -435,7 +449,7 @@ async fn run_query(ctx: &Ctx<'_>, a: &QueryArgs) -> MethodResult<Vec<String>> {
         return Err(MethodError::new("unsupportedSort"));
     }
     let store = ctx.jmap.dav_store()?;
-    let books = book_ids(store.as_ref(), ctx.scope).await?;
+    let books = book_ids(ctx).await?;
     let filter = a.filter.as_ref().filter(|f| !f.is_null());
     let objects = match filter.and_then(index_needle) {
         Some(needle) => candidates(store.as_ref(), ctx.scope, &books, &needle).await?,
@@ -475,7 +489,7 @@ pub(crate) async fn query(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: QueryArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     let st = state(ctx.jmap.dav_store()?.as_ref(), ctx.scope).await?;
     let ids = run_query(ctx, &a).await?;
     let mut out = object(json!({
@@ -493,7 +507,7 @@ pub(crate) async fn query_changes(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let qc: QueryChangesArgs = parse_args(args.clone())?;
-    ctx.check_account(&qc.account_id)?;
+    ctx.open_dav(&qc.account_id).await?;
     let mut q = args;
     q.retain(|k, _| matches!(k.as_str(), "accountId" | "filter" | "sort"));
     let a: QueryArgs = parse_args(q)?;
@@ -560,6 +574,11 @@ fn forbidden() -> Value {
     set_error("forbidden", Some("the address book is read-only"), &[])
 }
 
+/// Карточки книги меняются: не книга GAL и есть право записи.
+fn writable(ctx: &Ctx<'_>, book: CollectionId, gal: Option<CollectionId>) -> bool {
+    Some(book) != gal && ctx.access.writes(book)
+}
+
 async fn create_one(
     ctx: &Ctx<'_>,
     v: &Value,
@@ -581,7 +600,7 @@ async fn create_one(
         let why = "exactly one existing address book is required";
         return Ok(Err(invalid(why, &["addressBookIds"])));
     };
-    if Some(book) == gal {
+    if !writable(ctx, book, gal) {
         return Ok(Err(forbidden()));
     }
     let now = utc_date(OffsetDateTime::now_utc());
@@ -627,10 +646,10 @@ async fn update_one(
     gal: Option<CollectionId>,
 ) -> MethodResult<Result<Value, Value>> {
     let store = ctx.jmap.dav_store()?;
-    let Some(obj) = find(store.as_ref(), ctx.scope, id).await? else {
+    let Some(obj) = find(ctx, id).await? else {
         return Ok(Err(set_error("notFound", None, &[])));
     };
-    if Some(obj.collection) == gal {
+    if !writable(ctx, obj.collection, gal) {
         return Ok(Err(forbidden()));
     }
     let Value::Object(patch) = patch else {
@@ -655,7 +674,7 @@ async fn update_one(
         let why = "exactly one existing address book is required";
         return Ok(Err(invalid(why, &["addressBookIds"])));
     };
-    if Some(to) == gal {
+    if !writable(ctx, to, gal) {
         return Ok(Err(forbidden()));
     }
     let now = utc_date(OffsetDateTime::now_utc());
@@ -707,7 +726,7 @@ pub(crate) async fn set(
     args: Map<String, Value>,
 ) -> MethodResult<Map<String, Value>> {
     let a: SetArgs = parse_args(args)?;
-    ctx.check_account(&a.account_id)?;
+    ctx.open_dav(&a.account_id).await?;
     a.check_limit(ctx.jmap.cfg.max_objects_in_set)?;
     let store = ctx.jmap.dav_store()?.clone();
     let old = state(store.as_ref(), ctx.scope).await?;
@@ -738,12 +757,12 @@ pub(crate) async fn set(
     }
     for id in a.destroy.unwrap_or_default() {
         let rid = ctx.resolve_id(&id).to_owned();
-        let Some(obj) = find(store.as_ref(), ctx.scope, &rid).await? else {
+        let Some(obj) = find(ctx, &rid).await? else {
             out.not_destroyed
                 .insert(id, set_error("notFound", None, &[]));
             continue;
         };
-        if Some(obj.collection) == gal {
+        if !writable(ctx, obj.collection, gal) {
             out.not_destroyed.insert(id, forbidden());
             continue;
         }
@@ -772,8 +791,7 @@ struct CopyArgs {
     account_id: String,
 }
 
-/// `ContactCard/copy`: копирование между учётными записями; доступна только своя, поэтому источник —
-/// `fromAccountNotFound` (общие адресные книги — JMAP-32).
+/// `ContactCard/copy`: копирование между аккаунтами не поддерживается — источник `fromAccountNotFound`.
 pub(crate) async fn copy(
     ctx: &mut Ctx<'_>,
     mut args: Map<String, Value>,
