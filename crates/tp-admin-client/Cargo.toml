@@ -14,10 +14,13 @@ workspace = true
 tp-contracts.workspace = true
 tp-auth.workspace = true
 tp-admin.workspace = true
+anstream.workspace = true
+anstyle.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
