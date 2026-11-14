@@ -94,6 +94,9 @@ pub enum AdminAction {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
     },
+    /// Текстовый интерфейс администратора (TUI): те же ключи подключения, что у `thepost admin`
+    /// (`--url`, `--ca-file`, `--insecure`, `--token` или THEPOST_ADMIN_TOKEN); выход — F10.
+    Tui,
     /// Команды Admin API: `thepost admin <ресурс> <действие>`.
     #[command(flatten)]
     Api(admin_cli::ApiAction),
@@ -222,12 +225,41 @@ pub async fn run(cli: Cli) -> i32 {
             api,
             action: AdminAction::Api(action),
         } => admin_cli::command(&path, api, action).await,
+        Command::Admin {
+            api,
+            action: AdminAction::Tui,
+        } => admin_tui(api).await,
         Command::Serve => serve_until_signal(path).await,
         Command::SearchExtract => {
             // Подпроцесс запускается до рантайма (`main`): сюда приходит только вызов из кода.
             eprintln!("thepost: search-extract — подпроцесс роли indexer, запускается до рантайма");
             2
         }
+    }
+}
+
+/// `thepost admin tui`: подключение — те же ключи, что у остальных команд `thepost admin`.
+async fn admin_tui(api: admin_cli::ApiArgs) -> i32 {
+    match tp_tui::run(tui_connect(api)).await {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("thepost: admin tui: {e}");
+            1
+        }
+    }
+}
+
+/// Ключи `thepost admin` → подключение текстового интерфейса (токен и адрес без ключей — из THEPOST_ADMIN_*).
+fn tui_connect(api: admin_cli::ApiArgs) -> tp_tui::Connect {
+    tp_tui::Connect {
+        url: api.url,
+        token: api.token,
+        options: tp_admin_client::Options {
+            ca_file: api.ca_file,
+            insecure: api.insecure,
+            timeout: std::time::Duration::from_secs(api.timeout),
+        },
+        ..tp_tui::Connect::default()
     }
 }
 
@@ -303,6 +335,35 @@ mod tests {
         ));
         assert_eq!(cli.config_path(), PathBuf::from("/y.yaml"));
         assert!(Cli::try_parse_from(["thepost", "bogus"]).is_err());
+        let cli = Cli::try_parse_from([
+            "thepost",
+            "admin",
+            "--url",
+            "https://127.0.0.1:8443",
+            "--ca-file",
+            "/ca.pem",
+            "--insecure",
+            "--token",
+            "tps_x",
+            "tui",
+        ])
+        .expect("admin tui");
+        let Command::Admin {
+            api,
+            action: AdminAction::Tui,
+        } = cli.command
+        else {
+            panic!("ждали admin tui");
+        };
+        let connect = tui_connect(api);
+        assert_eq!(connect.url.as_deref(), Some("https://127.0.0.1:8443"));
+        assert_eq!(connect.token.as_deref(), Some("tps_x"));
+        assert!(connect.options.insecure);
+        assert_eq!(connect.options.ca_file, Some(PathBuf::from("/ca.pem")));
+        let help = Cli::try_parse_from(["thepost", "admin", "tui", "--help"])
+            .expect_err("--help — это выход clap");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("THEPOST_ADMIN_TOKEN"));
         let cli = Cli::try_parse_from(["thepost", tp_search::extract::WORKER_SUBCOMMAND])
             .expect("worker");
         assert!(matches!(cli.command, Command::SearchExtract));
