@@ -29,6 +29,7 @@ jobs:
       rust: ${{ steps.d.outputs.rust }}
       deps: ${{ steps.d.outputs.deps }}
       console: ${{ steps.d.outputs.console }}
+      design: ${{ steps.d.outputs.design }}
       openapi: ${{ steps.d.outputs.openapi }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -43,7 +44,7 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           if [ -z "$BASE" ]; then
-            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"
+            echo rust=true >> "$GITHUB_OUTPUT"; echo deps=true >> "$GITHUB_OUTPUT"; echo design=true >> "$GITHUB_OUTPUT"
             # Сверка схемы с копией консоли — только PR и очередь (CI-11): расхождение не валит main и артефакт release.
             echo openapi=false >> "$GITHUB_OUTPUT"
             if [ -f console/package-lock.json ]; then echo console=true; else echo console=false; fi >> "$GITHUB_OUTPUT"
@@ -70,10 +71,17 @@ jobs:
           else
             echo deps=false >> "$GITHUB_OUTPUT"
           fi
-          if grep -qE '^(console/|\.github/actions/console/)' changed.txt; then
+          # Токены фирменного стиля (DES-01): консоль читает design/ при сборке (UI-19) — правка design/ запускает и
+          # job console; tp-tui читает их include_str! (TUI-06) — Rust тоже собирается.
+          if grep -qE '^(console/|\.github/actions/console/|design/)' changed.txt; then
             echo console=true >> "$GITHUB_OUTPUT"
           else
             echo console=false >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '^(design/|scripts/design_contrast\.py$)' changed.txt; then
+            echo design=true >> "$GITHUB_OUTPUT"
+          else
+            echo design=false >> "$GITHUB_OUTPUT"
           fi
           # Схема Admin API (utoipa) — только в tp-admin; копия консоли — console/src/api/openapi.json.
           if grep -qE '^(crates/tp-admin/|console/src/api/openapi\.json$)' changed.txt; then
@@ -222,6 +230,18 @@ jobs:
         with:
           checks: 'true'
 
+  # Фирменный стиль (решение 119, DES-01): контраст пар ролей design/tokens.toml в каждом режиме и у CLI.
+  # Самопроверка — скрипт находит нарушения в испорченных токенах.
+  design:
+    needs: changes
+    if: needs.changes.outputs.design == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: python3 scripts/design_contrast.py --self-test
+      - run: python3 scripts/design_contrast.py design/tokens.toml
+
   # Только main, бета и ручной запуск: release-сборка и артефакт (решение 116, CI-14) — тем же путём, что выпуск
   # в beta.yml (.github/actions/release-build: cross, запуск на qemu Nehalem). В PR не выполняется.
   release:
@@ -255,7 +275,7 @@ jobs:
 
   # Единственный required check: зелёный, если всё нужное прошло или было пропущено.
   gate:
-    needs: [changes, fmt, clippy, test, interp, deny, console]
+    needs: [changes, fmt, clippy, test, interp, deny, console, design]
     if: always()
     runs-on: ubuntu-latest
     steps:
