@@ -854,6 +854,14 @@
 | [UI-21](UI-21.md) | консоль — тип ресурса бронирования | console | A | console-12 | todo | ADM-47 |
 | [DAV-38](DAV-38.md) | `calendar-user-type` по типу ресурса — `ROOM` или `RESOURCE` | dav | A | dav-17 | todo | CTR-88,DAV-19 |
 | [JMAP-45](JMAP-45.md) | `Principal.type` по типу ресурса — `location` или `resource` | jmap | A | jmap-28 | todo | CTR-88 |
+| [META-82](META-82.md) | просмотр очереди и повтор доставки в PostgreSQL — `QueueStore::list` и `retry` | meta | A | meta-55 | todo | CTR-85 |
+| [CTR-89](CTR-89.md) | `QueueStore::list` и `retry` без тел по умолчанию | contracts | B | contracts-60 | todo | META-82 |
+| [META-83](META-83.md) | хранилище `ShareNotification` в PostgreSQL — миграция 0042 | meta | A | meta-56 | todo | CTR-86 |
+| [JMAP-46](JMAP-46.md) | `ShareNotification` из `ShareNotificationStore`, а не из памяти узла | jmap | B | jmap-29 | todo | CTR-86,META-83 |
+| [APP-72](APP-72.md) | узел — `ShareNotification` переживают перезапуск и видны на другом узле | app | A | app-69 | todo | JMAP-46 |
+| [CTR-90](CTR-90.md) | вытеснение старых `ShareNotification` сверх предела в хранилище | contracts | B | contracts-61 | todo | CTR-86,META-83 |
+| [DAV-39](DAV-39.md) | удалить `tp_dav::router_with`, тесты — на `router_shared` | dav | A | dav-18 | ready | — |
+| [APP-73](APP-73.md) | e2e узла — ответ ресурса внешнему организатору письмом iMIP | app | A | app-70 | todo | APP-71 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
