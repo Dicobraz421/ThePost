@@ -2875,9 +2875,14 @@ mod tests {
         assert!(err.contains("401"), "{err}");
     }
 
-    /// Проверка скрипта, как у узла: разбор tp-sieve.
+    /// Проверка скрипта, как у узла: `tp_sieve::compile` с пределами секции `sieve`; у тестовой секции глубина
+    /// вложенности меньше умолчания, чтобы отказ по пределу секции был виден.
     fn check_script(text: &str) -> Vec<tp_admin::ScriptError> {
-        tp_sieve::check(text)
+        let section = tp_sieve::SieveConfig {
+            max_nesting: 2,
+            ..tp_sieve::SieveConfig::default()
+        };
+        tp_sieve::compile(text.as_bytes(), &section.limits())
             .err()
             .unwrap_or_default()
             .into_iter()
@@ -3259,6 +3264,17 @@ mod tests {
         std::fs::write(&bad, "keep;\nнеизвестно;\n").expect("write");
         let err = exec(&c, false, put(&bad)).await.expect_err("422");
         assert!(err.contains("422") && err.contains("строка 2"), "{err}");
+        // Текст верен, но вложенность больше предела секции `sieve`: отказ узла с позицией, как при доставке.
+        let deep = dir.path().join("deep.sieve");
+        let deep_text = "if true { if true { if true { if true { keep; } } } }
+";
+        assert!(
+            tp_sieve::compile(deep_text.as_bytes(), &tp_sieve::Limits::default()).is_ok(),
+            "с пределами по умолчанию скрипт верен"
+        );
+        std::fs::write(&deep, deep_text).expect("write");
+        let err = exec(&c, false, put(&deep)).await.expect_err("422");
+        assert!(err.contains("422") && err.contains("строка 1"), "{err}");
         let missing = dir.path().join("нет.sieve");
         let err = exec(&c, false, put(&missing)).await.expect_err("нет файла");
         assert!(err.contains("нет.sieve"), "{err}");
