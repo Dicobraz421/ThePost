@@ -340,7 +340,7 @@ pub struct Env {
     pub other_tenant: TenantId,
 }
 
-/// Проверка скрипта тестов (вместо `tp_sieve::check`): каждое `oops` — ошибка с позицией.
+/// Проверка скрипта тестов (вместо разбора узла): каждое `oops` — ошибка с позицией.
 pub fn check_script(text: &str) -> Vec<ScriptError> {
     let mut errors = Vec::new();
     for (i, line) in text.lines().enumerate() {
