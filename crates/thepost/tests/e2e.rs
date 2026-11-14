@@ -23,8 +23,8 @@
 //! представитель через `PROPPATCH group-member-set`, приглашение переговорной — бронь в её календаре и ответ
 //! организатору.
 //!
-//! Ответ ресурса внешнему организатору (APP-73): приглашение переговорной письмом iMIP через доверенный шлюз —
-//! отказ (организатор вне организации) и `REPLY` письмом iMIP в очереди исходящей почты.
+//! Снаружи — только почта (APP-73, решение 123): приглашение переговорной письмом iMIP через доверенный шлюз — письмо
+//! в ящике ресурса, брони нет, ответа (письма в очереди исходящей почты) нет.
 //!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
@@ -2100,7 +2100,7 @@ async fn sharing_delegates_and_booking() {
     drop_database(&url, &db_name).await;
 }
 
-// ---------- APP-73: ответ ресурса внешнему организатору ----------
+// ---------- APP-73, решение 123: снаружи — только почта ----------
 
 /// Ответ `EHLO` целиком (строки расширений).
 async fn smtp_ehlo(addr: std::net::SocketAddr) -> String {
@@ -2126,84 +2126,15 @@ async fn smtp_ehlo(addr: std::net::SocketAddr) -> String {
     }
 }
 
-/// Письма очереди исходящей почты получателю `address`: тело каждого из BLOB (с распаковкой).
-async fn queued_bodies(
-    pool: &tp_meta::pool::DbPool,
-    meta: &PgMeta,
-    dir: &Path,
-    address: &str,
-) -> Vec<Vec<u8>> {
-    use futures::TryStreamExt as _;
-    use tp_contracts::blob::BlobStore;
-    use tp_contracts::ids::{BlobHash, BlobKey, Gen};
-
-    let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
-        .await
-        .expect("begin");
-    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT q.blob_hash, q.blob_gen FROM queue q JOIN queue_rcpts r USING (queue_id) \
-         WHERE r.address = $1 ORDER BY q.queued_at",
-    )
-    .bind(address)
-    .fetch_all(&mut *tx)
-    .await
-    .expect("queue");
-    drop(tx);
-    let local = tp_blob::LocalStore::open(tp_blob::LocalConfig {
-        root: dir.join("blob"),
-        ..tp_blob::LocalConfig::default()
-    })
-    .await
-    .expect("blob");
-    let blobs = tp_blob::Decompressing::new(Arc::new(local), Arc::new(meta.clone()));
-    let mut out = Vec::new();
-    for (hash, generation) in rows {
-        let key = BlobKey {
-            tenant: TenantId::DEFAULT,
-            hash: BlobHash(hash.try_into().expect("sha-256")),
-            generation: Gen(u32::try_from(generation).expect("generation")),
-        };
-        let chunks: Vec<_> = blobs
-            .get(&key, None)
-            .await
-            .expect("blob get")
-            .try_collect()
-            .await
-            .expect("blob read");
-        out.push(chunks.concat());
-    }
-    out
-}
-
-/// Часть `text/calendar` письма: (параметр `method`, текст iCalendar).
-fn calendar_part(raw: &[u8]) -> Option<(String, String)> {
-    use mail_parser::MimeHeaders as _;
-
-    let msg = mail_parser::MessageParser::default().parse(raw)?;
-    msg.parts.iter().find_map(|p| {
-        let ct = p.content_type()?;
-        let calendar = ct.ctype().eq_ignore_ascii_case("text")
-            && ct
-                .subtype()
-                .is_some_and(|s| s.eq_ignore_ascii_case("calendar"));
-        let method = ct.attribute("method").filter(|_| calendar)?;
-        Some((
-            method.to_owned(),
-            String::from_utf8_lossy(p.contents()).into_owned(),
-        ))
-    })
-}
-
-/// Приглашение переговорной письмом iMIP с внешнего адреса (APP-73, после #764): письмо `REQUEST` приходит через
-/// доверенный шлюз (`Authentication-Results` с `dmarc=pass`), приём iTIP узла решает по правилам бронирования —
-/// организатор вне организации бронировать не может (`BookingPolicy::allows`), поэтому брони в календаре ресурса нет,
-/// а ответ `REPLY` со статусом `DECLINED` и причиной (`COMMENT`) уходит внешнему организатору письмом iMIP в очередь
-/// исходящей почты (`ImipSender` узла). Принятие (`ACCEPTED`) организатору из организации проверяет
+/// Приглашение переговорной письмом iMIP с внешнего адреса (APP-73; решение 123 «Снаружи — только почта»): письмо
+/// `REQUEST` приходит через доверенный шлюз (`Authentication-Results` с `dmarc=pass`) и остаётся только письмом —
+/// оно в ящике ресурса, в журнале доставки приём iTIP отброшен (`Discard`), брони в календаре ресурса нет, ответа
+/// организатору (письма в очереди исходящей почты) нет. Бронь и ответ организатору из организации проверяет
 /// `sharing_delegates_and_booking`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resource_reply_to_external_organizer() {
+async fn external_request_to_room_stays_mail() {
     use tp_contracts::dav::{CollectionKind, DavStore};
-    use tp_contracts::schedule::ItipMethod;
+    use tp_contracts::delivery::DeliveryDecision;
     use tp_contracts::sharing::{BookingPolicy, ResourceStore};
     use tp_contracts::transport::{SourceKind, SourceMatch, TrustedSource};
 
@@ -2219,7 +2150,7 @@ async fn resource_reply_to_external_organizer() {
 
     let domain = "example.ru".to_owned();
     let path = dir.path().join("config.yaml");
-    // Без роли smtp-out: письмо iMIP остаётся в очереди, его никто не забирает.
+    // Без роли smtp-out: письмо в очереди, если бы оно появилось, никто бы не забрал.
     let text = config(dir.path(), &db_url, &domain).replace(
         "roles: [all]",
         "roles: [smtp-in, imap, jmap, dav, search, indexer, maintenance]",
@@ -2317,41 +2248,50 @@ async fn resource_reply_to_external_organizer() {
          ATTENDEE;CUTYPE=ROOM;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{room}\n\
          END:VEVENT\nEND:VCALENDAR\n"
     );
+    let message_id = format!("app73-{}@external.test", std::process::id());
     let message = format!(
         "Authentication-Results: {authserv}; spf=pass smtp.mailfrom=external.test;\n \
          dkim=pass header.d=external.test; dmarc=pass header.from=external.test\n\
          From: Carol <{organizer}>\nTo: <{room}>\nSubject: Invitation: External booking\n\
-         Message-ID: <app73-{}@external.test>\nDate: Thu, 12 Nov 2026 10:00:00 +0000\n\
-         MIME-Version: 1.0\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\n\n{ics}",
-        std::process::id()
+         Message-ID: <{message_id}>\nDate: Thu, 12 Nov 2026 10:00:00 +0000\n\
+         MIME-Version: 1.0\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\n\n{ics}"
     );
     smtp_send(smtp, organizer, &room, &message).await;
 
-    // Ответ ресурса — письмо iMIP внешнему организатору в очереди исходящей почты.
-    let until = deadline();
-    let bodies = loop {
-        let bodies = queued_bodies(&pool, &meta, dir.path(), organizer).await;
-        if !bodies.is_empty() {
-            break bodies;
-        }
-        retry(until, "ответ ресурса в очереди исходящей почты").await;
+    // Письмо доставлено в ящик ресурса, приём iTIP его отбросил (решение 123).
+    let query = DeliveryQuery {
+        message_id: Some(message_id.clone()),
+        ..DeliveryQuery::all(20)
     };
-    assert_eq!(bodies.len(), 1, "ответ ресурса не один");
-    let raw = &bodies[0];
-    let (method, reply) = calendar_part(raw)
-        .unwrap_or_else(|| panic!("нет части text/calendar: {}", String::from_utf8_lossy(raw)));
-    assert!(method.eq_ignore_ascii_case("REPLY"), "{method}");
-    let itip = tp_dav::itip::parse(&reply).unwrap_or_else(|e| panic!("не iTIP ({e:?}): {reply}"));
-    assert_eq!(itip.method, ItipMethod::Reply, "{reply}");
-    assert_eq!(itip.meeting.uid, uid);
-    assert_eq!(itip.meeting.organizer.as_deref(), Some(organizer));
-    let attendee = itip
-        .meeting
-        .attendee(&room)
-        .unwrap_or_else(|| panic!("в ответе нет ресурса: {reply}"));
-    assert_eq!(attendee.partstat, "DECLINED", "{reply}");
-    assert!(reply.contains("COMMENT"), "у отказа нет причины: {reply}");
-    // Отказ: брони в календаре ресурса нет.
+    let until = deadline();
+    let itip = loop {
+        let log = DeliveryLog::search(&meta, tenant, &query)
+            .await
+            .expect("delivery log");
+        let delivered = log
+            .events
+            .iter()
+            .any(|e| e.kind == DeliveryEventKind::Deliver);
+        let itip: Vec<_> = log
+            .events
+            .iter()
+            .filter(|e| e.kind == DeliveryEventKind::Itip)
+            .cloned()
+            .collect();
+        if delivered && !itip.is_empty() {
+            break itip;
+        }
+        retry(until, "доставка и приём iTIP в журнале доставки").await;
+    };
+    assert_eq!(itip.len(), 1, "{itip:?}");
+    assert_eq!(itip[0].decision, DeliveryDecision::Discard, "{itip:?}");
+    // Ответа нет: в очереди исходящей почты организатору пусто.
+    assert_eq!(
+        queued(&pool, organizer).await,
+        0,
+        "ответ внешнему организатору"
+    );
+    // Брони в календаре ресурса нет.
     for c in DavStore::list_collections(&meta, room_scope, CollectionKind::Calendar)
         .await
         .expect("calendars")

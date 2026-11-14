@@ -4,7 +4,7 @@
 use tp_contracts::DomainId;
 use tp_contracts::auth::{Resource, Rights, SendRight};
 use tp_contracts::meta::{AccountKind, AccountUpsert};
-use tp_contracts::schedule::{ItipMethod, ItipSource};
+use tp_contracts::schedule::{ItipMethod, SenderKind};
 use tp_testkit::FakeItip;
 
 use super::*;
@@ -101,7 +101,7 @@ async fn reached(env: &Env, itip: &FakeItip) -> Vec<String> {
             assert_eq!(c.recipient, bob);
             assert_eq!(c.to, BOB);
             assert_eq!(c.method, ItipMethod::Request);
-            assert_eq!(c.source, ItipSource::Internal);
+            assert_eq!(c.sender, SenderKind::Own);
             assert!(c.ics.contains("UID:u1"));
             c.from
         })
@@ -174,6 +174,33 @@ async fn send_as_and_on_behalf_reach_calendar() {
         ["carol@example.org", "boss@example.org"]
     );
     assert_eq!(env.inbox(BOB).await.len(), 2);
+}
+
+/// Решение 123 (SMTP-49): своя организация — по входу, а не по домену `From`: письмо вошедшего с правом Send As на
+/// адрес другой организации установки или внешний адрес — тоже своя организация (получатель — в организации узла).
+#[tokio::test]
+async fn internal_sender_is_own_whatever_from_domain() {
+    let env = Env::new(DecisionHooks::default()).await;
+    super::imip::accept(&env, "other.example", TenantId::new()).await;
+    let froms = [
+        "desk@sub.example.org",
+        "boss@other.example",
+        "boss@outside.example",
+    ];
+    let rights = Arc::new(SendRights::default());
+    for from in froms {
+        rights.grant(ALICE, from, SendRight::SendAs);
+    }
+    let (d, itip) = delivery(&env, Some(rights));
+    for from in froms {
+        submission(&env, &d, &invite(from, from)).await;
+    }
+    let calls = itip.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(
+        calls.iter().all(|c| c.sender == SenderKind::Own),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]

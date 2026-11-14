@@ -330,8 +330,8 @@ impl Services {
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
         // Приём iTIP — с настройками секции `dav` (календарь по умолчанию, входящие планирования, лимиты).
-        // Бронирование ресурсов (DAV-19, APP-71): правила, занятость и группы бронирующих — `PgMeta`; ответ внешнему
-        // организатору — письмом iMIP в очередь исходящей почты (с подписью DKIM). Доставка узла здесь не подходит:
+        // Бронирование ресурсов (DAV-19, APP-71): правила, занятость и группы бронирующих — `PgMeta`; бронирует только
+        // организатор из организации ресурса, ответ — в его календарь (решение 123). Доставка узла здесь не подходит:
         // она сама держит этот приём iTIP (`Delivery::with_itip`).
         let itip = Arc::new(
             tp_dav::ItipInbox::new(
@@ -343,7 +343,6 @@ impl Services {
                 resources: Arc::new(meta.clone()),
                 freebusy: Arc::new(meta.clone()),
                 group_store: Arc::new(meta.clone()),
-                sender: Some(Arc::new(tp_dav::ImipSender::new(queue.clone()))),
             }),
         );
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
