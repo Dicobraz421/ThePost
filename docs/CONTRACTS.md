@@ -836,7 +836,8 @@ Vec<Delegation>` (уровень в пределах политики, по `own
 Уведомления о доступе (CTR-86; JMAP `ShareNotification`, RFC 9670 §5): `ShareNotification { id: ShareNotificationId (задаёт вызывающий),
 created, changed_by: ShareChangedBy { name, email?, account? }, object_type: SharedObjectType::{Calendar, TaskList, AddressBook}, owner,
 collection, old_rights, new_rights (`NONE` — не было или отозваны), name }` (`validate()`: права не изменились — `Invalid`); уведомления
-не меняются. `ShareNotificationStore` — общее для узлов, видит только получатель: `record(recipient, n) -> u64` (занятый id — `Conflict`),
+не меняются. `ShareNotificationStore` — общее для узлов, видит только получатель: `record(recipient, n) -> u64` (занятый id — `Conflict`;
+сверх `MAX_NOTICES` = 1000 у получателя вытесняет старшие по (`created`, `id`) — как удаление, в `destroyed` изменений; CTR-90),
 `notifications(scope)` — по (`created`, `id`), `notification(scope, id) -> Option`, `destroy_notification(scope, id) -> u64` (`/set destroy`;
 нет — `NotFound`), `notification_state(scope) -> u64` (у новой — 0), `notification_changes(scope, since, limit) ->
 ShareNotificationChanges { created, destroyed, new_state, has_more }` (записанное и удалённое после `since` не входит; `limit` = 0 —
@@ -844,7 +845,7 @@ ShareNotificationChanges { created, destroyed, new_state, has_more }` (запи�
 организациях (удалённые — в изменениях; срок — настройка протокола). Фильтр `/query` — `ShareNotificationFilter { after, before,
 object_type, owner }::matches`. Записывает вызывающий, изменивший права (`CollectionAcl::set_collection_acl`), — каждой учётной записи с
 изменившимися правами; удаление учётной записи удаляет её уведомления. Все методы обязательные; in-memory — `MemShareNotifications`; набор
-`suite::sharing::share_notifications`. PostgreSQL (миграция) и перевод JMAP с памяти узла — отдельные волны.
+`suite::sharing::share_notifications`; PostgreSQL — `PgMeta` (META-83, миграция 0042).
 
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
@@ -1163,6 +1164,10 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   как `Room` — хранение в БД (миграция) META-81; Admin API — ADM-47, CalDAV — DAV-38, JMAP — JMAP-45. Несовместимо: новые обязательные
   поля `Account`, `AccountUpsert`; все места сборки в репозитории (`tp-admin`, `tp-auth`, `tp-meta`, `tp-testkit`, тесты `tp-imap`,
   `tp-smtp`, `tp-dav`, `tp-jmap`, `thepost`) дополнены: пересборка из `Account` переносит тип, прочие — `None`.
+- 2026-11-14 — CTR-90 (волна contracts-61): `sharing::MAX_NOTICES` = 1000 — предел уведомлений о доступе на учётную запись:
+  `ShareNotificationStore::record` сверх него вытесняет старшие по (`created`, `id`), вытеснение — шаг состояния и `destroyed` в
+  изменениях. Сигнатуры не меняются. Реализации — `MemShareNotifications`, `PgMeta` (без миграции; блокированные удалением или сроком
+  хранения уведомления вытеснение пропускает — `SKIP LOCKED`); набор `suite::sharing::share_notifications` — проверка 1001-й записи.
 - 2026-11-14 — ADM-41 (x/admin-27, решение 117, решение владельца 14.11 «Переделать роль»): `AccountStore::grant_installation_admin`,
   `is_installation_admin` — роль администратора установки явной записью вместо признака «действующий пароль приложения с подписью
   `thepost admin init`». Без реализации по умолчанию: `PgMeta` (таблица `installation_admins`, миграция 0040 переносит роль учётной
