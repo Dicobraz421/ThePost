@@ -856,6 +856,33 @@ async fn room_booking_not_taken_by_foreign_uid() {
 }
 
 #[tokio::test]
+async fn room_imip_from_own_domain_is_external() {
+    // DAV-42: письмо извне с адресом организации (DMARC pass через сторонний сервис домена) не бронирует.
+    let env = Share::new().await;
+    env.policy(BookingPolicy {
+        horizon: None,
+        ..BookingPolicy::default()
+    })
+    .await;
+    let out = env
+        .imip_to_room("i1", ALICE, "20260105T100000Z", "20260105T110000Z")
+        .await;
+    assert_eq!(out, ItipOutcome::Applied);
+    assert_eq!(env.partstat(ROOM, "i1", ROOM).await, None, "брони нет");
+    assert!(
+        env.sender.sent().is_empty(),
+        "ответ на свой адрес — не письмом наружу"
+    );
+    // Та же встреча изнутри (CalDAV) — принята.
+    env.book(ALICE, "i1", "20260105T100000Z", "20260105T110000Z")
+        .await;
+    assert_eq!(
+        env.partstat(ROOM, "i1", ROOM).await.as_deref(),
+        Some("ACCEPTED")
+    );
+}
+
+#[tokio::test]
 async fn room_in_principal_search() {
     let env = Share::new().await;
     let cutype = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-user-type/></d:prop></d:propfind>"#;
