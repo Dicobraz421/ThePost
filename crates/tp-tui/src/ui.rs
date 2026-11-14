@@ -14,6 +14,7 @@ use crate::app::{
     Overlay, Panel, Stage, TreeRow, View,
 };
 use crate::engine::{self, Form};
+use crate::layout::{self, Layout};
 use crate::schema::{Kind, catalog};
 use crate::theme::{Role, Theme};
 use crate::tree::{NODE_CONFIG, SECTIONS};
@@ -29,20 +30,6 @@ const ROW_STATUS: u16 = 21;
 const ROW_CLI: u16 = 22;
 const ROW_KEYS: u16 = 23;
 const ROW_SEP: u16 = 17;
-
-/// Подписи F-клавиш.
-pub const KEYS: [&str; 10] = [
-    "Помощь",
-    "Фильтр",
-    "Просм",
-    "Правка",
-    "Блок",
-    "Пароль",
-    "Создать",
-    "Удалить",
-    "Меню",
-    "Выход",
-];
 
 /// Отрисовать интерфейс в кадр.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -74,7 +61,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     };
     p.status(app);
     p.cli(&app.command_line());
-    p.keys();
+    p.keys(&app.keys());
 }
 
 struct Painter<'a> {
@@ -230,7 +217,8 @@ impl Painter<'_> {
             active: !tree_active,
         };
         match &m.overlay {
-            Some(Overlay::Form(f)) => self.form(&body, f),
+            Some(Overlay::Form(f)) => self.form(&body, f, &f.op.title()),
+            Some(Overlay::Lookup(f, then)) => self.form(&body, f, &then.title()),
             Some(Overlay::Confirm(req)) => self.confirm(&body, req),
             Some(Overlay::Menu { sel }) => self.op_menu(&body, *sel),
             Some(Overlay::Help) => self.help(&body, m),
@@ -289,6 +277,9 @@ impl Painter<'_> {
     }
 
     fn list(&mut self, b: &Body, l: &ListView) {
+        if let Some(layout) = l.layout {
+            return self.layout_list(b, l, layout);
+        }
         let cols = engine::list_columns(l.req.op);
         let visible = &l.rows[l.top.min(l.rows.len())..(l.top + LIST_ROWS).min(l.rows.len())];
         let total = b.width() as usize;
@@ -336,21 +327,7 @@ impl Painter<'_> {
                 x += *wdt as u16 + 1;
             }
         }
-        if l.rows.len() > LIST_ROWS {
-            let track = LIST_ROWS as u16;
-            let len = l.rows.len().max(1);
-            let thumb = ((LIST_ROWS * LIST_ROWS) / len).max(1) as u16;
-            let start = ((l.top * LIST_ROWS) / len) as u16;
-            let role = if b.active { Role::FrameA } else { Role::Frame };
-            for i in 0..track {
-                let ch = if (start..start + thumb).contains(&i) {
-                    "▓"
-                } else {
-                    "░"
-                };
-                self.put(b.x1 + 2, 3 + i, ch, role);
-            }
-        }
+        self.scrollbar(b, l);
         if let Some(row) = l.row() {
             let first = cols
                 .first()
@@ -381,6 +358,77 @@ impl Painter<'_> {
         self.put_n(b.x0, 19, &hint, Role::Muted, b.width());
     }
 
+    /// Полоса прокрутки списка длиннее экрана.
+    fn scrollbar(&mut self, b: &Body, l: &ListView) {
+        if l.rows.len() <= LIST_ROWS {
+            return;
+        }
+        let track = LIST_ROWS as u16;
+        let len = l.rows.len().max(1);
+        let thumb = ((LIST_ROWS * LIST_ROWS) / len).max(1) as u16;
+        let start = ((l.top * LIST_ROWS) / len) as u16;
+        let role = if b.active { Role::FrameA } else { Role::Frame };
+        for i in 0..track {
+            let ch = if (start..start + thumb).contains(&i) {
+                "▓"
+            } else {
+                "░"
+            };
+            self.put(b.x1 + 2, 3 + i, ch, role);
+        }
+    }
+
+    /// Список в ручной раскладке раздела: колонки с подписями и знаками, подробности выделенной записи.
+    fn layout_list(&mut self, b: &Body, l: &ListView, layout: &Layout) {
+        let mut x = b.x0;
+        for c in layout.columns {
+            self.put_n(x, 2, c.head, Role::Head, c.width);
+            x += c.width + 1;
+        }
+        if l.rows.is_empty() {
+            self.put(b.x0, 4, "Записей нет.", Role::Muted);
+        }
+        let end = (l.top + LIST_ROWS).min(l.rows.len());
+        for (i, row) in l.rows[l.top.min(end)..end].iter().enumerate() {
+            let y = 3 + i as u16;
+            let sel = l.top + i == l.sel;
+            let line = match (sel, b.active) {
+                (true, true) => Some(Role::Sel),
+                (true, false) => Some(Role::SelI),
+                _ => None,
+            };
+            if let Some(r) = line {
+                self.fill(b.x0 - 1, b.x1 + 1, y, r);
+            }
+            let mut x = b.x0;
+            for c in layout.columns {
+                let (text, role) = layout::cell(c, row);
+                self.put_n(x, y, &text, line.unwrap_or(role), c.width);
+                x += c.width + 1;
+            }
+        }
+        self.scrollbar(b, l);
+        let Some(row) = l.row() else {
+            return;
+        };
+        for (y, parts) in [18, 19].into_iter().zip((layout.detail)(row)) {
+            let mut x = b.x0;
+            for (text, role) in parts {
+                if x > b.x1 {
+                    break;
+                }
+                self.put_n(
+                    x,
+                    y,
+                    &text,
+                    role,
+                    (b.x1 - x + 1).min(text.chars().count() as u16),
+                );
+                x += text.chars().count() as u16;
+            }
+        }
+    }
+
     fn card(&mut self, b: &Body, c: &CardView) {
         let lines = card_lines(&c.value);
         let top = c.top.min(lines.len().saturating_sub(1));
@@ -405,8 +453,8 @@ impl Painter<'_> {
         self.put_n(b.x0, 19, hint, Role::Muted, b.width());
     }
 
-    fn form(&mut self, b: &Body, f: &Form) {
-        self.put_n(b.x0, 2, &f.op.title(), Role::TitleA, b.width());
+    fn form(&mut self, b: &Body, f: &Form, title: &str) {
+        self.put_n(b.x0, 2, title, Role::TitleA, b.width());
         self.put_n(
             b.x0,
             3,
@@ -618,8 +666,8 @@ impl Painter<'_> {
         }
     }
 
-    fn keys(&mut self) {
-        for (i, label) in KEYS.iter().enumerate() {
+    fn keys(&mut self, labels: &[&str; 10]) {
+        for (i, label) in labels.iter().enumerate() {
             let x = i as u16 * 8;
             let num = (i + 1).to_string();
             self.put(x, ROW_KEYS, &num, Role::FkNum);
@@ -721,8 +769,9 @@ mod tests {
 
     use super::*;
     use crate::app::LoginForm;
-    use crate::app::tests::{key, with_accounts};
+    use crate::app::tests::{call, key, ok, section, with_accounts, with_members};
     use crossterm::event::KeyCode;
+    use serde_json::json;
 
     fn screen(app: &App) -> (Vec<String>, Buffer) {
         let mut term = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("терминал");
@@ -767,7 +816,13 @@ mod tests {
         assert!(rows[3].contains("├ Учётные записи"));
         assert!(rows[13].contains("└ Очередь"));
         assert!(rows[18].contains("◆ Конфигурация узла"));
-        assert!(rows[2].contains("login"), "{}", rows[2]);
+        assert!(rows[2].contains("Адрес"), "{}", rows[2]);
+        assert!(rows[3].contains("●"), "{}", rows[3]);
+        assert!(
+            rows[18].contains("user0@it-task.ru · Пользователь 0"),
+            "{}",
+            rows[18]
+        );
         assert!(rows[3].contains("user0@it-task.ru"), "{}", rows[3]);
         assert_eq!(rows[17].chars().nth(30), Some('╟'));
         assert!(
@@ -783,7 +838,7 @@ mod tests {
         assert!(rows[22].ends_with("эквивалент CLI"), "{}", rows[22]);
         assert_eq!(
             rows[23],
-            "1Помощь 2Фильтр 3Просм  4Правка 5Блок   6Пароль 7Создать8Удалить9Меню   10Выход "
+            "1Помощь 2Фильтр 3Просм  4Правка 5Блок   6Пароли 7Создать8Скрыть 9Меню   10Выход "
         );
         // Tab — активно дерево.
         app.on_key(key(KeyCode::Tab));
@@ -855,6 +910,104 @@ mod tests {
             "{}",
             rows[22]
         );
+    }
+
+    /// Ручные раскладки разделов: подписи колонок, знаки состояний, подробности и F-клавиши раздела.
+    #[test]
+    fn section_layouts() {
+        let app = with_members();
+        let (rows, _) = screen(&app);
+        assert!(rows[2].contains("Вид  Участник"), "{}", rows[2]);
+        assert!(rows[3].contains("уч.  user1@it-task.ru"), "{}", rows[3]);
+        assert!(rows[4].contains("гр.  Инженеры"), "{}", rows[4]);
+        assert!(
+            rows[18].contains("user1@it-task.ru · acc-1"),
+            "{}",
+            rows[18]
+        );
+        assert!(rows[23].contains("7Добав"), "{}", rows[23]);
+        assert!(!rows[23].contains("Фильтр"), "{}", rows[23]);
+
+        let mut app = with_accounts();
+        let id = call(&section(&mut app, "Политики"), "get_org");
+        app.on_result(
+            id,
+            ok(json!({"policy": {"send_per_hour": 200},
+                      "effective": {"send_per_hour": 200, "quota_bytes": 5_368_709_120u64}})),
+        );
+        app.on_key(key(KeyCode::Tab));
+        let (rows, _) = screen(&app);
+        let all = rows.join(
+            "
+",
+        );
+        assert!(
+            rows[2].contains("Параметр           Задано        Действует"),
+            "{}",
+            rows[2]
+        );
+        assert!(
+            all.contains("quota_bytes        —             5 ГБ"),
+            "{all}"
+        );
+        assert!(
+            all.contains("send_per_hour      200           200"),
+            "{all}"
+        );
+        assert!(
+            rows[23].contains("5Домены") && rows[23].contains("6Ящик"),
+            "{}",
+            rows[23]
+        );
+
+        let id = call(&section(&mut app, "Журналы"), "search_audit");
+        app.on_result(
+            id,
+            ok(json!({"entries": [{"seq": 1, "at": "2026-11-14T09:30:00Z", "actor_login": "admin@it-task.ru",
+                "method": "POST", "status": 409, "path": "/api/v1/orgs/o1/accounts", "roles": ["organization_admin"]}],
+                "next": null})),
+        );
+        let (rows, _) = screen(&app);
+        assert!(
+            rows[2].contains("Время            Администратор    Метод  Код"),
+            "{}",
+            rows[2]
+        );
+        assert!(
+            rows[3].contains("2026-11-14 09:30 admin@it-task.ru POST   × 409"),
+            "{}",
+            rows[3]
+        );
+        assert!(
+            rows[18].contains("POST /api/v1/orgs/o1/accounts"),
+            "{}",
+            rows[18]
+        );
+        assert!(rows[23].contains("5Достав"), "{}", rows[23]);
+
+        // Заблокированная учётная запись с почти полной квотой: знак ×, строка квоты.
+        let mut app = with_accounts();
+        let id = call(&section(&mut app, "Учётные записи"), "list_accounts");
+        app.on_result(
+            id,
+            ok(json!([{"id": "a1", "login": "petrov@it-task.ru", "display_name": "Петров Илья", "enabled": false,
+                "hidden_from_gal": true, "quota": {"used_bytes": 4_831_838_208u64, "limit_bytes": 5_368_709_120u64, "messages": 9}}])),
+        );
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Tab));
+        let (rows, _) = screen(&app);
+        assert!(
+            rows[3].contains("petrov@it-task.ru     Петров Илья     5 ГБ   ×"),
+            "{}",
+            rows[3]
+        );
+        assert!(rows[18].contains("Петров Илья · скрыта из"), "{}", rows[18]);
+        assert!(
+            rows[19].contains("× заблокирована · 4,5 ГБ из 5 ГБ █"),
+            "{}",
+            rows[19]
+        );
+        assert!(rows[19].contains("90 %"), "{}", rows[19]);
     }
 
     #[test]

@@ -146,6 +146,13 @@ impl Form {
         }
     }
 
+    /// Оставить в форме только поля `names` (например, имя входа из параметров поиска).
+    pub fn retain(&mut self, names: &[&str]) {
+        self.fields
+            .retain(|f| names.contains(&f.field.name.as_str()));
+        self.focus = 0;
+    }
+
     /// Значение поля по имени.
     pub fn value(&self, name: &str) -> Option<&str> {
         self.fields
