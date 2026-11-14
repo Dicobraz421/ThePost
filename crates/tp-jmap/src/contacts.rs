@@ -384,7 +384,7 @@ pub(crate) async fn set(
             out.not_created.insert(cid, e);
             continue;
         }
-        let grants = match prepare_share(ctx, ObjectType::AddressBook, None, &share).await? {
+        let grants = match prepare_share(ctx, ObjectType::AddressBook, c.id, &share).await? {
             Ok(g) => g,
             Err(e) => {
                 out.not_created.insert(cid, e);
@@ -436,7 +436,7 @@ pub(crate) async fn set(
             out.not_updated.insert(id, e);
             continue;
         }
-        let grants = match prepare_share(ctx, ObjectType::AddressBook, Some(c.id), &share).await? {
+        let grants = match prepare_share(ctx, ObjectType::AddressBook, c.id, &share).await? {
             Ok(g) => g,
             Err(e) => {
                 out.not_updated.insert(id, e);

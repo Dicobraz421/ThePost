@@ -25,6 +25,7 @@ use tp_contracts::Error;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::dav::DavStore;
 use tp_contracts::meta::AccountScope;
+use tp_contracts::sharing::SharingAuthorizer;
 
 use crate::config::DavConfig;
 use crate::path::Target;
@@ -47,12 +48,16 @@ pub struct Deps {
     pub auth: Arc<dyn Authenticator>,
     /// Календари и контакты.
     pub store: Arc<dyn DavStore>,
+    /// Единый слой прав на коллекции (CTR-84) для общего доступа и представителей (DAV-17, DAV-18); `None` —
+    /// только свои коллекции. Узел подключает тот же слой, что у JMAP и Admin API.
+    pub sharing: Option<Arc<dyn SharingAuthorizer>>,
 }
 
 impl fmt::Debug for Deps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deps")
             .field("limits", &self.store.limits())
+            .field("sharing", &self.sharing.is_some())
             .finish_non_exhaustive()
     }
 }

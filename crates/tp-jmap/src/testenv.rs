@@ -14,114 +14,21 @@ use time::OffsetDateTime;
 use tp_contracts::Result;
 use tp_contracts::auth::{Authorizer, Principal, Resource, Rights, SendRight};
 use tp_contracts::blob::{BlobIndex, BlobStore, ByteStream, Compression, ObjectStream};
-use tp_contracts::dav::{CollectionId, DavStore};
+use tp_contracts::dav::DavStore;
 use tp_contracts::ext::{DecisionHooks, JmapCapability};
-use tp_contracts::ids::{AccountId, TenantId};
 use tp_contracts::mailstore::{Delivery, IngestRequest, MailStore};
 use tp_contracts::meta::{AccountScope, Flags, SpecialUse};
-use tp_contracts::sharing::{
-    CollectionAcl, CollectionAclEntry, CollectionRights, SharedCollection, SharingPolicy,
-    SharingPolicyStore, collection_rights,
-};
 use tp_contracts::sieve::SieveStore;
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSearch, MemAddressBook, MemBlobIndex, MemBlobStore, MemDav,
-    MemDeliveryLog, MemEventBus, MemGroups, MemItipSender, MemMailboxAudit, MemMetadata,
-    MemOutbound, MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions, MemTrash,
-    RecordingDecisionHook, SearchDoc, SystemClock,
+    Clock, FakeAuthenticator, FakeSearch, FakeSharingAuthorizer, MemAddressBook, MemBlobIndex,
+    MemBlobStore, MemDav, MemDeliveryLog, MemEventBus, MemGroups, MemItipSender, MemMailboxAudit,
+    MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions,
+    MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
 use crate::{Deps, Jmap, JmapConfig, SharingDeps};
-
-/// Права на коллекции в памяти (`CollectionAcl`; in-memory реализации контракта CTR-48 в tp-testkit нет): записи по
-/// (организация, владелец, коллекция).
-#[derive(Clone, Default)]
-pub struct MemAcl(Arc<Mutex<AclMap>>);
-
-type AclMap = HashMap<(TenantId, AccountId, CollectionId), Vec<CollectionAclEntry>>;
-
-#[async_trait]
-impl CollectionAcl for MemAcl {
-    async fn collection_acl(
-        &self,
-        owner: AccountScope,
-        collection: CollectionId,
-    ) -> Result<Vec<CollectionAclEntry>> {
-        let map = self.0.lock().expect("lock");
-        let key = (owner.tenant, owner.account, collection);
-        Ok(map.get(&key).cloned().unwrap_or_default())
-    }
-
-    async fn set_collection_acl(
-        &self,
-        owner: AccountScope,
-        collection: CollectionId,
-        identifier: &str,
-        rights: CollectionRights,
-    ) -> Result<()> {
-        tp_contracts::sharing::validate_identifier(identifier, false)?;
-        let mut map = self.0.lock().expect("lock");
-        let entries = map
-            .entry((owner.tenant, owner.account, collection))
-            .or_default();
-        entries.retain(|e| e.identifier != identifier);
-        if !rights.is_empty() {
-            entries.push(CollectionAclEntry {
-                identifier: identifier.into(),
-                rights,
-            });
-        }
-        Ok(())
-    }
-
-    async fn collection_rights(
-        &self,
-        owner: AccountScope,
-        collection: CollectionId,
-        identifiers: &[String],
-    ) -> Result<CollectionRights> {
-        let entries = self.collection_acl(owner, collection).await?;
-        Ok(collection_rights(&entries, identifiers))
-    }
-
-    async fn shared_with(
-        &self,
-        scope: AccountScope,
-        identifiers: &[String],
-    ) -> Result<Vec<SharedCollection>> {
-        let map = self.0.lock().expect("lock");
-        let mut out: Vec<SharedCollection> = map
-            .iter()
-            .filter(|((tenant, owner, _), _)| *tenant == scope.tenant && *owner != scope.account)
-            .map(|((_, owner, collection), entries)| SharedCollection {
-                owner: *owner,
-                collection: *collection,
-                rights: collection_rights(entries, identifiers),
-            })
-            .filter(|s| !s.rights.is_empty())
-            .collect();
-        out.sort_by_key(|s| (s.owner.to_string(), s.collection.to_string()));
-        Ok(out)
-    }
-}
-
-/// Политика общего доступа в памяти (`SharingPolicyStore`): одна на все организации.
-#[derive(Clone, Default)]
-pub struct MemSharingPolicy(Arc<Mutex<SharingPolicy>>);
-
-#[async_trait]
-impl SharingPolicyStore for MemSharingPolicy {
-    async fn sharing_policy(&self, _: TenantId) -> Result<SharingPolicy> {
-        Ok(self.0.lock().expect("lock").clone())
-    }
-
-    async fn set_sharing_policy(&self, _: TenantId, policy: SharingPolicy) -> Result<()> {
-        *self.0.lock().expect("lock") = policy;
-        Ok(())
-    }
-}
 
 /// Права отправки: свой адрес — Send As, остальные — из таблицы.
 #[derive(Default)]
@@ -243,11 +150,9 @@ pub struct Env {
     pub dav: MemDav,
     /// Письма iMIP внешним участникам (`Jmap::with_schedule`).
     pub imip: MemItipSender,
-    /// Права на коллекции и политика общего доступа (`Jmap::with_sharing`, только [`Env::sharing`]).
-    pub acl: MemAcl,
-    pub sharing_policy: MemSharingPolicy,
-    /// Группы рассылки (состав групп политики общего доступа).
-    pub groups: MemGroups,
+    /// Действующие права на коллекции (`Jmap::with_sharing`, только [`Env::sharing`]): тест задаёт их таблицей,
+    /// записи `shareWith` хранит [`Env::dav`].
+    pub collections: FakeSharingAuthorizer,
     pub jmap: Arc<Jmap>,
 }
 
@@ -278,9 +183,8 @@ impl Env {
         let mut env = Self::new().await;
         let jmap = Arc::get_mut(&mut env.jmap).expect("jmap");
         jmap.sharing = Some(SharingDeps {
-            acl: Arc::new(env.acl.clone()),
-            policy: Arc::new(env.sharing_policy.clone()),
-            groups: Arc::new(env.groups.clone()),
+            authz: Arc::new(env.collections.clone()),
+            acl: Arc::new(env.dav.clone()),
         });
         env
     }
@@ -402,7 +306,7 @@ impl Env {
             delivery: Arc::new(tp_dav::ItipInbox::new(Arc::new(dav.clone()), dav_cfg)),
             sender: Some(Arc::new(imip.clone())),
             freebusy: Arc::new(dav.clone()),
-            group_store: Arc::new(groups.clone()),
+            group_store: Arc::new(groups),
         };
         let jmap = Jmap::new(
             Deps {
@@ -467,9 +371,7 @@ impl Env {
             sieve,
             dav,
             imip,
-            acl: MemAcl::default(),
-            sharing_policy: MemSharingPolicy::default(),
-            groups,
+            collections: FakeSharingAuthorizer::default(),
             jmap: Arc::new(jmap),
         }
     }

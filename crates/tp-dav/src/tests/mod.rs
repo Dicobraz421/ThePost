@@ -75,6 +75,7 @@ impl Env {
             Deps {
                 auth: Arc::new(auth.clone()),
                 store: Arc::new(store.clone()),
+                sharing: None,
             },
             cfg.clone(),
         );

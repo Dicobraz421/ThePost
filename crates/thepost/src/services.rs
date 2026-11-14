@@ -86,7 +86,8 @@ pub struct Services {
     /// Права на папки и отправку от имени.
     pub authz: Arc<dyn Authorizer>,
     /// Права на календари и адресные книги (AUTH-12, CTR-84): владелец, записи прав, представители, политика
-    /// организации поверх `PgMeta`; CalDAV, CardDAV и JMAP подключают его своими волнами.
+    /// организации поверх `PgMeta` — один слой для CalDAV и CardDAV (`tp_dav::Deps::sharing`) и JMAP
+    /// (`Jmap::with_sharing`); Admin API — `Admin::with_sharing` поверх тех же хранилищ.
     pub collections: Arc<dyn SharingAuthorizer>,
     /// Каталог LDAP; `None` — учётные записи только из PostgreSQL (книгу GAL тогда строит каталог `PgMeta`,
     /// [`Services::gal`]).
@@ -581,7 +582,12 @@ impl Services {
             .with_dav(Some(Arc::new(self.meta.clone())))
             .with_freebusy(Some(Arc::new(self.meta.clone())))
             // Приглашения из JMAP (`sendSchedulingMessages`, JMAP-31) — теми же зависимостями, что у CalDAV.
-            .with_schedule(Some(self.schedule(outbound))))
+            .with_schedule(Some(self.schedule(outbound)))
+            // Общий доступ к календарям и книгам (JMAP-32): права — единый слой `collections`, записи — `PgMeta`.
+            .with_sharing(Some(tp_jmap::SharingDeps {
+                authz: self.collections.clone(),
+                acl: Arc::new(self.meta.clone()),
+            })))
     }
 
     /// Маршруты календарей и контактов (CalDAV, CardDAV; APP-29): хранилище — `PgMeta`, вход — тот же, что у
@@ -600,6 +606,8 @@ impl Services {
         let deps = tp_dav::Deps {
             auth: self.authn.clone(),
             store: Arc::new(self.meta.clone()),
+            // Общий доступ и представители (DAV-17, DAV-18) — тот же слой прав, что у JMAP.
+            sharing: Some(self.collections.clone()),
         };
         let outbound: Arc<dyn Outbound> = Arc::new(self.base_delivery(smtp)?);
         // Книгу GAL маршруты читают из хранилища, заполняет её `Services::gal`.
@@ -704,7 +712,16 @@ impl Services {
             .with_held_blobs(Arc::new(tp_blob::Decompressing::new(
                 self.blob.clone(),
                 Arc::new(self.meta.clone()),
-            ))))
+            )))
+            // Общий доступ, представители, ресурсы и политика (ADM-*, CTR-48) — хранилища `PgMeta`, те же, что у
+            // единого слоя прав `collections`.
+            .with_sharing(tp_admin::SharingStores {
+                acl: Arc::new(self.meta.clone()),
+                delegates: Arc::new(self.meta.clone()),
+                resources: Arc::new(self.meta.clone()),
+                policy: Arc::new(self.meta.clone()),
+                collections: Arc::new(self.meta.clone()),
+            }))
     }
 
     /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»

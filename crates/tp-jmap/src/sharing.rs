@@ -1,15 +1,18 @@
 //! JMAP — общий доступ к календарям и адресным книгам (JMAP-32; RFC 9670, RFC 9610 §2, draft-ietf-jmap-calendars)
-//! поверх [`CollectionAcl`] и [`SharingPolicy`] (CTR-48), [`Jmap::with_sharing`].
+//! поверх единого слоя прав [`SharingAuthorizer`] (CTR-84) и записей [`CollectionAcl`] (CTR-48),
+//! [`Jmap::with_sharing`].
 //!
-//! - Чужие коллекции, на которые у субъекта есть права ([`CollectionAcl::shared_with`] по имени входа, группам и
-//!   [`ANYONE`]), — в аккаунтах их владельцев: в сессии аккаунт с `isPersonal` = `false` и capability календарей,
-//!   задач и контактов; методы `Calendar`, `CalendarEvent`, `TaskList`, `Task`, `AddressBook`, `ContactCard` с
-//!   `accountId` владельца видят только эти коллекции ([`Access`]). Почта чужих ящиков через JMAP не открывается.
-//! - `myRights` — права субъекта ([`CollectionRights`]): владелец — все, иначе — по записям. `shareWith` — записи
-//!   прав учётных записей организации по идентификатору `Principal`; виден и меняется при праве `admin`
-//!   (`mayShare`). Записи групп и [`ANYONE`] JMAP не показывает и не меняет (их выдаёт CalDAV, CardDAV, Admin API).
-//! - Выдача прав проверяется политикой организации ([`SharingPolicy::check`]): получатель в группах
-//!   [`SharingScope::Groups`] — участник их состава ([`GroupStore::expand`]). Нарушение — `forbidden`.
+//! - Чужие коллекции, на которые у субъекта есть права ([`SharingAuthorizer::shared_with`]: записи по имени входа,
+//!   группам и [`ANYONE`] с ограничением политикой организации), — в аккаунтах их владельцев: в сессии аккаунт с
+//!   `isPersonal` = `false` и capability календарей, задач и контактов; методы `Calendar`, `CalendarEvent`,
+//!   `TaskList`, `Task`, `AddressBook`, `ContactCard` с `accountId` владельца видят только эти коллекции
+//!   ([`Access`]). Почта чужих ящиков через JMAP не открывается.
+//! - `myRights` — действующие права субъекта ([`CollectionRights`]): свой аккаунт — все, чужой — по
+//!   [`SharingAuthorizer`]. `shareWith` — записи прав учётных записей организации по идентификатору `Principal`;
+//!   виден и меняется при праве `admin` (`mayShare`). Записи групп и [`ANYONE`] JMAP не показывает и не меняет (их
+//!   выдаёт CalDAV, CardDAV, Admin API).
+//! - Выдачу прав проверяет [`SharingAuthorizer::check_grant`]: владелец или субъект с `admin`, в пределах политики
+//!   организации. Отказ — `forbidden`.
 //! - Изменение прав учётной записи записывает ей `ShareNotification` (RFC 9670 §5): `/get`, `/changes`, `/query`,
 //!   `/set` (только `destroy`); `/queryChanges` — `cannotCalculateChanges`.
 //!
@@ -19,8 +22,8 @@
 //! - в чужом аккаунте свойства коллекции (имя, цвет, подписка) меняет только субъект с правом `admin`, создать
 //!   коллекцию нельзя (`mayCreateCalendar`, `mayCreateAddressBook` — `false`), отправка приглашений
 //!   (`sendSchedulingMessages`) — `forbidden`;
-//! - представители ([`tp_contracts::sharing::DelegateStore`]) и ограничение уже выданных прав политикой
-//!   ([`SharingPolicy::limit`]) — единый слой прав `tp-auth` (AUTH-12).
+//! - календари по представительству ([`SharingAuthorizer::delegations`]) в аккаунтах JMAP не показываются —
+//!   представитель работает с ними через CalDAV (`calendar-proxy-*`, DAV-18).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -33,12 +36,10 @@ use tp_contracts::auth::Principal;
 use tp_contracts::dav::{
     Collection, CollectionId, CollectionKind, DavObject, DavObjectId, DavStore,
 };
-use tp_contracts::groups::GroupStore;
 use tp_contracts::ids::{AccountId, TenantId};
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::sharing::{
-    ANYONE, CollectionAcl, CollectionRights, SharedCollection, SharingPolicy, SharingPolicyStore,
-    SharingScope,
+    ANYONE, CollectionAcl, CollectionRights, SharedCollection, SharingAuthorizer,
 };
 use tp_contracts::{Error, ModSeq, Result};
 
@@ -56,12 +57,10 @@ pub(crate) const MAX_NOTICES: usize = 1000;
 /// Зависимости общего доступа ([`Jmap::with_sharing`]).
 #[derive(Clone)]
 pub struct SharingDeps {
-    /// Записи прав на коллекции.
+    /// Единый слой прав на коллекции: действующие права, общие коллекции субъекта, проверка выдачи.
+    pub authz: Arc<dyn SharingAuthorizer>,
+    /// Записи прав на коллекции: `shareWith` и выдача прав, прошедшая [`SharingAuthorizer::check_grant`].
     pub acl: Arc<dyn CollectionAcl>,
-    /// Политика организации на выдачу прав.
-    pub policy: Arc<dyn SharingPolicyStore>,
-    /// Состав групп политики [`SharingScope::Groups`].
-    pub groups: Arc<dyn GroupStore>,
 }
 
 impl std::fmt::Debug for SharingDeps {
@@ -118,24 +117,13 @@ impl Access {
     }
 }
 
-/// Идентификаторы субъекта в записях прав: имя входа, группы, [`ANYONE`].
-fn identifiers(p: &Principal) -> Vec<String> {
-    let mut ids = vec![p.login.clone()];
-    ids.extend(p.groups.iter().cloned());
-    ids.push(ANYONE.to_owned());
-    ids
-}
-
-/// Чужие коллекции субъекта; общий доступ или DAV не подключены — пусто.
+/// Чужие коллекции субъекта с действующими правами ([`SharingAuthorizer::shared_with`]); общий доступ или DAV не
+/// подключены — пусто.
 pub(crate) async fn shared(jmap: &Jmap, p: &Principal) -> Result<Vec<SharedCollection>> {
     let (Some(s), Some(_)) = (&jmap.sharing, &jmap.dav) else {
         return Ok(Vec::new());
     };
-    let scope = AccountScope {
-        tenant: p.tenant,
-        account: p.account,
-    };
-    let mut all = s.acl.shared_with(scope, &identifiers(p)).await?;
+    let mut all = s.authz.shared_with(p).await?;
     all.retain(|c| c.owner != p.account && !c.rights.is_empty());
     Ok(all)
 }
@@ -383,12 +371,13 @@ pub(crate) fn split_share(v: &Value) -> (Map<String, Value>, Vec<(String, Value)
     (rest, share)
 }
 
-/// Проверяет изменения `shareWith` коллекции `c` как объекта `ty` (`None` — создаваемая коллекция): право `admin`,
-/// получатели — учётные записи организации, политика. Ошибка — `SetError`.
+/// Проверяет изменения `shareWith` коллекции `c` как объекта `ty` (в том числе создаваемой): получатели — учётные
+/// записи организации, выдачу каждого изменения — [`SharingAuthorizer::check_grant`] от имени субъекта (владелец или
+/// право `admin`, политика организации). Ошибка — `SetError`.
 pub(crate) async fn prepare_share(
     ctx: &Ctx<'_>,
     ty: ObjectType,
-    c: Option<CollectionId>,
+    c: CollectionId,
     changes: &[(String, Value)],
 ) -> MethodResult<std::result::Result<Vec<Grant>, Value>> {
     let bad = |why: &str| {
@@ -408,17 +397,7 @@ pub(crate) async fn prepare_share(
     if changes.is_empty() {
         return Ok(Ok(Vec::new()));
     }
-    if c.is_some_and(|c| !ctx.access.admins(c)) {
-        return Ok(Err(set_error(
-            "forbidden",
-            Some("mayShare is required"),
-            &[],
-        )));
-    }
-    let current = match c {
-        Some(c) => account_entries(ctx, s, c).await?,
-        None => Vec::new(),
-    };
+    let current = account_entries(ctx, s, c).await?;
     let mut want: BTreeMap<String, CollectionRights> = BTreeMap::new();
     for (k, v) in changes {
         match k.strip_prefix("shareWith/") {
@@ -450,7 +429,6 @@ pub(crate) async fn prepare_share(
             }
         }
     }
-    let policy = s.policy.sharing_policy(ctx.scope.tenant).await?;
     let mut grants = Vec::new();
     for (id, new) in want {
         let account = AccountId::from_str(&id).ok();
@@ -470,13 +448,23 @@ pub(crate) async fn prepare_share(
         if old == new {
             continue;
         }
-        let in_group = in_policy_groups(ctx, s, &policy, a.id).await?;
-        if policy.check(new, false, in_group).is_err() {
-            return Ok(Err(set_error(
-                "forbidden",
-                Some("the organization sharing policy does not allow these rights"),
-                &["shareWith"],
-            )));
+        match s
+            .authz
+            .check_grant(ctx.principal, ctx.scope.account, c, &a.login, new)
+            .await
+        {
+            Ok(()) => {}
+            Err(Error::Forbidden) => {
+                return Ok(Err(set_error(
+                    "forbidden",
+                    Some(
+                        "mayShare is required and the organization sharing policy must allow these rights",
+                    ),
+                    &["shareWith"],
+                )));
+            }
+            Err(Error::Invalid(_)) => return bad("shareWith: invalid principal"),
+            Err(e) => return Err(e.into()),
         }
         grants.push(Grant {
             account: a.id,
@@ -486,28 +474,6 @@ pub(crate) async fn prepare_share(
         });
     }
     Ok(Ok(grants))
-}
-
-/// Учётная запись — участник групп политики [`SharingScope::Groups`].
-async fn in_policy_groups(
-    ctx: &Ctx<'_>,
-    s: &SharingDeps,
-    policy: &SharingPolicy,
-    account: AccountId,
-) -> MethodResult<bool> {
-    let SharingScope::Groups { groups } = &policy.scope else {
-        return Ok(false);
-    };
-    for g in groups {
-        if s.groups
-            .expand(ctx.scope.tenant, *g)
-            .await?
-            .contains(&account)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Записывает подготовленные права на коллекцию `c` (объект `ty`) и уведомления получателям.
@@ -891,7 +857,9 @@ pub(crate) async fn retain_objects(
 mod tests {
     use serde_json::{Value, json};
     use tp_contracts::auth::Principal;
-    use tp_contracts::sharing::{SharingPolicy, SharingPolicyStore, SharingScope};
+    use tp_contracts::dav::CollectionId;
+    use tp_contracts::meta::AccountScope;
+    use tp_contracts::sharing::{CollectionAcl, CollectionRights as R};
 
     use crate::calendars::tests::create_calendar;
     use crate::contacts::tests::create_book;
@@ -918,6 +886,30 @@ mod tests {
 
     fn id(p: &Principal) -> String {
         p.account.to_string()
+    }
+
+    /// Действующие права `who` на коллекцию `c` владельца `owner` — как их посчитал бы единый слой прав по записям
+    /// (`FakeSharingAuthorizer` записи `shareWith` не читает).
+    fn allow(env: &Env, who: &Principal, owner: &Principal, c: &str, rights: R) {
+        let c: CollectionId = c.parse().expect("collection id");
+        env.collections
+            .set_rights(who.account, owner.account, c, rights);
+    }
+
+    /// Записи прав коллекции `c` владельца в хранилище: (имя входа, действующие права записи).
+    async fn entries(env: &Env, owner: &Principal, c: &str) -> Vec<(String, R)> {
+        let scope = AccountScope {
+            tenant: owner.tenant,
+            account: owner.account,
+        };
+        let c: CollectionId = c.parse().expect("collection id");
+        env.dav
+            .collection_acl(scope, c)
+            .await
+            .expect("collection_acl")
+            .into_iter()
+            .map(|e| (e.identifier, e.rights.effective()))
+            .collect()
     }
 
     /// Выдача и отзыв прав на календарь: аккаунт владельца в сессии, чтение, запись без права — `forbidden`,
@@ -965,6 +957,11 @@ mod tests {
         assert_eq!(share["mayReadFreeBusy"], true, "{r}");
         assert_eq!(share["mayWriteAll"], false, "{r}");
         assert_eq!(r["list"][0]["myRights"]["mayShare"], true, "{r}");
+        assert_eq!(
+            entries(&env, &owner, &cal).await,
+            vec![("anna@example.org".to_owned(), R::READ)]
+        );
+        allow(&env, &anna, &owner, &cal, R::READ);
 
         // Получатель видит аккаунт владельца: только чтение, без создания календарей.
         let s = env.jmap.session(&anna, "").await;
@@ -1029,6 +1026,7 @@ mod tests {
         )
         .await;
         assert!(r["notUpdated"].is_null(), "{r}");
+        allow(&env, &anna, &owner, &cal, R::WRITE);
         let r = call(
             &env,
             &anna,
@@ -1080,6 +1078,8 @@ mod tests {
         )
         .await;
         assert!(r["notUpdated"].is_null(), "{r}");
+        assert_eq!(entries(&env, &owner, &cal).await, Vec::new());
+        allow(&env, &anna, &owner, &cal, R::NONE);
         let r = call(&env, &anna, "CalendarEvent/get", json!({"accountId": acc})).await;
         assert_eq!(r["type"], "accountNotFound", "{r}");
         let s = env.jmap.session(&anna, "").await;
@@ -1131,39 +1131,19 @@ mod tests {
         assert_eq!(r["notFound"], json!([last]), "{r}");
     }
 
-    /// Адресная книга: запись без права — `forbidden`, с правом — карточка видна владельцу; политика организации
-    /// ограничивает выдачу; получатель — только учётная запись организации.
+    /// Адресная книга: запись без права — `forbidden`, с правом — карточка видна владельцу; выдачу проверяет единый
+    /// слой прав (`check_grant`: владелец или право `admin`); получатель — только учётная запись организации.
     #[tokio::test]
-    async fn address_book_rights_and_policy() {
+    async fn address_book_rights_and_grants() {
         let env = Env::sharing().await;
         let owner = env.principal.clone();
         let acc = id(&owner);
         let anna = env.user("anna@example.org").await;
+        let ivan = env.user("ivan@example.org").await;
         let book = create_book(&env, "Клиенты").await;
         let card = json!({"addressBookIds": {&book: true}, "name": {"full": "Пётр Иванов"}});
         let grant = |rights: Value| json!({"accountId": acc, "update": {&book: {"shareWith": {id(&anna): rights}}}});
 
-        // Политика «никому»: выдача запрещена.
-        let nobody = SharingPolicy {
-            scope: SharingScope::Nobody,
-            ..SharingPolicy::default()
-        };
-        env.sharing_policy
-            .set_sharing_policy(owner.tenant, nobody)
-            .await
-            .expect("policy");
-        let r = call(
-            &env,
-            &owner,
-            "AddressBook/set",
-            grant(json!({"mayRead": true})),
-        )
-        .await;
-        assert_eq!(r["notUpdated"][&book]["type"], "forbidden", "{r}");
-        env.sharing_policy
-            .set_sharing_policy(owner.tenant, SharingPolicy::default())
-            .await
-            .expect("policy");
         let r = call(
             &env,
             &owner,
@@ -1185,6 +1165,7 @@ mod tests {
         )
         .await;
         assert!(r["notUpdated"].is_null(), "{r}");
+        allow(&env, &anna, &owner, &book, R::READ);
         let s = env.jmap.session(&anna, "").await;
         let caps = &s["accounts"][&acc]["accountCapabilities"];
         assert_eq!(
@@ -1201,11 +1182,17 @@ mod tests {
             r["list"][0]["myRights"],
             json!({"mayRead": true, "mayWrite": false, "mayShare": false, "mayDelete": false})
         );
+        // Без права `admin` выдавать нельзя.
+        let to_ivan = json!({"accountId": acc,
+            "update": {&book: {format!("shareWith/{}", id(&ivan)): {"mayRead": true}}}});
+        let r = call(&env, &anna, "AddressBook/set", to_ivan.clone()).await;
+        assert_eq!(r["notUpdated"][&book]["type"], "forbidden", "{r}");
 
         // Право записи: карточка создаётся и видна владельцу.
         let rw = grant(json!({"mayRead": true, "mayWrite": true}));
         let r = call(&env, &owner, "AddressBook/set", rw).await;
         assert!(r["notUpdated"].is_null(), "{r}");
+        allow(&env, &anna, &owner, &book, R::WRITE);
         let r = call(&env, &anna, "ContactCard/set", create).await;
         let created = r["created"]["c"]["id"].as_str().expect("card").to_owned();
         let r = call(
@@ -1224,6 +1211,30 @@ mod tests {
         )
         .await;
         assert_eq!(r["ids"], json!([created]), "{r}");
+
+        // С правом `admin` получатель сам выдаёт права на книгу владельца — от своего имени, запись — у владельца.
+        let admin = R {
+            admin: true,
+            ..R::NONE
+        };
+        allow(&env, &anna, &owner, &book, admin);
+        let r = call(&env, &anna, "AddressBook/set", to_ivan).await;
+        assert!(r["notUpdated"].is_null(), "{r}");
+        assert!(
+            entries(&env, &owner, &book)
+                .await
+                .contains(&("ivan@example.org".to_owned(), R::READ)),
+            "{r}"
+        );
+        let r = call(
+            &env,
+            &ivan,
+            "ShareNotification/get",
+            json!({"accountId": id(&ivan)}),
+        )
+        .await;
+        assert_eq!(r["list"][0]["changedBy"]["principalId"], id(&anna), "{r}");
+        assert_eq!(r["list"][0]["objectAccountId"], acc, "{r}");
     }
 
     /// Без общего доступа `shareWith` — `null`, задать его нельзя.

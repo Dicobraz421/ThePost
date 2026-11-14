@@ -849,6 +849,7 @@ pub(crate) mod tests {
             tp_dav::Deps {
                 auth: Arc::new(env.auth.clone()),
                 store: Arc::new(env.dav.clone()),
+                sharing: None,
             },
             tp_dav::DavConfig::default(),
         );

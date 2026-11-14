@@ -288,7 +288,7 @@ pub(crate) async fn list_set(
             out.not_created.insert(cid, e);
             continue;
         }
-        let grants = match prepare_share(ctx, ty, None, &share).await? {
+        let grants = match prepare_share(ctx, ty, c.id, &share).await? {
             Ok(g) => g,
             Err(e) => {
                 out.not_created.insert(cid, e);
@@ -334,7 +334,7 @@ pub(crate) async fn list_set(
             out.not_updated.insert(id, e);
             continue;
         }
-        let grants = match prepare_share(ctx, ty, Some(c.id), &share).await? {
+        let grants = match prepare_share(ctx, ty, c.id, &share).await? {
             Ok(g) => g,
             Err(e) => {
                 out.not_updated.insert(id, e);

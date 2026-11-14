@@ -424,9 +424,10 @@ impl Jmap {
     }
 
     /// Подключает общий доступ к календарям и адресным книгам (CONTRACTS.md#Sharing, JMAP-32): чужие коллекции с
-    /// правами субъекта — в аккаунтах владельцев (`isPersonal` = `false`), `shareWith` и `myRights` по
-    /// [`tp_contracts::sharing::CollectionAcl`], выдача — в пределах политики организации, `ShareNotification`.
-    /// `None` — только свои коллекции, `shareWith` — `null`.
+    /// правами субъекта — в аккаунтах владельцев (`isPersonal` = `false`); `myRights`, видимость и выдача прав — по
+    /// единому слою прав [`tp_contracts::sharing::SharingAuthorizer`], `shareWith` — записи
+    /// [`tp_contracts::sharing::CollectionAcl`]; `ShareNotification`. `None` — только свои коллекции, `shareWith` —
+    /// `null`.
     #[must_use]
     pub fn with_sharing(mut self, sharing: Option<SharingDeps>) -> Self {
         self.sharing = sharing;
