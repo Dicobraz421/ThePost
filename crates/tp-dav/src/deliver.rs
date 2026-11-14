@@ -15,6 +15,14 @@
 //! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REQUEST` и `ADD` — только
 //! получателю из `ATTENDEE` сообщения (DAV-41), `REPLY` — только от адреса участника события и только организатору;
 //! меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
+//!
+//! Снаружи — только почта (решение 123, DAV-43): что применять, бронировать и на что отвечать, решает одно место —
+//! матрица [`inbound_allowed`] от типа отправителя ([`SenderKind`], определяет вызывающий) и действия
+//! ([`InboundAction::of`]: метод и получатель-ресурс). Не разрешено — `Ignored`: ни события, ни брони, ни ответа. По
+//! умолчанию своей организации — всё; извне (партнёр, соседняя организация установки, внешний) — только `REPLY` и
+//! `CANCEL` к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2): ответ — от участника события его организатору,
+//! отмена — от организатора события получателю из `ATTENDEE`; новое приглашение, прочие методы и любое сообщение
+//! ресурсу — письмом. `REFRESH` — только от участника события, организатор которого — получатель (RFC 5546 §6.1.6).
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
 //!
@@ -36,12 +44,13 @@ use tp_contracts::dav::{
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::schedule::{
-    InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, ItipOutgoing, ItipSource,
+    InboundAction, InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, SenderKind,
+    inbound_allowed,
 };
 use tp_contracts::sharing::BookingDecision;
 use tp_contracts::{Error, Result};
 
-use crate::booking::{self, Booking, BookingDeps};
+use crate::booking::{self, Booking, BookingDeps, Verdict};
 use crate::config::DavConfig;
 use crate::index;
 use crate::itip::{self, Itip};
@@ -673,10 +682,37 @@ impl ItipDelivery for ItipInbox {
         {
             return refuse("получатель не участник встречи");
         }
-        let booked = match (&self.booking, it.method) {
-            (Some(b), ItipMethod::Request) => {
-                b.decide(self.store.as_ref(), &self.cfg, msg, &it, &to)
+        // REFRESH — только от участника существующего события, организатор которого — получатель (RFC 5546 §6.1.6).
+        if it.method == ItipMethod::Refresh
+            && !self.attendee_of_own(msg.recipient, &it, &from, &to).await?
+        {
+            return refuse("REFRESH не от участника события");
+        }
+        // Отмена не своей организации — тоже только участнику.
+        if msg.sender != SenderKind::Own
+            && it.method == ItipMethod::Cancel
+            && it.meeting.attendee(&to).is_none()
+        {
+            return refuse("получатель не участник встречи");
+        }
+        let resource = match &self.booking {
+            Some(b) => b.is_resource(msg.recipient).await?,
+            None => false,
+        };
+        // Решение 123: «кто — что» — только здесь, по матрице.
+        if !inbound_allowed(msg.sender, InboundAction::of(it.method, resource)) {
+            return refuse("отправителю не разрешено (решение 123)");
+        }
+        let booked = match &self.booking {
+            Some(b) if resource && it.method == ItipMethod::Request => {
+                match b
+                    .decide(self.store.as_ref(), &self.cfg, msg, &it, &to)
                     .await?
+                {
+                    Verdict::Regular => None,
+                    Verdict::Refused(reason) => return refuse(reason),
+                    Verdict::Booked(b) => Some(b),
+                }
             }
             _ => None,
         };
@@ -708,12 +744,27 @@ impl ItipDelivery for ItipInbox {
 }
 
 impl ItipInbox {
-    /// Ответ ресурса `to` организатору приглашения `it` по решению `b` ([`crate::booking`]): учётной записи
-    /// организации — в календарь, внешнему — письмом iMIP. Сбой ответа — в журнал, решение остаётся.
-    async fn answer(&self, msg: &ItipMessage, it: &Itip, to: &str, b: &Booking) {
-        let Some(deps) = &self.booking else {
-            return;
+    /// У получателя `scope` с адресом `to` есть событие с UID сообщения `it`, его организатор — `to`, а `from` — его
+    /// участник.
+    async fn attendee_of_own(
+        &self,
+        scope: AccountScope,
+        it: &Itip,
+        from: &str,
+        to: &str,
+    ) -> Result<bool> {
+        let Some(o) = find_uid(self.store.as_ref(), scope, &it.meeting.uid).await? else {
+            return Ok(false);
         };
+        Ok(ICalendar::parse(&o.body)
+            .ok()
+            .and_then(|i| itip::meeting(&i))
+            .is_some_and(|m| m.organizer.as_deref() == Some(to) && m.attendee(from).is_some()))
+    }
+
+    /// Ответ ресурса `to` организатору приглашения `it` по решению `b` ([`crate::booking`]) — в календарь его учётной
+    /// записи. Сбой ответа — в журнал, решение остаётся.
+    async fn answer(&self, msg: &ItipMessage, it: &Itip, to: &str, b: &Booking) {
         let Some(organizer) = it.meeting.organizer.clone() else {
             return;
         };
@@ -726,40 +777,18 @@ impl ItipInbox {
                 c.add_property(ICalendarProperty::Comment, booking::reason_text(reason));
             }
         }
-        let ics = reply.to_string();
-        let result = match b.organizer {
-            Some(account) => {
-                let m = ItipMessage {
-                    recipient: AccountScope {
-                        tenant: msg.recipient.tenant,
-                        account,
-                    },
-                    to: organizer,
-                    from: to.to_owned(),
-                    method: ItipMethod::Reply,
-                    ics,
-                    source: ItipSource::Internal,
-                };
-                self.deliver(&m).await.map(|_| ())
-            }
-            None => match &deps.sender {
-                Some(sender) => {
-                    let (subject, text) = crate::imip::describe(ItipMethod::Reply, &reply);
-                    let mail = ItipOutgoing {
-                        sender: msg.recipient,
-                        from: to.to_owned(),
-                        to: vec![organizer],
-                        method: ItipMethod::Reply,
-                        ics,
-                        subject,
-                        text,
-                    };
-                    sender.send(&mail).await.map(|_| ())
-                }
-                None => Ok(()),
+        let m = ItipMessage {
+            recipient: AccountScope {
+                tenant: msg.recipient.tenant,
+                account: b.organizer,
             },
+            to: organizer,
+            from: to.to_owned(),
+            method: ItipMethod::Reply,
+            ics: reply.to_string(),
+            sender: SenderKind::Own,
         };
-        if let Err(e) = result {
+        if let Err(e) = self.deliver(&m).await {
             tracing::warn!(error = %e, "iTIP: ответ ресурса организатору не отправлен");
         }
     }

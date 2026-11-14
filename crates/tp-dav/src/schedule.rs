@@ -38,7 +38,7 @@ use tp_contracts::meta::{AccountScope, AccountStore, AddressTarget};
 use tp_contracts::queue::SubmitStatus;
 use tp_contracts::schedule::{
     BusyKind, BusyPeriod, FreeBusy, Inbox, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome,
-    ItipOutgoing, ItipSender, ItipSource, Period, valid_address,
+    ItipOutgoing, ItipSender, Period, SenderKind, valid_address,
 };
 use tp_contracts::{AccountId, Error, ModSeq, Result, TenantId};
 
@@ -201,7 +201,7 @@ impl ScheduleDeps {
                     from: from.to_owned(),
                     method: m.method,
                     ics: ics.clone(),
-                    source: ItipSource::Internal,
+                    sender: SenderKind::Own,
                 };
                 match self.delivery.deliver(&msg).await {
                     Ok(ItipOutcome::Applied) => set(to, STATUS_DELIVERED),
