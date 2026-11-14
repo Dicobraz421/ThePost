@@ -4,6 +4,8 @@ name: CI
 
 on:
   pull_request:
+    # labeled/unlabeled — метка owner-review перезапускает gate (решение владельца 2026-11-14).
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   merge_group:
   push:
     branches: [main]
@@ -283,4 +285,8 @@ jobs:
         run: |
           r='${{ join(needs.*.result, ' ') }}'
           echo "$r"
+          # Ручной стоп владельца (решение 2026-11-14): метка owner-review — PR ждёт владельца; снять метку — gate заново.
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'owner-review') }}" = true ]; then
+            echo "::error::метка owner-review — PR ждёт решения владельца"; exit 1
+          fi
           case " $r " in *" failure "*|*" cancelled "*) exit 1;; esac
