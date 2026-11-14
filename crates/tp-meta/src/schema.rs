@@ -189,6 +189,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "installation admins",
         include_str!("../migrations/0040_installation_admins.sql"),
     ),
+    (
+        41,
+        "account resource type",
+        include_str!("../migrations/0041_account_resource_type.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.
