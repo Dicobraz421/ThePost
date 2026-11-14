@@ -5699,6 +5699,7 @@ dependencies = [
  "tp-smtp",
  "tp-sys",
  "tp-testkit",
+ "tp-tui",
  "tracing",
  "x509-parser",
 ]
