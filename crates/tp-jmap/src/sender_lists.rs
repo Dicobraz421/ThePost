@@ -171,7 +171,10 @@ mod tests {
     async fn get_and_set() {
         let env = Env::new().await;
         let acc = env.account();
-        let session = env.jmap.session(&env.principal, "https://mail.example.org");
+        let session = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         assert!(session["capabilities"][URI].is_object(), "{session}");
         assert_eq!(session["primaryAccounts"][URI], acc);
         assert_eq!(
@@ -291,7 +294,8 @@ mod tests {
         let bare = Env::bare().await;
         let session = bare
             .jmap
-            .session(&bare.principal, "https://mail.example.org");
+            .session(&bare.principal, "https://mail.example.org")
+            .await;
         assert!(session["capabilities"][URI].is_null());
         let resp = bare
             .request(json!({"using": ["urn:ietf:params:jmap:core", URI],

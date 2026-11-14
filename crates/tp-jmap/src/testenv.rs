@@ -22,13 +22,13 @@ use tp_contracts::sieve::SieveStore;
 use tp_contracts::{BlobHash, BlobKey};
 use tp_contracts::{MailboxId, MessageId};
 use tp_testkit::{
-    Clock, FakeAuthenticator, FakeSearch, MemAddressBook, MemBlobIndex, MemBlobStore, MemDav,
-    MemDeliveryLog, MemEventBus, MemGroups, MemItipSender, MemMailboxAudit, MemMetadata,
-    MemOutbound, MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions, MemTrash,
-    RecordingDecisionHook, SearchDoc, SystemClock,
+    Clock, FakeAuthenticator, FakeSearch, FakeSharingAuthorizer, MemAddressBook, MemBlobIndex,
+    MemBlobStore, MemDav, MemDeliveryLog, MemEventBus, MemGroups, MemItipSender, MemMailboxAudit,
+    MemMetadata, MemOutbound, MemPolicies, MemQuota, MemSenderLists, MemSieve, MemSubmissions,
+    MemTrash, RecordingDecisionHook, SearchDoc, SystemClock,
 };
 
-use crate::{Deps, Jmap, JmapConfig};
+use crate::{Deps, Jmap, JmapConfig, SharingDeps};
 
 /// Права отправки: свой адрес — Send As, остальные — из таблицы.
 #[derive(Default)]
@@ -150,6 +150,9 @@ pub struct Env {
     pub dav: MemDav,
     /// Письма iMIP внешним участникам (`Jmap::with_schedule`).
     pub imip: MemItipSender,
+    /// Действующие права на коллекции (`Jmap::with_sharing`, только [`Env::sharing`]): тест задаёт их таблицей,
+    /// записи `shareWith` хранит [`Env::dav`].
+    pub collections: FakeSharingAuthorizer,
     pub jmap: Arc<Jmap>,
 }
 
@@ -173,6 +176,17 @@ impl Env {
             Default::default(),
         )
         .await
+    }
+
+    /// Окружение с общим доступом к календарям и адресным книгам (`Jmap::with_sharing`).
+    pub async fn sharing() -> Self {
+        let mut env = Self::new().await;
+        let jmap = Arc::get_mut(&mut env.jmap).expect("jmap");
+        jmap.sharing = Some(SharingDeps {
+            authz: Arc::new(env.collections.clone()),
+            acl: Arc::new(env.dav.clone()),
+        });
+        env
     }
 
     /// Окружение с хранилищами, но без планирования встреч (`Jmap::with_schedule` не вызван).
@@ -357,6 +371,7 @@ impl Env {
             sieve,
             dav,
             imip,
+            collections: FakeSharingAuthorizer::default(),
             jmap: Arc::new(jmap),
         }
     }

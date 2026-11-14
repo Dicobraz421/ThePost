@@ -207,7 +207,10 @@ mod tests {
     #[tokio::test]
     async fn capability() {
         let env = Env::new().await;
-        let session = env.jmap.session(&env.principal, "https://mail.example.org");
+        let session = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         assert!(session["capabilities"][URI].is_object(), "{session}");
         assert_eq!(session["primaryAccounts"][URI], env.account());
         let g = call(&env, json!({"accountId": "чужая"})).await;
@@ -218,7 +221,8 @@ mod tests {
         let bare = Env::bare().await;
         let session = bare
             .jmap
-            .session(&bare.principal, "https://mail.example.org");
+            .session(&bare.principal, "https://mail.example.org")
+            .await;
         assert!(session["capabilities"][URI].is_null());
     }
 }

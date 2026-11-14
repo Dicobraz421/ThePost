@@ -113,7 +113,7 @@ fn principal_json(ctx: &Ctx<'_>, a: &Account) -> Map<String, Value> {
             json!({
                 "accountId": own.then_some(&id),
                 "mayGetAvailability": ctx.jmap.freebusy.is_some(),
-                "mayShareWith": false,
+                "mayShareWith": ctx.jmap.sharing.is_some(),
                 "calendarAddress": format!("mailto:{}", a.login),
             }),
         );
@@ -475,7 +475,10 @@ mod tests {
     #[tokio::test]
     async fn session_lists_capabilities() {
         let env = Env::new().await;
-        let s = env.jmap.session(&env.principal, "https://mail.example.org");
+        let s = env
+            .jmap
+            .session(&env.principal, "https://mail.example.org")
+            .await;
         let acc = env.account();
         for uri in USING.iter().skip(1) {
             assert!(s["capabilities"][uri].is_object(), "{uri}: {s}");
@@ -498,7 +501,8 @@ mod tests {
         let bare = Env::bare().await;
         let s = bare
             .jmap
-            .session(&bare.principal, "https://mail.example.org");
+            .session(&bare.principal, "https://mail.example.org")
+            .await;
         assert!(s["capabilities"][USING[1]].is_null(), "{s}");
         assert!(s["capabilities"][USING[2]].is_null(), "{s}");
     }
