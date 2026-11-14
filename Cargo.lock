@@ -6409,10 +6409,12 @@ version = "0.2.0"
 dependencies = [
  "crossterm",
  "evdev",
+ "image",
  "ratatui",
  "ratatui-image",
  "serde_json",
  "tokio",
+ "toml",
  "tp-admin",
  "tp-admin-client",
 ]
