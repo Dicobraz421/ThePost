@@ -6,6 +6,8 @@
 !crates/**
 crates/**/target
 !console/**
+# Токены фирменного стиля и знак (DES-01): консоль читает их при сборке.
+!design/**
 console/node_modules
 console/dist
 console/coverage
