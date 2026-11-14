@@ -199,6 +199,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "share notifications",
         include_str!("../migrations/0042_share_notifications.sql"),
     ),
+    (
+        43,
+        "branding",
+        include_str!("../migrations/0043_branding.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

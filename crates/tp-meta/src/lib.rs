@@ -14,6 +14,7 @@ pub mod app_passwords;
 mod archive;
 pub mod audit_log;
 pub mod blob_index;
+mod branding;
 mod busy;
 mod card_search;
 pub mod changelog;
@@ -340,7 +341,8 @@ impl PgMeta {
     ///   сокращается), `AccountStore::upsert` (поиск по имени входа, системные папки — `ensure_system`),
     ///   `AclStore::set_acl`, `set_send_delegation`, `GroupStore::put` (группа заменяется целиком),
     ///   `Membership::heartbeat` (`upsert_node`), `set_policy`, `set_user_trash_purge`, `ContactStore::put_contact`,
-    ///   `OrgStore::put_org_unit`, `set_org`, `DynamicGroupStore::put_dynamic` (замена целиком);
+    ///   `OrgStore::put_org_unit`, `set_org`, `DynamicGroupStore::put_dynamic` (замена целиком),
+    ///   `BrandingStore::set_branding` (набор уровня заменяется целиком);
     /// - `set_*` по значению: `MailboxStore::set_subscribed` (повтор лишь добавляет запись `updated` в
     ///   журнал изменений), `AppPasswords::revoke` (`COALESCE` — время первого отзыва),
     ///   `mark_blob_damaged` (`coalesce` — время первой пометки), `disable_account`, `restore_account` (срок
@@ -352,7 +354,7 @@ impl PgMeta {
     /// Не повторяются: CAS по версии (`transport`, `put_manifest`) и номеру захвата (лизы, очередь) —
     /// повтор применённой записи отвечает `Conflict`; счётчики ссылок BLOB, UID и `ModSeq` писем,
     /// выдача идентификаторов внутри операции (`create`, `copy`), удаление с возвратом
-    /// удалённого и удаление с ответом `NotFound` об отсутствии (`take_held`, `GroupStore::remove`,
+    /// удалённого (`BrandingStore::reset_branding`) и удаление с ответом `NotFound` об отсутствии (`take_held`, `GroupStore::remove`,
     /// `remove_contact`, `remove_org_unit`, `remove_dynamic`, `cancel_queued`), состояние списков отправителей
     /// (`put_sender_list`), подключение и удаление отключённого ящика (`attach_account`, `remove_disabled`) —
     /// повтор вернул бы другое.
