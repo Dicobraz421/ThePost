@@ -6,6 +6,8 @@ python design_contrast.py --self-test
 Проверяет design/tokens.toml:
 - в каждом цветном режиме ([mode.*], кроме mono) заданы все роли из [roles], значения разбираются;
 - пары [[contrast]] в каждом цветном режиме — не ниже min (WCAG 2.x: 4,5 у текста, 3 у рамок и значков);
+  min не из STANDARD_MIN — только с exception (причина, например решение владельца);
+- [attrs] — атрибуты ролей во всех цветных режимах, только bold, dim, reverse, underline;
 - красный (тон в пределах 20° от 0°, насыщенный) — только у ролей [rules].red_roles; в c16 цвета 1 и 9 — тоже;
 - [mode.mono] — только атрибуты bold, dim, reverse, underline;
 - [cli]: у каждой роли brand не ниже [cli].min на каждом фоне [cli].backgrounds, ansi — параметры SGR,
@@ -23,6 +25,7 @@ HEX = re.compile(r"^#[0-9A-F]{6}$")
 SGR = re.compile(r"^[0-9]+(;[0-9]+)*$")
 MONO_ATTRS = {"bold", "dim", "reverse", "underline"}
 RED_SLOTS16 = {1, 9}
+STANDARD_MIN = {4.5, 3.0}
 
 
 def hex_rgb(h: str) -> tuple[int, int, int]:
@@ -109,6 +112,17 @@ def check(tok: dict) -> list[str]:
     pairs = tok.get("contrast", [])
     if not pairs:
         errs.append("[[contrast]] пуст")
+    for p in pairs:
+        fg, need = p.get("fg"), p.get("min")
+        if fg not in roles or not p.get("bg") or not all(b in roles for b in p["bg"]):
+            errs.append(f"[[contrast]] {fg}: fg и bg — роли из [roles]")
+        if not isinstance(need, (int, float)) or isinstance(need, bool):
+            errs.append(f"[[contrast]] {fg}: min {need!r} — нужно число")
+        elif need not in STANDARD_MIN and not p.get("exception"):
+            errs.append(f"[[contrast]] {fg}: min {need} не из {sorted(STANDARD_MIN)} без exception")
+    for r, attrs in tok.get("attrs", {}).items():
+        if r not in roles or not isinstance(attrs, list) or not set(attrs) <= MONO_ATTRS:
+            errs.append(f"[attrs].{r}: {attrs!r} — роль из [roles], атрибуты из {sorted(MONO_ATTRS)}")
 
     for mname, mode in modes.items():
         kind = mode_kind(mname)
@@ -220,6 +234,10 @@ def self_test(path: str) -> int:
             print(f"ok: {desc} — найдено")
 
     spoiled("текст ниже 4,5:1", lambda t: t["mode"]["light"].update(text="#9AA6B2"), "text #9AA6B2 на")
+    spoiled("исключение без причины", lambda t: next(p for p in t["contrast"] if p["fg"] == "selFg").pop("exception"),
+            "без exception")
+    spoiled("ниже допущенного исключения", lambda t: t["mode"]["dark"].update(sel="#E8187F"), "selFg #FFFFFF на sel")
+    spoiled("атрибут роли", lambda t: t["attrs"].update(selFg=["blink"]), "[attrs].selFg")
     spoiled("рамка ниже 3:1", lambda t: t["mode"]["dark"].update(frameA="#26313B"), "frameA #26313B на")
     spoiled("номер 256 ниже порога", lambda t: t["mode"]["c256"].update(muted=236), "[mode.c256]: muted")
     spoiled("красный не у ошибки", lambda t: t["mode"]["dark"].update(head="#FF3030"), "head: красный")
