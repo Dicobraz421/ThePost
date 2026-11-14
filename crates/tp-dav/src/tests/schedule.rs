@@ -23,7 +23,7 @@ use tp_testkit::{
 };
 
 use super::{Resp, basic};
-use crate::{DavConfig, Deps, ImipSender, ItipInbox, ScheduleDeps, imip, itip, router_with};
+use crate::{DavConfig, Deps, ImipSender, ItipInbox, ScheduleDeps, imip, itip, router_shared};
 
 const IVAN: &str = "ivan@example.org";
 const PETR: &str = "petr@example.org";
@@ -98,7 +98,7 @@ impl Sched {
         let store = MemDav::new();
         let sender = MemItipSender::new();
         let inbox = ItipInbox::new(Arc::new(store.clone()), cfg.clone());
-        let app = router_with(
+        let app = router_shared(
             Deps {
                 auth: Arc::new(auth),
                 store: Arc::new(store.clone()),
@@ -111,6 +111,7 @@ impl Sched {
                 freebusy: Arc::new(store.clone()),
                 group_store: Arc::new(groups.clone()),
             }),
+            None,
             cfg,
         );
         Self {

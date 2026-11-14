@@ -1,5 +1,6 @@
-//! CTR-73, CTR-76…78 на PostgreSQL: ближайший срок и сигнал очереди, архив ящика (и на втором шарде), сигнал и
-//! отметка удаления отключённого ящика — общие наборы `tp_testkit::suite::lifecycle`.
+//! CTR-73, CTR-76…78, CTR-85 на PostgreSQL: ближайший срок и сигнал очереди, просмотр и повтор записей очереди,
+//! архив ящика (и на втором шарде), сигнал и отметка удаления отключённого ящика — общие наборы
+//! `tp_testkit::suite::lifecycle`.
 
 mod common;
 
@@ -19,6 +20,20 @@ async fn queue_next_due_suite() {
     let meta = db.meta.clone().with_bus(bus.clone());
     let tenant = common::tenant(meta.pool()).await;
     lifecycle::queue_next_due(&meta, bus.as_ref(), tenant).await;
+    db.drop_db().await;
+}
+
+/// META-82: просмотр и повтор — на своей чистой БД: `claim` и `next_due` видят записи всех организаций.
+#[tokio::test]
+async fn queue_list_suite() {
+    let Some(db) = common::fresh_meta().await else {
+        return;
+    };
+    let bus = Arc::new(MemEventBus::default());
+    let meta = db.meta.clone().with_bus(bus.clone());
+    let tenant = common::tenant(meta.pool()).await;
+    let foreign = common::tenant(meta.pool()).await;
+    lifecycle::queue_list(&meta, bus.as_ref(), tenant, foreign).await;
     db.drop_db().await;
 }
 

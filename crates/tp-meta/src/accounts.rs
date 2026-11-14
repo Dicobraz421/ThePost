@@ -10,7 +10,7 @@ use sqlx::{FromRow, PgConnection, Postgres, Row};
 use time::OffsetDateTime;
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
-    DisabledAccount, ExistingContent, QuotaUsage, account_aliases, account_disabled,
+    DisabledAccount, ExistingContent, QuotaUsage, ResourceType, account_aliases, account_disabled,
     account_resource_type, disabled_mailbox_changed,
 };
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
@@ -23,7 +23,7 @@ use crate::shards::{ReadIntent, ShardId};
 
 /// `AccountStore::list` без верхней границы префикса (пустой префикс или одни `U+10FFFF`): `$1` — организация,
 /// `$2` — префикс, `$3` — курсор (строго больше), `$4` — лимит. Открыт для проверки плана (`EXPLAIN`) в тестах.
-pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal
+pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type
     FROM accounts
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND starts_with(lower(login), $2)
       AND lower(login) COLLATE "C" > $3
@@ -31,7 +31,7 @@ pub const LIST_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, di
 
 /// Как [`LIST_SQL`], префикс — диапазоном `>= $2 AND < $5` (`$5` — `prefix_next`), не `starts_with` и не `LIKE`
 /// (`%` и `_` в префиксе — обычные знаки).
-pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal
+pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type
     FROM accounts
     WHERE tenant_id = $1 AND lower(login) COLLATE "C" >= $2 AND lower(login) COLLATE "C" < $5
       AND lower(login) COLLATE "C" > $3
@@ -41,12 +41,12 @@ pub const LIST_PREFIX_SQL: &str = r#"SELECT account_id, tenant_id, domain_id, lo
 /// краям. Строка учётной записи (`group_id` — `NULL`) или группы (столбцы учётной записи — `NULL`); ранг — основной
 /// адрес, псевдоним, группа.
 const BY_ADDRESS_SQL: &str = r#"SELECT * FROM (
-        SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal,
+        SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type,
                NULL::uuid AS group_id, CASE WHEN lower(login) = lower($2) THEN 0 ELSE 1 END AS rank
         FROM accounts WHERE tenant_id = $1 AND (lower(login) = lower($2) OR $2 = ANY(aliases))
         UNION ALL
         SELECT NULL::uuid, NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::boolean, NULL::text[],
-               NULL::text, NULL::boolean, group_id, 2
+               NULL::text, NULL::boolean, NULL::text, group_id, 2
         FROM groups WHERE tenant_id = $1 AND address IS NOT NULL AND lower(address) = lower($2)
     ) t ORDER BY rank LIMIT 1"#;
 
@@ -80,6 +80,7 @@ pub(crate) struct AccountRow {
     pub(crate) aliases: Vec<String>,
     pub(crate) kind: String,
     pub(crate) hidden_from_gal: bool,
+    pub(crate) resource_type: Option<String>,
 }
 
 /// Строка `upsert`: учётная запись и её шард.
@@ -90,10 +91,11 @@ struct UpsertRow {
     shard_id: i32,
 }
 
-/// Общие параметры `upsert` (`$3`–`$10`).
+/// Общие параметры `upsert` (`$3`–`$11`); `resource_type` — по правилу [`account_resource_type`].
 fn bind_upsert<'q>(
     q: QueryAs<'q, Postgres, UpsertRow, PgArguments>,
     data: &'q AccountUpsert,
+    resource_type: Option<ResourceType>,
 ) -> QueryAs<'q, Postgres, UpsertRow, PgArguments> {
     q.bind(data.domain.as_uuid())
         .bind(&data.login)
@@ -106,12 +108,20 @@ fn bind_upsert<'q>(
         ))
         .bind(kind_str(data.kind))
         .bind(data.hidden_from_gal)
+        .bind(resource_type.map(resource_type_str))
 }
 
 fn kind_str(kind: AccountKind) -> &'static str {
     match kind {
         AccountKind::User => "user",
         AccountKind::Resource => "resource",
+    }
+}
+
+fn resource_type_str(t: ResourceType) -> &'static str {
+    match t {
+        ResourceType::Room => "room",
+        ResourceType::Equipment => "equipment",
     }
 }
 
@@ -128,6 +138,15 @@ impl TryFrom<AccountRow> for Account {
                 )));
             }
         };
+        // Согласованность с видом — ограничение `accounts_resource_type_kind` (миграция 0041).
+        let resource_type = match r.resource_type.as_deref() {
+            None => None,
+            Some("room") => Some(ResourceType::Room),
+            Some("equipment") => Some(ResourceType::Equipment),
+            Some(other) => {
+                return Err(Error::internal(format!("тип ресурса в БД: {other:?}")));
+            }
+        };
         Ok(Account {
             id: AccountId::from_uuid(r.account_id),
             tenant: TenantId::from_uuid(r.tenant_id),
@@ -137,8 +156,7 @@ impl TryFrom<AccountRow> for Account {
             external_id: r.external_id,
             enabled: r.enabled,
             aliases: r.aliases,
-            // Тип ресурса в БД — META-81; до неё ресурс читается помещением (CTR-88).
-            resource_type: account_resource_type(kind, None)?,
+            resource_type,
             kind,
             hidden_from_gal: r.hidden_from_gal,
         })
@@ -190,8 +208,8 @@ impl PgMeta {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
         }
-        // Тип ресурса (CTR-88) проверяется; хранение — META-81.
-        account_resource_type(data.kind, data.resource_type)?;
+        // Тип ресурса (CTR-88): у ресурса без типа — помещение, у пользователя — `NULL`.
+        let resource_type = account_resource_type(data.kind, data.resource_type)?;
         // Шард новой учётной записи — до транзакции каталога (справочник читает свой пул).
         let place = match self.shard_resolver() {
             Some(r) => r.place(tenant).await?,
@@ -206,26 +224,28 @@ impl PgMeta {
                 sqlx::query_as(
                     "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6,
                                          enabled = $7, aliases = $8, kind = $9,
-                                         hidden_from_gal = $10, updated_at = now()
+                                         hidden_from_gal = $10, resource_type = $11, updated_at = now()
                      WHERE tenant_id = $1 AND account_id = $2
                      RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind,
-                               hidden_from_gal, shard_id",
+                               hidden_from_gal, resource_type, shard_id",
                 )
                 .bind(tenant.as_uuid())
                 .bind(id),
                 data,
+                resource_type,
             ),
             None => bind_upsert(
                 sqlx::query_as(
                     "INSERT INTO accounts (tenant_id, account_id, domain_id, login, display_name, external_id,
-                                           enabled, aliases, kind, hidden_from_gal, shard_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                           enabled, aliases, kind, hidden_from_gal, resource_type, shard_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                      RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind,
-                               hidden_from_gal, shard_id",
+                               hidden_from_gal, resource_type, shard_id",
                 )
                 .bind(tenant.as_uuid())
                 .bind(*AccountId::new().as_uuid()),
                 data,
+                resource_type,
             )
             .bind(place.0),
         }
@@ -278,7 +298,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type
              FROM accounts WHERE tenant_id = $1 AND account_id = $2",
             )
             .bind(tenant.as_uuid())
@@ -304,7 +324,7 @@ impl AccountStore for PgMeta {
             .idempotent(|| async move {
                 let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
                 let rows: Vec<AccountRow> = sqlx::query_as(
-                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal
+                    "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type
                  FROM accounts WHERE tenant_id = $1 AND account_id = ANY($2)",
                 )
                 .bind(tenant.as_uuid())
@@ -362,7 +382,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type
              FROM accounts WHERE tenant_id = $1 AND lower(login) = lower($2)",
             )
             .bind(tenant.as_uuid())
@@ -380,7 +400,7 @@ impl AccountStore for PgMeta {
         self.idempotent(|| async move {
             let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, tenant).await?;
             let row: Option<AccountRow> = sqlx::query_as(
-                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal
+                "SELECT account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type
              FROM accounts WHERE tenant_id = $1 AND external_id = $2",
             )
             .bind(tenant.as_uuid())

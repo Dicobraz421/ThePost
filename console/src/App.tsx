@@ -24,6 +24,7 @@ import { LoginPage } from "./pages/login";
 import { MailboxAuditPage } from "./pages/mailbox-audit";
 import { ModerationPage } from "./pages/moderation";
 import { OrganizationPage } from "./pages/organization";
+import { QueuePage } from "./pages/queue";
 import { ResourceCreate, ResourceList, ResourceShow } from "./pages/resources";
 import { AccountSieve, OrgSieve } from "./pages/sieve";
 import { AccountTrash } from "./pages/trash";
@@ -88,6 +89,7 @@ export function App() {
             },
             { name: "units", list: "/units", meta: { label: "Оргструктура" } },
             { name: "moderation", list: "/moderation", meta: { label: "Модерация" } },
+            { name: "queue", list: "/queue", meta: { label: "Очередь" } },
             { name: "sieve", list: "/sieve", meta: { label: "Правила организации" } },
             { name: "transport", list: "/transport", meta: { label: "Транспорт" } },
             { name: "delivery", list: "/delivery", meta: { label: "Журнал доставки" } },
@@ -137,6 +139,7 @@ export function App() {
               </Route>
               <Route path="/units" element={<UnitsPage />} />
               <Route path="/moderation" element={<ModerationPage />} />
+              <Route path="/queue" element={<QueuePage />} />
               <Route path="/sieve" element={<OrgSieve />} />
               <Route path="/transport" element={<TransportPage />} />
               <Route path="/delivery" element={<DeliveryPage />} />
