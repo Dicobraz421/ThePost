@@ -194,6 +194,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "account resource type",
         include_str!("../migrations/0041_account_resource_type.sql"),
     ),
+    (
+        42,
+        "share notifications",
+        include_str!("../migrations/0042_share_notifications.sql"),
+    ),
 ];
 
 /// Мигратор схемы ядра.

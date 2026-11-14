@@ -34,6 +34,7 @@ tp-search.workspace = true
 tp-admin.workspace = true
 tp-admin-client.workspace = true
 tp-sys.workspace = true
+tp-tui.workspace = true
 schemars.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

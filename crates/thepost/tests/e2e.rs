@@ -16,9 +16,15 @@
 //!
 //! Книга «Организация» без LDAP (APP-51): учётная запись из Admin API видна в книге по CardDAV.
 //!
+//! Уведомления об общем доступе (APP-72): `ShareNotification` из PostgreSQL — после перезапуска узла и на втором
+//! узле с той же базой; удаление на одном узле видно на другом.
+//!
 //! Общий доступ, представители и бронирование в CalDAV (APP-71): выдача и отзыв прав `POST` на коллекцию,
 //! представитель через `PROPPATCH group-member-set`, приглашение переговорной — бронь в её календаре и ответ
 //! организатору.
+//!
+//! Снаружи — только почта (APP-73, решение 123): приглашение переговорной письмом iMIP через доверенный шлюз — письмо
+//! в ящике ресурса, брони нет, ответа (письма в очереди исходящей почты) нет.
 //!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
@@ -1285,6 +1291,11 @@ async fn transport_settings_without_restart() {
     let (code, body) = http(admin, "GET", &format!("{org}/audit"), &bearer, None).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let audit: Value = serde_json::from_slice(&body).expect("audit");
+    // APP-74: очередь исходящей почты подключена к Admin API (`with_queue`), не 503; список — JSON-массив.
+    let (code, body) = http(admin, "GET", &format!("{org}/queue"), &bearer, None).await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let queue: Value = serde_json::from_slice(&body).expect("queue");
+    assert!(queue.is_array(), "{queue}");
     let changes: Vec<(&str, &str, u64)> = audit["entries"]
         .as_array()
         .expect("entries")
@@ -2089,6 +2100,215 @@ async fn sharing_delegates_and_booking() {
     drop_database(&url, &db_name).await;
 }
 
+// ---------- APP-73, решение 123: снаружи — только почта ----------
+
+/// Ответ `EHLO` целиком (строки расширений).
+async fn smtp_ehlo(addr: std::net::SocketAddr) -> String {
+    let mut s = TcpStream::connect(addr).await.expect("smtp connect");
+    assert_eq!(smtp_reply(&mut s).await, 220);
+    s.write_all(b"EHLO client.test\r\n")
+        .await
+        .expect("smtp write");
+    let mut text = String::new();
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        s.read_exact(&mut byte).await.expect("smtp read");
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            buf.clear();
+            text.push_str(&line);
+            if line.len() >= 4 && line.as_bytes()[3] == b' ' {
+                return text;
+            }
+        }
+    }
+}
+
+/// Приглашение переговорной письмом iMIP с внешнего адреса (APP-73; решение 123 «Снаружи — только почта»): письмо
+/// `REQUEST` приходит через доверенный шлюз (`Authentication-Results` с `dmarc=pass`) и остаётся только письмом —
+/// оно в ящике ресурса, в журнале доставки приём iTIP отброшен (`Discard`), брони в календаре ресурса нет, ответа
+/// организатору (письма в очереди исходящей почты) нет. Бронь и ответ организатору из организации проверяет
+/// `sharing_delegates_and_booking`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_request_to_room_stays_mail() {
+    use tp_contracts::dav::{CollectionKind, DavStore};
+    use tp_contracts::delivery::DeliveryDecision;
+    use tp_contracts::sharing::{BookingPolicy, ResourceStore};
+    use tp_contracts::transport::{SourceKind, SourceMatch, TrustedSource};
+
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = node_secrets(password);
+
+    let domain = "example.ru".to_owned();
+    let path = dir.path().join("config.yaml");
+    // Без роли smtp-out: письмо в очереди, если бы оно появилось, никто бы не забрал.
+    let text = config(dir.path(), &db_url, &domain).replace(
+        "roles: [all]",
+        "roles: [smtp-in, imap, jmap, dav, search, indexer, maintenance]",
+    );
+    assert!(!text.contains("roles: [all]"), "{text}");
+    std::fs::write(&path, text).expect("config");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let smtp = addr(&running, "smtp-in");
+
+    let pool = db_pool(&url_db).await;
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let tenant = TenantId::DEFAULT;
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
+    let room = format!("room@{domain}");
+    let account = meta
+        .upsert(
+            tenant,
+            AccountUpsert {
+                domain: domain_id,
+                login: room.clone(),
+                display_name: "Переговорная".to_owned(),
+                external_id: None,
+                enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::Resource,
+                hidden_from_gal: false,
+                resource_type: None,
+            },
+        )
+        .await
+        .expect("account");
+    let room_scope = AccountScope {
+        tenant,
+        account: account.id,
+    };
+    ResourceStore::set_booking_policy(
+        &meta,
+        room_scope,
+        Some(BookingPolicy {
+            horizon: None,
+            ..BookingPolicy::default()
+        }),
+    )
+    .await
+    .expect("правила бронирования");
+
+    // Доверенный шлюз кластера для 127.0.0.1: результаты его проверок (`Authentication-Results`) — вместо DNS.
+    let authserv = "gw.example.ru";
+    let version = TransportStore::cluster(&meta)
+        .await
+        .expect("transport")
+        .version;
+    meta.put_source(
+        version,
+        &TrustedSource {
+            name: "gateway".to_owned(),
+            tenant: None,
+            matcher: SourceMatch::Networks(vec!["127.0.0.1/32".parse().expect("net")]),
+            kind: SourceKind::Gateway {
+                xclient: true,
+                authserv_id: Some(authserv.to_owned()),
+            },
+        },
+    )
+    .await
+    .expect("источник");
+    // Снимок без перезапуска (`TransportChanged`): шлюзу `EHLO` объявляет `XCLIENT`.
+    let until = deadline();
+    while !smtp_ehlo(smtp).await.contains("XCLIENT") {
+        retry(until, "шлюз действует на новую сессию").await;
+    }
+
+    // Приглашение письмом iMIP с внешнего адреса (`smtp_send` переводит `\n` в `\r\n`).
+    let organizer = "carol@external.test";
+    let uid = "app-73-room";
+    let ics = format!(
+        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//external//e2e//EN\nMETHOD:REQUEST\nBEGIN:VEVENT\n\
+         UID:{uid}\nDTSTAMP:20261112T100000Z\nDTSTART:20270114T070000Z\n\
+         DTEND:20270114T080000Z\nSEQUENCE:0\nSUMMARY:External booking\n\
+         ORGANIZER:mailto:{organizer}\n\
+         ATTENDEE;PARTSTAT=ACCEPTED:mailto:{organizer}\n\
+         ATTENDEE;CUTYPE=ROOM;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{room}\n\
+         END:VEVENT\nEND:VCALENDAR\n"
+    );
+    let message_id = format!("app73-{}@external.test", std::process::id());
+    let message = format!(
+        "Authentication-Results: {authserv}; spf=pass smtp.mailfrom=external.test;\n \
+         dkim=pass header.d=external.test; dmarc=pass header.from=external.test\n\
+         From: Carol <{organizer}>\nTo: <{room}>\nSubject: Invitation: External booking\n\
+         Message-ID: <{message_id}>\nDate: Thu, 12 Nov 2026 10:00:00 +0000\n\
+         MIME-Version: 1.0\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\n\n{ics}"
+    );
+    smtp_send(smtp, organizer, &room, &message).await;
+
+    // Письмо доставлено в ящик ресурса, приём iTIP его отбросил (решение 123).
+    let query = DeliveryQuery {
+        message_id: Some(message_id.clone()),
+        ..DeliveryQuery::all(20)
+    };
+    let until = deadline();
+    let itip = loop {
+        let log = DeliveryLog::search(&meta, tenant, &query)
+            .await
+            .expect("delivery log");
+        let delivered = log
+            .events
+            .iter()
+            .any(|e| e.kind == DeliveryEventKind::Deliver);
+        let itip: Vec<_> = log
+            .events
+            .iter()
+            .filter(|e| e.kind == DeliveryEventKind::Itip)
+            .cloned()
+            .collect();
+        if delivered && !itip.is_empty() {
+            break itip;
+        }
+        retry(until, "доставка и приём iTIP в журнале доставки").await;
+    };
+    assert_eq!(itip.len(), 1, "{itip:?}");
+    assert_eq!(itip[0].decision, DeliveryDecision::Discard, "{itip:?}");
+    // Ответа нет: в очереди исходящей почты организатору пусто.
+    assert_eq!(
+        queued(&pool, organizer).await,
+        0,
+        "ответ внешнему организатору"
+    );
+    // Брони в календаре ресурса нет.
+    for c in DavStore::list_collections(&meta, room_scope, CollectionKind::Calendar)
+        .await
+        .expect("calendars")
+    {
+        let booked = DavStore::object_by_uid(&meta, room_scope, c.id, uid)
+            .await
+            .expect("object");
+        assert!(booked.is_none(), "бронь внешнего организатора: {booked:?}");
+    }
+
+    pool.close().await;
+    shutdown.cancel();
+    let report = running.wait().await.expect("report");
+    assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
 // ---------- APP-34: метрики Д.7 ----------
 
 /// `/metrics` узла с шиной LISTEN/NOTIFY содержит показатели критериев Д.7: пул СУБД, слушатель, время фиксаций
@@ -2614,5 +2834,233 @@ async fn gal_without_ldap() {
     let report = running.wait().await.expect("wait");
     assert!(report.failed.is_empty(), "{report:?}");
     pool.close().await;
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- APP-72: уведомления об общем доступе в PostgreSQL ----------
+
+/// Узел только с ролью jmap над базой `db_url`; `node` — идентификатор узла в кластере (у двух узлов — разные).
+async fn jmap_node(
+    dir: &Path,
+    db_url: &str,
+    domain: &str,
+    node: &str,
+    secrets: &Arc<MemSecretStore>,
+) -> (Running, CancellationToken) {
+    let path = dir.join("config.yaml");
+    let text = config(dir, db_url, domain)
+        .replace("roles: [all]", "roles: [jmap]")
+        .replace(
+            &format!("node_id: e2e-{}", std::process::id()),
+            &format!("node_id: {node}"),
+        );
+    assert!(text.contains("roles: [jmap]"), "{text}");
+    assert!(text.contains(&format!("node_id: {node}")), "{text}");
+    std::fs::write(&path, text).expect("config");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    (running, shutdown)
+}
+
+/// Остановка узла без сбоев ролей.
+async fn stop_node(running: Running, shutdown: CancellationToken) {
+    shutdown.cancel();
+    let report = running.wait().await.expect("report");
+    assert!(report.failed.is_empty(), "{report:?}");
+}
+
+/// Вызов JMAP с capability общего доступа (`principals` — методы `ShareNotification`).
+async fn share_call(web: std::net::SocketAddr, auth: &str, method: &str, args: Value) -> Value {
+    let req = json!({
+        "using": [
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:calendars",
+            "urn:ietf:params:jmap:principals",
+        ],
+        "methodCalls": [[method, args, "c0"]],
+    });
+    let (code, body) = http(
+        web,
+        "POST",
+        "/jmap/api",
+        &format!("Basic {auth}"),
+        Some(&req),
+    )
+    .await;
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let resp: Value = serde_json::from_slice(&body).expect("json");
+    let call = &resp["methodResponses"][0];
+    assert_eq!(call[0], method, "{resp}");
+    call[1].clone()
+}
+
+/// `ShareNotification` из `PgMeta` (APP-72, JMAP-46): выдача прав на календарь через JMAP записывает получателю
+/// уведомление; оно читается `ShareNotification/get` после перезапуска узла и на втором узле с той же базой, а
+/// `/set destroy` на одном узле убирает его на другом (`/changes` — `destroyed`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn share_notifications_across_nodes() {
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    // У каждого узла свой каталог (индексы поиска, BLOB); общая — только база.
+    let dir_a = tempfile::tempdir().expect("tempdir");
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = node_secrets(password);
+    let domain = "example.ru".to_owned();
+    let pid = std::process::id();
+    let node_a = format!("app72-a-{pid}");
+    let (running, shutdown) = jmap_node(dir_a.path(), &db_url, &domain, &node_a, &secrets).await;
+
+    let pool = db_pool(&url_db).await;
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let tenant = TenantId::DEFAULT;
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
+    let apps =
+        tp_auth::AppPasswords::new(Arc::new(meta.clone()), tp_auth::PasswordConfig::default())
+            .expect("app passwords");
+    let mut users = Vec::new();
+    for name in ["alice", "bob"] {
+        let login = format!("{name}@{domain}");
+        let account = meta
+            .upsert(
+                tenant,
+                AccountUpsert {
+                    domain: domain_id,
+                    login: login.clone(),
+                    display_name: name.to_owned(),
+                    external_id: None,
+                    enabled: true,
+                    aliases: Vec::new(),
+                    kind: AccountKind::User,
+                    hidden_from_gal: false,
+                    resource_type: None,
+                },
+            )
+            .await
+            .expect("account");
+        let scope = AccountScope {
+            tenant,
+            account: account.id,
+        };
+        let (_, secret) = apps.issue(scope, "e2e").await.expect("issue");
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{login}:{}", secret.expose()));
+        users.push((account.id.to_string(), auth));
+    }
+    let (alice, alice_auth) = users[0].clone();
+    let (bob, bob_auth) = users[1].clone();
+
+    // 1. Владелец создаёт календарь с правом чтения получателю — уведомление получателю в `PgMeta`.
+    let web = addr(&running, "jmap");
+    let r = share_call(
+        web,
+        &alice_auth,
+        "Calendar/set",
+        json!({ "accountId": alice, "create": { "c": {
+            "name": "Команда", "shareWith": { &bob: { "mayReadItems": true } },
+        } } }),
+    )
+    .await;
+    let calendar = r["created"]["c"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("календарь не создан: {r}"))
+        .to_owned();
+    let r = share_call(
+        web,
+        &bob_auth,
+        "ShareNotification/get",
+        json!({ "accountId": bob }),
+    )
+    .await;
+    let list = r["list"].as_array().cloned().unwrap_or_default();
+    assert_eq!(list.len(), 1, "{r}");
+    assert_eq!(list[0]["objectType"], "Calendar", "{r}");
+    assert_eq!(list[0]["objectAccountId"], alice, "{r}");
+    assert_eq!(list[0]["objectId"], calendar, "{r}");
+    assert_eq!(list[0]["name"], "Команда", "{r}");
+    assert_eq!(list[0]["oldRights"], Value::Null, "{r}");
+    assert_eq!(list[0]["newRights"]["mayReadItems"], true, "{r}");
+    assert_eq!(list[0]["changedBy"]["principalId"], alice, "{r}");
+    let notice = list[0]["id"].as_str().expect("id").to_owned();
+    let state = r["state"].clone();
+
+    // 2. Перезапуск узла: уведомление на месте.
+    stop_node(running, shutdown).await;
+    let (running_a, shutdown_a) =
+        jmap_node(dir_a.path(), &db_url, &domain, &node_a, &secrets).await;
+    let web_a = addr(&running_a, "jmap");
+    let r = share_call(
+        web_a,
+        &bob_auth,
+        "ShareNotification/get",
+        json!({ "accountId": bob }),
+    )
+    .await;
+    assert_eq!(r["list"].as_array().map(Vec::len), Some(1), "{r}");
+    assert_eq!(r["list"][0]["id"], notice, "{r}");
+    assert_eq!(r["state"], state, "{r}");
+
+    // 3. Второй узел с той же базой видит то же уведомление.
+    let node_b = format!("app72-b-{pid}");
+    let (running_b, shutdown_b) =
+        jmap_node(dir_b.path(), &db_url, &domain, &node_b, &secrets).await;
+    let web_b = addr(&running_b, "jmap");
+    let r = share_call(
+        web_b,
+        &bob_auth,
+        "ShareNotification/get",
+        json!({ "accountId": bob, "ids": [&notice] }),
+    )
+    .await;
+    assert_eq!(r["list"][0]["id"], notice, "{r}");
+    assert_eq!(r["list"][0]["objectId"], calendar, "{r}");
+    assert_eq!(r["notFound"], json!([]), "{r}");
+
+    // 4. Удаление на первом узле убирает уведомление на втором.
+    let r = share_call(
+        web_a,
+        &bob_auth,
+        "ShareNotification/set",
+        json!({ "accountId": bob, "destroy": [&notice] }),
+    )
+    .await;
+    assert_eq!(r["destroyed"], json!([&notice]), "{r}");
+    let r = share_call(
+        web_b,
+        &bob_auth,
+        "ShareNotification/get",
+        json!({ "accountId": bob, "ids": [&notice] }),
+    )
+    .await;
+    assert_eq!(r["notFound"], json!([&notice]), "{r}");
+    let r = share_call(
+        web_b,
+        &bob_auth,
+        "ShareNotification/changes",
+        json!({ "accountId": bob, "sinceState": state }),
+    )
+    .await;
+    assert_eq!(r["destroyed"], json!([&notice]), "{r}");
+    assert_eq!(r["created"], json!([]), "{r}");
+
+    pool.close().await;
+    stop_node(running_b, shutdown_b).await;
+    stop_node(running_a, shutdown_a).await;
     drop_database(&url, &db_name).await;
 }

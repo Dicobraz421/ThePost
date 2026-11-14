@@ -1,18 +1,19 @@
 //! Приглашения iTIP в письмах (RFC 6047, SRS 4.4): письмо с частью `text/calendar; method=…` локальному получателю
 //! после доставки передаётся приёму iTIP учётной записи (`ItipDelivery`, [`crate::deliver::Delivery::with_itip`]) —
-//! извне (iMIP, SMTP-33) и из почтового клиента (submission, JMAP; решение 78, SMTP-36).
+//! из почтового клиента (submission, JMAP; решение 78, SMTP-36) и извне (iMIP, SMTP-33) с типом отправителя; что
+//! применять, решает приём по матрице решения 123.
 //!
 //! Здесь — только то, что нужно до вызова: часть письма, метод и сверка `From` с участниками. От организатора
 //! (`REQUEST`, `CANCEL`, …) `From` должен совпадать с `ORGANIZER`, от участника (`REPLY`, `COUNTER`, `REFRESH`) — с
 //! одним из `ATTENDEE`, либо с параметром `SENT-BY` такого свойства (RFC 5545 §3.2.18: представитель отправляет от
 //! имени владельца, SMTP-38). Доверие к самому `From` (DMARC у iMIP, принадлежность вошедшей учётной записи у письма
-//! из клиента) и право представителя на адрес владельца проверяет вызывающий. iCalendar целиком не разбирается (это
-//! делает реализация `ItipDelivery` на calcard): из объекта читаются только строки `METHOD`, `ORGANIZER` и
-//! `ATTENDEE`.
+//! из клиента), тип отправителя и право представителя на адрес владельца определяет вызывающий. iCalendar целиком не
+//! разбирается (это делает реализация `ItipDelivery` на calcard): из объекта читаются только строки `METHOD`,
+//! `ORGANIZER` и `ATTENDEE`.
 
 use std::collections::BTreeSet;
 
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::{HeaderName, MessageParser, MimeHeaders};
 use tp_contracts::schedule::ItipMethod;
 
 /// Сообщение iTIP из письма, `From` которого совпал с организатором или участником либо с его `SENT-BY`.
@@ -45,6 +46,11 @@ pub(crate) fn extract(raw: &[u8]) -> Option<Result<Imip, &'static str>> {
     })?;
     Some((|| {
         let method: ItipMethod = param.parse().map_err(|_| "неизвестный метод iTIP")?;
+        // Ровно один заголовок `From` (SMTP-48): разбор здесь берёт один из них, а DMARC (mail-auth) — адреса всех,
+        // и проверенный DMARC `From` разошёлся бы с применённым.
+        if msg.header_values(HeaderName::From).nth(1).is_some() {
+            return Err("у письма не один заголовок From");
+        }
         // Ровно один адрес `From`: DMARC и права отправки проверяют один адрес, а не выбор из нескольких.
         let from = msg
             .from()
@@ -254,6 +260,20 @@ mod tests {
             extract(mail("REPLY", &two).as_bytes()),
             Some(Err("отправитель письма — SENT-BY нескольких адресов"))
         );
+    }
+
+    #[test]
+    fn several_from_headers() {
+        // Второй заголовок `From` — даже с тем же адресом: применяется только письмо с одним заголовком.
+        for extra in ["org@example.com", "mallory@example.net"] {
+            let raw =
+                mail("REQUEST", REQUEST).replacen("To: ", &format!("From: {extra}\r\nTo: "), 1);
+            assert_eq!(
+                extract(raw.as_bytes()),
+                Some(Err("у письма не один заголовок From")),
+                "{extra}"
+            );
+        }
     }
 
     #[test]

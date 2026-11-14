@@ -7,14 +7,22 @@
 //!
 //! - принято — событие в календаре ресурса с `PARTSTAT=ACCEPTED`, под вопросом (без автоматического принятия) — с
 //!   `TENTATIVE` до решения представителя ресурса (DAV-18); отклонено — события в календаре ресурса нет;
-//! - организатору — `REPLY` от адреса ресурса с тем же статусом, у отказа — `COMMENT` с причиной: учётной записи
-//!   организации — в календарь ([`crate::ItipInbox`]), внешнему — письмом iMIP (`BookingDeps::sender`).
+//! - организатору — `REPLY` от адреса ресурса с тем же статусом, у отказа — `COMMENT` с причиной, в его календарь
+//!   ([`crate::ItipInbox`]).
 //!
 //! Решение принимается для новой встречи и для перенесённой ([`crate::itip::rescheduled`]): прежняя бронь этой встречи
-//! снимается до чтения занятости, чтобы не пересекаться сама с собой. Правка без переноса сохраняет прежний статус, ответ
-//! не отправляется. Сообщение только с исключениями ряда, правила не заданы, получатель — не ресурс — обычный приём
-//! iTIP. Организатор вне организации бронировать не может ([`BookingPolicy::allows`]); группы организатора для
-//! [`Bookers::Only`] раскрываются ([`GroupStore::expand`]).
+//! снимается до чтения занятости, чтобы не пересекаться сама с собой, — только если приглашение от того же
+//! организатора и не устарело (`SEQUENCE`); иначе бронь не трогается и приглашение не применяется (DAV-40). Правка
+//! без переноса сохраняет прежний статус, ответ не отправляется. Сообщение только с исключениями ряда, правила не
+//! заданы, получатель — не ресурс — обычный приём iTIP. Группы организатора для [`Bookers::Only`] раскрываются
+//! ([`GroupStore::expand`]).
+//!
+//! Бронирование — только внутри организации (решение 123, DAV-43): кому можно писать ресурсу, решает матрица
+//! [`inbound_allowed`](tp_contracts::schedule::inbound_allowed) (действие `Booking` — только [`SenderKind::Own`]:
+//! CalDAV, JMAP, почтовый клиент), её проверяет [`crate::ItipInbox`] до решения. Организатор приглашения — ещё и
+//! включённая учётная запись организации ресурса; иначе — только письмо: брони нет, ответа нет (`Ignored`).
+//!
+//! [`SenderKind::Own`]: tp_contracts::schedule::SenderKind::Own
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -29,7 +37,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use tp_contracts::dav::{DavStore, Precondition};
 use tp_contracts::groups::GroupStore;
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AddressTarget};
-use tp_contracts::schedule::{FreeBusy, ItipMessage, ItipSender, Period};
+use tp_contracts::schedule::{FreeBusy, ItipMessage, Period};
 use tp_contracts::sharing::{
     Bookers, BookingDecision, BookingPeriod, BookingPolicy, BookingRequest, DeclineReason,
     ResourceStore,
@@ -51,24 +59,31 @@ pub struct BookingDeps {
     pub freebusy: Arc<dyn FreeBusy>,
     /// Группы рассылки: группы организатора для [`Bookers::Only`].
     pub group_store: Arc<dyn GroupStore>,
-    /// Ответ внешнему организатору письмом iMIP; `None` — внешнему ответ не отправляется.
-    pub sender: Option<Arc<dyn ItipSender>>,
 }
 
 impl std::fmt::Debug for BookingDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BookingDeps")
-            .field("imip", &self.sender.is_some())
-            .finish_non_exhaustive()
+        f.debug_struct("BookingDeps").finish_non_exhaustive()
     }
+}
+
+/// Итог [`BookingDeps::decide`].
+#[derive(Debug, Clone)]
+pub(crate) enum Verdict {
+    /// Обычный приём iTIP: правила не заданы, только исключения ряда, правка без переноса.
+    Regular,
+    /// Только письмо (решение 123): ни брони, ни ответа; причина — для журнала.
+    Refused(&'static str),
+    /// Решение ресурса.
+    Booked(Booking),
 }
 
 /// Решение ресурса по приглашению.
 #[derive(Debug, Clone)]
 pub(crate) struct Booking {
     pub decision: BookingDecision,
-    /// Учётная запись организатора; `None` — внешний.
-    pub organizer: Option<AccountId>,
+    /// Учётная запись организатора — ответ ей в календарь.
+    pub organizer: AccountId,
 }
 
 impl Booking {
@@ -95,8 +110,17 @@ pub(crate) fn reason_text(reason: DeclineReason) -> &'static str {
 }
 
 impl BookingDeps {
-    /// Решение по приглашению `it` ресурсу `msg.recipient` с адресом `to`; `None` — обычный приём (не ресурс, правила
-    /// не заданы, только исключения ряда, правка без переноса). Прежняя бронь перенесённой встречи снимается.
+    /// Получатель `scope` — ресурс ([`AccountKind::Resource`]); нет учётной записи — нет.
+    pub(crate) async fn is_resource(&self, scope: AccountScope) -> Result<bool> {
+        Ok(self
+            .accounts
+            .get(scope.tenant, scope.account)
+            .await?
+            .is_some_and(|a| a.kind == AccountKind::Resource))
+    }
+
+    /// Решение по приглашению (`REQUEST`) `it` ресурсу `msg.recipient` с адресом `to` ([`Verdict`]); что отправителю
+    /// можно бронировать, проверил вызывающий ([`crate::ItipInbox`]). Прежняя бронь перенесённой встречи снимается.
     pub(crate) async fn decide(
         &self,
         store: &dyn DavStore,
@@ -104,16 +128,10 @@ impl BookingDeps {
         msg: &ItipMessage,
         it: &Itip,
         to: &str,
-    ) -> Result<Option<Booking>> {
+    ) -> Result<Verdict> {
         let scope = msg.recipient;
-        let Some(account) = self.accounts.get(scope.tenant, scope.account).await? else {
-            return Ok(None);
-        };
-        if account.kind != AccountKind::Resource {
-            return Ok(None);
-        }
         let Some(policy) = self.resources.booking_policy(scope).await? else {
-            return Ok(None);
+            return Ok(Verdict::Regular);
         };
         let master = it
             .ical
@@ -121,20 +139,24 @@ impl BookingDeps {
             .iter()
             .any(|c| itip::is_sched(c) && itip::recurrence_id(c).is_none());
         if !master || !it.meeting.event {
-            return Ok(None);
+            return Ok(Verdict::Regular);
         }
         let existing = deliver::find_uid(store, scope, &it.meeting.uid).await?;
-        if let Some(o) = &existing
-            && let Ok(old) = ICalendar::parse(&o.body)
-        {
+        if let Some(o) = &existing {
+            // Чужой организатор или устаревший `SEQUENCE`: бронь не трогается, ответа нет — обычный приём отказывает
+            // с той же причиной (DAV-40). Иначе знающий UID чужой встречи снял бы её бронь своим приглашением.
+            let Ok(old) = deliver::replaceable(o, it) else {
+                return Ok(Verdict::Regular);
+            };
             let answered = itip::meeting(&old)
                 .and_then(|m| m.attendee(to).map(|a| a.partstat != itip::NEEDS_ACTION))
                 .unwrap_or(false);
             if answered && !itip::rescheduled(&old, &it.ical) {
-                return Ok(None);
+                return Ok(Verdict::Regular);
             }
         }
         let now = OffsetDateTime::now_utc();
+        // Организатор — включённая учётная запись организации ресурса; иначе ни брони, ни ответа.
         let organizer = match it.meeting.organizer.as_deref() {
             Some(addr) => match self.accounts.by_address(scope.tenant, addr).await? {
                 Some(AddressTarget::Account(a)) if a.enabled => Some(a.id),
@@ -142,10 +164,13 @@ impl BookingDeps {
             },
             None => None,
         };
+        let Some(organizer) = organizer else {
+            return Ok(Verdict::Refused("организатор вне организации ресурса"));
+        };
         let organizer_groups = self.groups_of(scope, organizer, &policy).await?;
         let (periods, unbounded) = periods(&it.ical, &policy, cfg.max_instances);
         let request = BookingRequest {
-            organizer,
+            organizer: Some(organizer),
             organizer_groups,
             periods,
             unbounded,
@@ -173,7 +198,7 @@ impl BookingDeps {
         };
         let decision = policy.decide(&request, &busy, now);
         tracing::info!(?decision, "DAV: решение ресурса по приглашению");
-        Ok(Some(Booking {
+        Ok(Verdict::Booked(Booking {
             decision,
             organizer,
         }))
@@ -183,11 +208,11 @@ impl BookingDeps {
     async fn groups_of(
         &self,
         scope: AccountScope,
-        organizer: Option<AccountId>,
+        organizer: AccountId,
         policy: &BookingPolicy,
     ) -> Result<BTreeSet<tp_contracts::GroupId>> {
         let mut out = BTreeSet::new();
-        let (Some(organizer), Bookers::Only { groups, .. }) = (organizer, &policy.bookers) else {
+        let Bookers::Only { groups, .. } = &policy.bookers else {
             return Ok(out);
         };
         for g in groups {

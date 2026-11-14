@@ -777,6 +777,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/orgs/{org}/queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Записи очереди организации по возрастанию идентификатора. Есть продолжение — заголовок
+         *     `Link: <…&after=…>; rel="next"` (RFC 8288), нет заголовка — страница последняя.
+         */
+        get: operations["list_queue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/orgs/{org}/queue/{id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Повтор доставки «сейчас»: срок попытки всех получателей без конечного статуса — момент запроса, отложенное
+         *     письмо выпускается. Запись доставляется (действует лиза) — 409: попытка уже идёт, срок не перенесён.
+         */
+        post: operations["retry_queue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/orgs/{org}/resources": {
         parameters: {
             query?: never;
@@ -1834,6 +1874,64 @@ export interface components {
          * @enum {string}
          */
         PurgeMode: "hide" | "erase";
+        /** @description Запись очереди исходящей почты. */
+        QueueEntry: {
+            /** @description Отправитель конверта; пустой — уведомление о недоставке. */
+            from: string;
+            /** @description Запись (UUID). */
+            id: string;
+            /**
+             * Format: date-time
+             * @description Ближайший срок попытки среди получателей без конечного статуса.
+             */
+            next_attempt: string;
+            /**
+             * Format: date-time
+             * @description Момент постановки (для отложенного письма — срок выпуска, если он позже).
+             */
+            queued_at: string;
+            /** @description Получатели в порядке постановки. */
+            rcpts: components["schemas"]["QueueRcptInfo"][];
+            /**
+             * Format: int64
+             * @description Размер письма, байт.
+             */
+            size: number;
+            /** @description Состояние в момент запроса. */
+            status: components["schemas"]["QueueStatus"];
+        };
+        /** @description Получатель записи очереди. */
+        QueueRcptInfo: {
+            /** @description Адрес (`RCPT TO`). */
+            address: string;
+            /**
+             * Format: int32
+             * @description Число неудачных попыток.
+             */
+            attempts: number;
+            /** @description Причина последней неудачи. */
+            last_error?: string | null;
+            /**
+             * Format: date-time
+             * @description Срок следующей попытки (для `pending`).
+             */
+            next_attempt?: string | null;
+            /** @description Ответ принимающего сервера или причина отказа (для `delivered` и `failed`). */
+            reply?: string | null;
+            /** @description Состояние. */
+            status: components["schemas"]["QueueRcptStatus"];
+        };
+        /**
+         * @description Состояние получателя: `pending` — ждёт попытки, `delivered` — доставлено, `failed` — окончательный отказ.
+         * @enum {string}
+         */
+        QueueRcptStatus: "pending" | "delivered" | "failed";
+        /**
+         * @description Состояние записи очереди: `ready` — ждёт первой попытки (в том числе отложенная отправка), `retry` — ждёт повтора
+         *     после временной неудачи, `active` — доставляется (действует лиза узла smtp-out).
+         * @enum {string}
+         */
+        QueueStatus: "ready" | "retry" | "active";
         /** @description Использование квоты. */
         QuotaInfo: {
             /**
@@ -5341,6 +5439,133 @@ export interface operations {
                 };
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_queue: {
+        parameters: {
+            query?: {
+                /** @description Только записи в этом состоянии: `ready`, `retry`, `active`. */
+                status?: components["schemas"]["QueueStatus"];
+                /** @description Только записи, у которых отправитель или получатель содержит эту строку (без учёта регистра). */
+                address?: string;
+                /** @description Размер страницы (по умолчанию и наибольший — из конфигурации). */
+                limit?: number;
+                /** @description Продолжение после этой записи — `after` из ссылки `rel="next"` предыдущей страницы. */
+                after?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    /** @description Следующая страница очереди: `<ссылка>; rel="next"`; нет — страница последняя */
+                    Link?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueueEntry"][];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    retry_queue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Организация (UUID) */
+                org: string;
+                /** @description Запись очереди (UUID) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

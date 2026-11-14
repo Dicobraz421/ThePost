@@ -820,6 +820,10 @@ pub struct ShareNotificationChanges {
     pub has_more: bool,
 }
 
+/// Предел числа уведомлений учётной записи (CTR-90): сверх него [`ShareNotificationStore::record`] вытесняет
+/// старшие.
+pub const MAX_NOTICES: usize = 1000;
+
 /// Уведомления получателям об изменении их прав на коллекции (CTR-86; JMAP `ShareNotification`). Уведомление
 /// записывает вызывающий, изменивший права ([`CollectionAcl::set_collection_acl`]), — каждой учётной записи, чьи права
 /// изменились; видит его только получатель. Общие для узлов и переживают перезапуск. Удаление учётной записи удаляет
@@ -827,7 +831,9 @@ pub struct ShareNotificationChanges {
 #[async_trait]
 pub trait ShareNotificationStore: Send + Sync + 'static {
     /// Записывает уведомление получателю `recipient`. Недопустимое ([`ShareNotification::validate`]) — `Error::Invalid`;
-    /// идентификатор занят у получателя — `Error::Conflict`. Возвращает новое состояние.
+    /// идентификатор занят у получателя — `Error::Conflict`. Сверх [`MAX_NOTICES`] у получателя вытесняются старшие
+    /// по (`created`, `id`), в том числе записанное, если оно старше всех: вытеснение — удаление (шаг состояния,
+    /// `destroyed` в изменениях). Возвращает новое состояние (после вытеснения).
     async fn record(&self, recipient: AccountScope, notification: ShareNotification)
     -> Result<u64>;
 

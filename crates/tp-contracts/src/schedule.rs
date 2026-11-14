@@ -121,16 +121,90 @@ impl FromStr for ItipMethod {
     }
 }
 
-/// Откуда пришло сообщение iTIP.
+/// Кто отправитель сообщения iTIP относительно организации получателя (решение 123) — первый аргумент матрицы
+/// [`inbound_allowed`]. Своя организация — по входу в систему, а не по домену `From`; остальные — по домену `From`
+/// письма через smtp-in (домен и его поддомены).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ItipSource {
-    /// Планирование внутри организации: отправитель — адрес учётной записи организации. Источники — `tp-dav`, `tp-jmap`
-    /// и приглашение из почтового клиента (submission, JMAP `EmailSubmission`; решение 78, SMTP-36), если `From` письма
-    /// принадлежит вошедшей учётной записи (свой адрес, псевдоним, право Send As); иначе письмо остаётся письмом.
-    Internal,
-    /// Письмо iMIP (RFC 6047, `tp-smtp`): отправитель — адрес `From`, прошедший DMARC.
-    Imip,
+pub enum SenderKind {
+    /// Своя организация — вошедший в систему: CalDAV и JMAP (`tp-dav`, `tp-jmap`) и письмо из почтового клиента
+    /// (submission со входом, JMAP `EmailSubmission`; решение 78, SMTP-36), `From` которого принадлежит вошедшей
+    /// учётной записи (свой адрес, псевдоним, право Send As или Send on Behalf).
+    Own,
+    /// Домен-партнёр организации получателя — официально заведённые доверительные отношения в политике организации
+    /// (письмо iMIP через smtp-in, прошедшее DMARC).
+    Partner,
+    /// Другая организация той же установки (MSSP), не партнёр.
+    Neighbor,
+    /// Остальные, в том числе письмо через smtp-in с адресом своей организации: DMARC проходит и сторонний сервис,
+    /// разрешённый в SPF или DKIM домена.
+    External,
+}
+
+/// Что сообщение iTIP делает у получателя — второй аргумент матрицы [`inbound_allowed`]. Каждая клетка — отдельное
+/// решение «кто — что»; содержательные проверки (UID, `ORGANIZER`, `ATTENDEE`, `SEQUENCE`) — у приёма, сверх неё.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundAction {
+    /// Новое приглашение (`REQUEST`) сотруднику: события с этим UID у получателя нет (или оно не того организатора, или
+    /// `SEQUENCE` не больше).
+    Invite,
+    /// Обновление (`REQUEST`) события, уже внесённого в календарь сотрудника: тот же `ORGANIZER`, `SEQUENCE` строго
+    /// больше, чем у события получателя (как у Exchange).
+    Update,
+    /// Ответ участника (`REPLY`) на событие нашего организатора: статус участника в событии организатора.
+    Reply,
+    /// Отмена (`CANCEL`) события в календаре сотрудника от его организатора.
+    Cancel,
+    /// Прочие методы у сотрудника: `ADD`, `REFRESH`, `COUNTER`, `DECLINECOUNTER` (`PUBLISH` не применяется никогда).
+    Other,
+    /// Любое сообщение ресурсу (переговорной, оборудованию): бронирование и ответ ресурса организатору.
+    Booking,
+}
+
+impl InboundAction {
+    /// Действие сообщения `method` получателю; `resource` — получатель — ресурс; `update` — `REQUEST` к событию,
+    /// уже внесённому в календарь получателя, того же `ORGANIZER` и со строго большим `SEQUENCE` (определяет приём).
+    pub const fn of(method: ItipMethod, resource: bool, update: bool) -> Self {
+        match method {
+            _ if resource => InboundAction::Booking,
+            ItipMethod::Request if update => InboundAction::Update,
+            ItipMethod::Request => InboundAction::Invite,
+            ItipMethod::Reply => InboundAction::Reply,
+            ItipMethod::Cancel => InboundAction::Cancel,
+            _ => InboundAction::Other,
+        }
+    }
+}
+
+/// Матрица «кто — что» приёма iTIP (решение 123, «Снаружи — только почта») — единственное место решения «применять,
+/// бронировать, отвечать»; позже — настройка администратора (политика или Sieve) с этими значениями по умолчанию.
+///
+/// | Отправитель \ действие | `Invite` | `Update` | `Reply` | `Cancel` | `Other` | `Booking` |
+/// |---|---|---|---|---|---|---|
+/// | `Own` — своя организация (вошедший) | да | да | да | да | да | да |
+/// | `Partner` — домен-партнёр | нет¹ | да | да | да | нет | нет |
+/// | `Neighbor` — соседняя организация установки | нет | да | да | да | нет | нет |
+/// | `External` — внешний | нет | да | да | да | нет | нет |
+///
+/// «Нет» — письмо остаётся письмом: ни события, ни брони, ни ответа. `Update`, `Reply` и `Cancel` извне — как у
+/// Exchange и Google: только к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2) — обновление и отмена от
+/// организатора события (тот же `ORGANIZER`, у обновления `SEQUENCE` строго больше) получателю из `ATTENDEE`, `REPLY`
+/// от участника этого события его организатору; UID совпадает, письмо прошло DMARC; проверяет приём. ¹ Новое
+/// приглашение партнёра — письмом, пока администратор не включит автодобавление (настройки ещё нет).
+pub const fn inbound_allowed(sender: SenderKind, action: InboundAction) -> bool {
+    use InboundAction::{Booking, Cancel, Invite, Other, Reply, Update};
+    match (sender, action) {
+        (SenderKind::Own, _) => true,
+        (
+            SenderKind::Partner | SenderKind::Neighbor | SenderKind::External,
+            Update | Reply | Cancel,
+        ) => true,
+        (
+            SenderKind::Partner | SenderKind::Neighbor | SenderKind::External,
+            Invite | Other | Booking,
+        ) => false,
+    }
 }
 
 /// Сообщение iTIP одному получателю — учётной записи организации.
@@ -140,14 +214,14 @@ pub struct ItipMessage {
     pub recipient: AccountScope,
     /// Адрес получателя (`ATTENDEE` или `ORGANIZER` в сообщении; у iMIP — получатель конверта без подадреса).
     pub to: String,
-    /// Адрес отправителя, проверенный вызывающим ([`ItipSource`]); сверяется с `ORGANIZER` или `ATTENDEE`.
+    /// Адрес отправителя, проверенный вызывающим ([`SenderKind`]); сверяется с `ORGANIZER` или `ATTENDEE`.
     pub from: String,
     /// Метод (`METHOD` объекта; у iMIP — и параметр `method` части `text/calendar`).
     pub method: ItipMethod,
     /// Объект iCalendar как получен.
     pub ics: String,
-    /// Источник.
-    pub source: ItipSource,
+    /// Кто отправитель относительно организации получателя; что ему можно — [`inbound_allowed`].
+    pub sender: SenderKind,
 }
 
 impl ItipMessage {
@@ -468,6 +542,38 @@ mod tests {
     }
 
     #[test]
+    fn inbound_matrix() {
+        use InboundAction::{Booking, Cancel, Invite, Other, Reply, Update};
+        use SenderKind::{External, Neighbor, Own, Partner};
+        for action in [Invite, Update, Reply, Cancel, Other, Booking] {
+            assert!(inbound_allowed(Own, action));
+            for sender in [Partner, Neighbor, External] {
+                assert_eq!(
+                    inbound_allowed(sender, action),
+                    matches!(action, Update | Reply | Cancel),
+                    "{sender:?} {action:?}"
+                );
+            }
+        }
+        assert_eq!(InboundAction::of(ItipMethod::Request, false, false), Invite);
+        assert_eq!(InboundAction::of(ItipMethod::Request, false, true), Update);
+        assert_eq!(InboundAction::of(ItipMethod::Reply, false, false), Reply);
+        assert_eq!(InboundAction::of(ItipMethod::Cancel, false, false), Cancel);
+        for m in ItipMethod::ALL {
+            assert_eq!(InboundAction::of(m, true, true), Booking);
+            assert_eq!(InboundAction::of(m, true, false), Booking);
+        }
+        for m in [
+            ItipMethod::Add,
+            ItipMethod::Refresh,
+            ItipMethod::Counter,
+            ItipMethod::DeclineCounter,
+        ] {
+            assert_eq!(InboundAction::of(m, false, false), Other);
+        }
+    }
+
+    #[test]
     fn addresses() {
         assert!(valid_address("anna@example.org"));
         for bad in [
@@ -492,7 +598,7 @@ mod tests {
             from: "boss@partner.example".into(),
             method: ItipMethod::Request,
             ics: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
-            source: ItipSource::Imip,
+            sender: SenderKind::Partner,
         };
         assert_eq!(msg.validate(), Ok(()));
         assert!(

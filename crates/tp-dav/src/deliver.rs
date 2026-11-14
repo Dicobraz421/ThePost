@@ -12,8 +12,17 @@
 //!
 //! Применённое сообщение во входящих CalDAV не остаётся; при `dav.schedule_keep_processed` оно хранится для ленты
 //! уведомлений JMAP с именем [`PROCESSED_PREFIX`] и удаляется по сроку ([`ItipInbox::purge_processed`]). Защита:
-//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REPLY` — только от адреса
-//! участника события и только организатору; меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
+//! `REQUEST`, `ADD` и `CANCEL` — только от организатора сообщения и события с тем же UID, `REQUEST` и `ADD` — только
+//! получателю из `ATTENDEE` сообщения (DAV-41), `REPLY` — только от адреса участника события и только организатору;
+//! меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
+//!
+//! Снаружи — только почта (решение 123, DAV-43): что применять, бронировать и на что отвечать, решает одно место —
+//! матрица [`inbound_allowed`] от типа отправителя ([`SenderKind`], определяет вызывающий) и действия
+//! ([`InboundAction::of`]: метод и получатель-ресурс). Не разрешено — `Ignored`: ни события, ни брони, ни ответа. По
+//! умолчанию своей организации — всё; извне (партнёр, соседняя организация установки, внешний) — только обновление,
+//! `REPLY` и `CANCEL` к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2): обновление (`REQUEST`, тот же
+//! `ORGANIZER`, `SEQUENCE` строго больше) и отмена — от организатора события получателю из `ATTENDEE`, ответ — от
+//! участника события его организатору; новое приглашение, прочие методы и любое сообщение ресурсу — письмом. `REFRESH` — только от участника события, организатор которого — получатель (RFC 5546 §6.1.6).
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
 //!
@@ -35,12 +44,13 @@ use tp_contracts::dav::{
 };
 use tp_contracts::meta::AccountScope;
 use tp_contracts::schedule::{
-    InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, ItipOutgoing, ItipSource,
+    InboundAction, InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, SenderKind,
+    inbound_allowed,
 };
 use tp_contracts::sharing::BookingDecision;
 use tp_contracts::{Error, Result};
 
-use crate::booking::{self, Booking, BookingDeps};
+use crate::booking::{self, Booking, BookingDeps, Verdict};
 use crate::config::DavConfig;
 use crate::index;
 use crate::itip::{self, Itip};
@@ -148,6 +158,28 @@ pub(crate) async fn find_uid(
         }
     }
     Ok(None)
+}
+
+/// Объект `existing` можно заменить приглашением `it` (`REQUEST`): у него тот же организатор, `SEQUENCE` приглашения
+/// не меньше. Возвращает разобранный объект; иначе — причина отказа. Проверка — до любого изменения календаря
+/// получателя, в том числе до снятия прежней брони ресурса ([`crate::booking`], DAV-40).
+pub(crate) fn replaceable(
+    existing: &DavObject,
+    it: &Itip,
+) -> std::result::Result<ICalendar, &'static str> {
+    let Some((ical, m)) = ICalendar::parse(&existing.body)
+        .ok()
+        .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
+    else {
+        return Err("чужой UID организатора");
+    };
+    if m.organizer != it.meeting.organizer {
+        return Err("чужой UID организатора");
+    }
+    if it.meeting.sequence < m.sequence {
+        return Err("устаревший SEQUENCE");
+    }
+    Ok(ical)
 }
 
 fn hash(parts: &[&str]) -> String {
@@ -336,23 +368,9 @@ impl ItipInbox {
         attempt: usize,
         forced: Option<&ICalendarParticipationStatus>,
     ) -> Result<Step> {
-        let old = match existing {
-            None => None,
-            Some(o) => {
-                let Some((ical, m)) = ICalendar::parse(&o.body)
-                    .ok()
-                    .and_then(|i| itip::meeting(&i).map(|m| (i, m)))
-                else {
-                    return ignored("чужой UID организатора");
-                };
-                if m.organizer != it.meeting.organizer {
-                    return ignored("чужой UID организатора");
-                }
-                if it.meeting.sequence < m.sequence {
-                    return ignored("устаревший SEQUENCE");
-                }
-                Some(ical)
-            }
+        let old = match existing.map(|o| replaceable(o, it)).transpose() {
+            Ok(old) => old,
+            Err(reason) => return ignored(reason),
         };
         let mut msg = it.ical.clone();
         if let Some(root) = msg.components.first_mut() {
@@ -657,10 +675,45 @@ impl ItipDelivery for ItipInbox {
         if !sender_ok {
             return refuse("отправитель не организатор и не участник");
         }
-        let booked = match (&self.booking, it.method) {
-            (Some(b), ItipMethod::Request) => {
-                b.decide(self.store.as_ref(), &self.cfg, msg, &it, &to)
+        // Получателя нет среди участников (DAV-41): в календарь не кладётся — иначе любой внешний отправитель с DMARC
+        // pass вносил бы события в чужие календари; письмо остаётся письмом.
+        if matches!(it.method, ItipMethod::Request | ItipMethod::Add)
+            && it.meeting.attendee(&to).is_none()
+        {
+            return refuse("получатель не участник встречи");
+        }
+        // REFRESH — только от участника существующего события, организатор которого — получатель (RFC 5546 §6.1.6).
+        if it.method == ItipMethod::Refresh
+            && !self.attendee_of_own(msg.recipient, &it, &from, &to).await?
+        {
+            return refuse("REFRESH не от участника события");
+        }
+        // Отмена не своей организации — тоже только участнику.
+        if msg.sender != SenderKind::Own
+            && it.method == ItipMethod::Cancel
+            && it.meeting.attendee(&to).is_none()
+        {
+            return refuse("получатель не участник встречи");
+        }
+        let resource = match &self.booking {
+            Some(b) => b.is_resource(msg.recipient).await?,
+            None => false,
+        };
+        let update = it.method == ItipMethod::Request && self.update_of(msg.recipient, &it).await?;
+        // Решение 123: «кто — что» — только здесь, по матрице.
+        if !inbound_allowed(msg.sender, InboundAction::of(it.method, resource, update)) {
+            return refuse("отправителю не разрешено (решение 123)");
+        }
+        let booked = match &self.booking {
+            Some(b) if resource && it.method == ItipMethod::Request => {
+                match b
+                    .decide(self.store.as_ref(), &self.cfg, msg, &it, &to)
                     .await?
+                {
+                    Verdict::Regular => None,
+                    Verdict::Refused(reason) => return refuse(reason),
+                    Verdict::Booked(b) => Some(b),
+                }
             }
             _ => None,
         };
@@ -692,12 +745,43 @@ impl ItipDelivery for ItipInbox {
 }
 
 impl ItipInbox {
-    /// Ответ ресурса `to` организатору приглашения `it` по решению `b` ([`crate::booking`]): учётной записи
-    /// организации — в календарь, внешнему — письмом iMIP. Сбой ответа — в журнал, решение остаётся.
-    async fn answer(&self, msg: &ItipMessage, it: &Itip, to: &str, b: &Booking) {
-        let Some(deps) = &self.booking else {
-            return;
+    /// У получателя `scope` с адресом `to` есть событие с UID сообщения `it`, его организатор — `to`, а `from` — его
+    /// участник.
+    async fn attendee_of_own(
+        &self,
+        scope: AccountScope,
+        it: &Itip,
+        from: &str,
+        to: &str,
+    ) -> Result<bool> {
+        let Some(o) = find_uid(self.store.as_ref(), scope, &it.meeting.uid).await? else {
+            return Ok(false);
         };
+        Ok(ICalendar::parse(&o.body)
+            .ok()
+            .and_then(|i| itip::meeting(&i))
+            .is_some_and(|m| m.organizer.as_deref() == Some(to) && m.attendee(from).is_some()))
+    }
+
+    /// Приглашение `it` — обновление события, уже внесённого в календарь получателя `scope`: тот же `ORGANIZER`,
+    /// `SEQUENCE` строго больше ([`InboundAction::Update`]).
+    async fn update_of(&self, scope: AccountScope, it: &Itip) -> Result<bool> {
+        let Some(o) = find_uid(self.store.as_ref(), scope, &it.meeting.uid).await? else {
+            return Ok(false);
+        };
+        Ok(ICalendar::parse(&o.body)
+            .ok()
+            .and_then(|i| itip::meeting(&i))
+            .is_some_and(|m| {
+                m.organizer.is_some()
+                    && m.organizer == it.meeting.organizer
+                    && it.meeting.sequence > m.sequence
+            }))
+    }
+
+    /// Ответ ресурса `to` организатору приглашения `it` по решению `b` ([`crate::booking`]) — в календарь его учётной
+    /// записи. Сбой ответа — в журнал, решение остаётся.
+    async fn answer(&self, msg: &ItipMessage, it: &Itip, to: &str, b: &Booking) {
         let Some(organizer) = it.meeting.organizer.clone() else {
             return;
         };
@@ -710,40 +794,18 @@ impl ItipInbox {
                 c.add_property(ICalendarProperty::Comment, booking::reason_text(reason));
             }
         }
-        let ics = reply.to_string();
-        let result = match b.organizer {
-            Some(account) => {
-                let m = ItipMessage {
-                    recipient: AccountScope {
-                        tenant: msg.recipient.tenant,
-                        account,
-                    },
-                    to: organizer,
-                    from: to.to_owned(),
-                    method: ItipMethod::Reply,
-                    ics,
-                    source: ItipSource::Internal,
-                };
-                self.deliver(&m).await.map(|_| ())
-            }
-            None => match &deps.sender {
-                Some(sender) => {
-                    let (subject, text) = crate::imip::describe(ItipMethod::Reply, &reply);
-                    let mail = ItipOutgoing {
-                        sender: msg.recipient,
-                        from: to.to_owned(),
-                        to: vec![organizer],
-                        method: ItipMethod::Reply,
-                        ics,
-                        subject,
-                        text,
-                    };
-                    sender.send(&mail).await.map(|_| ())
-                }
-                None => Ok(()),
+        let m = ItipMessage {
+            recipient: AccountScope {
+                tenant: msg.recipient.tenant,
+                account: b.organizer,
             },
+            to: organizer,
+            from: to.to_owned(),
+            method: ItipMethod::Reply,
+            ics: reply.to_string(),
+            sender: SenderKind::Own,
         };
-        if let Err(e) = result {
+        if let Err(e) = self.deliver(&m).await {
             tracing::warn!(error = %e, "iTIP: ответ ресурса организатору не отправлен");
         }
     }

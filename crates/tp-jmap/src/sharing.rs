@@ -13,21 +13,20 @@
 //!   выдаёт CalDAV, CardDAV, Admin API).
 //! - Выдачу прав проверяет [`SharingAuthorizer::check_grant`]: владелец или субъект с `admin`, в пределах политики
 //!   организации. Отказ — `forbidden`.
-//! - Изменение прав учётной записи записывает ей `ShareNotification` (RFC 9670 §5): `/get`, `/changes`, `/query`,
-//!   `/set` (только `destroy`); `/queryChanges` — `cannotCalculateChanges`.
+//! - Изменение прав учётной записи записывает ей `ShareNotification` (RFC 9670 §5) в
+//!   [`ShareNotificationStore`] (общее для узлов, переживает перезапуск): `/get`, `/changes`, `/query`, `/set`
+//!   (только `destroy`); `/queryChanges` — `cannotCalculateChanges`.
 //!
 //! Отличия:
-//! - `ShareNotification` хранятся в памяти узла (контракта хранилища уведомлений нет): не переживают перезапуск и
-//!   не видны на других узлах; на учётную запись — не больше [`MAX_NOTICES`], старшие вытесняются;
 //! - в чужом аккаунте свойства коллекции (имя, цвет, подписка) меняет только субъект с правом `admin`, создать
 //!   коллекцию нельзя (`mayCreateCalendar`, `mayCreateAddressBook` — `false`), отправка приглашений
 //!   (`sendSchedulingMessages`) — `forbidden`;
 //! - календари по представительству ([`SharingAuthorizer::delegations`]) в аккаунтах JMAP не показываются —
 //!   представитель работает с ними через CalDAV (`calendar-proxy-*`, DAV-18).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -36,10 +35,12 @@ use tp_contracts::auth::Principal;
 use tp_contracts::dav::{
     Collection, CollectionId, CollectionKind, DavObject, DavObjectId, DavStore,
 };
-use tp_contracts::ids::{AccountId, TenantId};
+use tp_contracts::ids::{AccountId, ShareNotificationId};
 use tp_contracts::meta::{AccountScope, Changes};
 use tp_contracts::sharing::{
-    ANYONE, CollectionAcl, CollectionRights, SharedCollection, SharingAuthorizer,
+    ANYONE, CollectionAcl, CollectionRights, ShareChangedBy, ShareNotification,
+    ShareNotificationChanges, ShareNotificationFilter, ShareNotificationStore, SharedCollection,
+    SharedObjectType, SharingAuthorizer,
 };
 use tp_contracts::{Error, ModSeq, Result};
 
@@ -51,9 +52,6 @@ use crate::core::request::{
 use crate::core::{Ctx, Jmap};
 use crate::email_get::utc_date;
 
-/// Наибольшее число `ShareNotification` учётной записи; старшие вытесняются.
-pub(crate) const MAX_NOTICES: usize = 1000;
-
 /// Зависимости общего доступа ([`Jmap::with_sharing`]).
 #[derive(Clone)]
 pub struct SharingDeps {
@@ -61,6 +59,8 @@ pub struct SharingDeps {
     pub authz: Arc<dyn SharingAuthorizer>,
     /// Записи прав на коллекции: `shareWith` и выдача прав, прошедшая [`SharingAuthorizer::check_grant`].
     pub acl: Arc<dyn CollectionAcl>,
+    /// Уведомления получателям об изменении их прав (`ShareNotification`).
+    pub notifications: Arc<dyn ShareNotificationStore>,
 }
 
 impl std::fmt::Debug for SharingDeps {
@@ -264,6 +264,22 @@ impl ObjectType {
         }
     }
 
+    /// Вид по имени типа (`ShareNotification.objectType`); неизвестный — `None`.
+    fn from_name(name: &str) -> Option<Self> {
+        [Self::Calendar, Self::TaskList, Self::AddressBook]
+            .into_iter()
+            .find(|t| t.name() == name)
+    }
+
+    /// Вид общего объекта уведомления.
+    fn shared(self) -> SharedObjectType {
+        match self {
+            Self::Calendar => SharedObjectType::Calendar,
+            Self::TaskList => SharedObjectType::TaskList,
+            Self::AddressBook => SharedObjectType::AddressBook,
+        }
+    }
+
     /// Объект прав JMAP по правам как выданы.
     fn rights(self, r: CollectionRights) -> Value {
         match self {
@@ -295,6 +311,16 @@ impl ObjectType {
             *slot |= on;
         }
         Some(r)
+    }
+}
+
+impl From<SharedObjectType> for ObjectType {
+    fn from(t: SharedObjectType) -> Self {
+        match t {
+            SharedObjectType::Calendar => Self::Calendar,
+            SharedObjectType::TaskList => Self::TaskList,
+            SharedObjectType::AddressBook => Self::AddressBook,
+        }
     }
 }
 
@@ -476,7 +502,8 @@ pub(crate) async fn prepare_share(
     Ok(Ok(grants))
 }
 
-/// Записывает подготовленные права на коллекцию `c` (объект `ty`) и уведомления получателям.
+/// Записывает подготовленные права на коллекцию `c` (объект `ty`) и уведомления получателям
+/// ([`ShareNotificationStore::record`]).
 pub(crate) async fn commit_share(
     ctx: &Ctx<'_>,
     ty: ObjectType,
@@ -490,86 +517,63 @@ pub(crate) async fn commit_share(
         s.acl
             .set_collection_acl(ctx.scope, c.id, &g.login, g.new)
             .await?;
-        let notice = object(json!({
-            "created": utc_date(OffsetDateTime::now_utc()),
-            "changedBy": {
-                "name": ctx.principal.login,
-                "email": ctx.principal.login,
-                "principalId": ctx.principal.account.to_string(),
+        let notice = ShareNotification {
+            id: ShareNotificationId::new(),
+            created: OffsetDateTime::now_utc(),
+            changed_by: ShareChangedBy {
+                name: ctx.principal.login.clone(),
+                email: Some(ctx.principal.login.clone()),
+                account: Some(ctx.principal.account),
             },
-            "objectType": ty.name(),
-            "objectAccountId": ctx.scope.account.to_string(),
-            "objectId": c.id.to_string(),
-            "oldRights": (!g.old.is_empty()).then(|| ty.rights(g.old)),
-            "newRights": (!g.new.is_empty()).then(|| ty.rights(g.new)),
-            "name": c.display_name,
-        }));
-        ctx.jmap.notices.push(ctx.scope.tenant, g.account, notice);
+            object_type: ty.shared(),
+            owner: ctx.scope.account,
+            collection: c.id,
+            old_rights: g.old,
+            new_rights: g.new,
+            name: c.display_name.clone(),
+        };
+        let recipient = AccountScope {
+            tenant: ctx.scope.tenant,
+            account: g.account,
+        };
+        s.notifications.record(recipient, notice).await?;
     }
     Ok(())
 }
 
 // ---------- ShareNotification ----------
 
-/// Уведомление в журнале учётной записи.
-#[derive(Debug, Clone)]
-struct Notice {
-    id: String,
-    created: OffsetDateTime,
-    object: Map<String, Value>,
+/// Хранилище уведомлений; общий доступ не подключён — `None` (уведомлений нет).
+fn notices<'a>(ctx: &'a Ctx<'_>) -> Option<&'a dyn ShareNotificationStore> {
+    ctx.jmap.sharing.as_ref().map(|s| &*s.notifications)
 }
 
-/// Уведомления учётной записи и журнал их изменений.
-#[derive(Debug, Default)]
-struct Log {
-    /// Состояние: номер последнего изменения.
-    state: u64,
-    /// Самое старое состояние, от которого считаются изменения.
-    floor: u64,
-    notices: VecDeque<(u64, Notice)>,
-    /// Удалённые: (номер изменения, id).
-    destroyed: VecDeque<(u64, String)>,
+/// Объект `ShareNotification` (RFC 9670 §5).
+fn notice_json(n: &ShareNotification) -> Map<String, Value> {
+    let ty = ObjectType::from(n.object_type);
+    object(json!({
+        "id": n.id.to_string(),
+        "created": utc_date(n.created),
+        "changedBy": {
+            "name": n.changed_by.name,
+            "email": n.changed_by.email,
+            "principalId": n.changed_by.account.map(|a| a.to_string()),
+        },
+        "objectType": ty.name(),
+        "objectAccountId": n.owner.to_string(),
+        "objectId": n.collection.to_string(),
+        "oldRights": (!n.old_rights.is_empty()).then(|| ty.rights(n.old_rights)),
+        "newRights": (!n.new_rights.is_empty()).then(|| ty.rights(n.new_rights)),
+        "name": n.name,
+    }))
 }
 
-/// `ShareNotification` учётных записей в памяти узла.
-#[derive(Debug, Default)]
-pub(crate) struct Notices(Mutex<HashMap<(TenantId, AccountId), Log>>);
-
-impl Notices {
-    fn with<T>(&self, tenant: TenantId, account: AccountId, f: impl FnOnce(&mut Log) -> T) -> T {
-        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        f(map.entry((tenant, account)).or_default())
+/// Состояние уведомлений учётной записи вызова.
+async fn notice_state(ctx: &Ctx<'_>) -> Result<u64> {
+    match notices(ctx) {
+        Some(st) => st.notification_state(ctx.scope).await,
+        None => Ok(0),
     }
-
-    /// Записывает уведомление учётной записи; сверх [`MAX_NOTICES`] старшее вытесняется (как удаление).
-    pub(crate) fn push(&self, tenant: TenantId, account: AccountId, object: Map<String, Value>) {
-        self.with(tenant, account, |log| {
-            log.state += 1;
-            let id = format!("S{}", log.state);
-            let notice = Notice {
-                id,
-                created: OffsetDateTime::now_utc(),
-                object,
-            };
-            log.notices.push_back((log.state, notice));
-            if log.notices.len() > MAX_NOTICES
-                && let Some((_, old)) = log.notices.pop_front()
-            {
-                log.destroyed.push_back((log.state, old.id));
-            }
-            while log.destroyed.len() > MAX_NOTICES {
-                if let Some((seq, _)) = log.destroyed.pop_front() {
-                    log.floor = seq;
-                }
-            }
-        });
-    }
-}
-
-fn notice_json(n: &Notice) -> Map<String, Value> {
-    let mut m = n.object.clone();
-    m.insert("id".into(), json!(n.id));
-    m
 }
 
 /// `ShareNotification/get`.
@@ -581,24 +585,24 @@ pub(crate) async fn notification_get(
     ctx.check_account(&a.account_id)?;
     ctx.check_get_limit(a.ids.as_ref())?;
     let props = a.properties.as_deref();
-    let (state, list, not_found) =
-        ctx.jmap
-            .notices
-            .with(ctx.scope.tenant, ctx.scope.account, |log| {
-                let (mut list, mut not_found) = (Vec::new(), Vec::new());
-                match &a.ids {
-                    None => list.extend(log.notices.iter().map(|(_, n)| notice_json(n))),
-                    Some(ids) => {
-                        for id in ids {
-                            match log.notices.iter().find(|(_, n)| n.id == *id) {
-                                Some((_, n)) => list.push(notice_json(n)),
-                                None => not_found.push(id.clone()),
-                            }
-                        }
-                    }
+    let state = notice_state(ctx).await?;
+    let (mut list, mut not_found) = (Vec::new(), Vec::new());
+    match (&a.ids, notices(ctx)) {
+        (None, Some(st)) => list.extend(st.notifications(ctx.scope).await?.iter().map(notice_json)),
+        (None, None) => {}
+        (Some(ids), st) => {
+            for id in ids {
+                let found = match (ShareNotificationId::from_str(id), st) {
+                    (Ok(nid), Some(st)) => st.notification(ctx.scope, nid).await?,
+                    _ => None,
+                };
+                match found {
+                    Some(n) => list.push(notice_json(&n)),
+                    None => not_found.push(id.clone()),
                 }
-                (log.state, list, not_found)
-            });
+            }
+        }
+    }
     let list: Vec<_> = list.into_iter().map(|n| select(n, props)).collect();
     Ok(object(json!({
         "accountId": a.account_id,
@@ -617,51 +621,24 @@ pub(crate) async fn notification_changes(
     ctx.check_account(&a.account_id)?;
     let limit = a.limit(ctx.jmap.cfg.max_changes)?;
     let since = parse_state(&a.since_state)?.0;
-    let c = ctx
-        .jmap
-        .notices
-        .with(ctx.scope.tenant, ctx.scope.account, |log| {
-            if since > log.state || since < log.floor {
-                return Err(changes_error(Error::Conflict));
-            }
-            let mut ev: Vec<(u64, String, bool)> = log
-                .notices
-                .iter()
-                .filter(|(seq, _)| *seq > since)
-                .map(|(seq, n)| (*seq, n.id.clone(), true))
-                .chain(
-                    log.destroyed
-                        .iter()
-                        .filter(|(seq, _)| *seq > since)
-                        .map(|(seq, id)| (*seq, id.clone(), false)),
-                )
-                .collect();
-            ev.sort();
-            let has_more = ev.len() > limit;
-            ev.truncate(limit);
-            let new_state = if has_more {
-                ev.last().map_or(log.state, |e| e.0)
-            } else {
-                log.state
-            };
-            let mut c = Changes {
-                created: Vec::new(),
-                updated: Vec::new(),
-                destroyed: Vec::new(),
-                new_state: ModSeq(new_state),
-                has_more,
-            };
-            for (_, id, created) in ev {
-                if created {
-                    c.created.push(id);
-                } else if !c.created.contains(&id) {
-                    c.destroyed.push(id);
-                } else {
-                    c.created.retain(|x| *x != id);
-                }
-            }
-            Ok(c)
-        })?;
+    let c = match notices(ctx) {
+        Some(st) => st
+            .notification_changes(ctx.scope, since, limit)
+            .await
+            .map_err(changes_error)?,
+        None if since == 0 => ShareNotificationChanges::default(),
+        None => return Err(changes_error(Error::Conflict)),
+    };
+    let ids = |v: Vec<ShareNotificationId>| -> Vec<String> {
+        v.iter().map(ToString::to_string).collect()
+    };
+    let c = Changes {
+        created: ids(c.created),
+        updated: Vec::new(),
+        destroyed: ids(c.destroyed),
+        new_state: ModSeq(c.new_state),
+        has_more: c.has_more,
+    };
     Ok(changes_response(&a.account_id, &a.since_state, &c))
 }
 
@@ -673,9 +650,7 @@ pub(crate) async fn notification_set(
     let a: SetArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
     a.check_limit(ctx.jmap.cfg.max_objects_in_set)?;
-    let (tenant, account) = (ctx.scope.tenant, ctx.scope.account);
-    let old = ctx.jmap.notices.with(tenant, account, |log| log.state);
-    let old = state_string(ModSeq(old));
+    let old = state_string(ModSeq(notice_state(ctx).await?));
     if a.if_in_state.as_ref().is_some_and(|s| *s != old) {
         return Err(MethodError::new("stateMismatch"));
     }
@@ -688,25 +663,24 @@ pub(crate) async fn notification_set(
         out.not_updated
             .insert(id, set_error("forbidden", None, &[]));
     }
-    let destroy = a.destroy.unwrap_or_default();
-    let new = ctx.jmap.notices.with(tenant, account, |log| {
-        for id in destroy {
-            match log.notices.iter().position(|(_, n)| n.id == id) {
-                Some(i) => {
-                    log.notices.remove(i);
-                    log.state += 1;
-                    log.destroyed.push_back((log.state, id.clone()));
-                    out.destroyed.push(id);
-                }
-                None => {
-                    out.not_destroyed
-                        .insert(id, set_error("notFound", None, &[]));
-                }
-            }
+    for id in a.destroy.unwrap_or_default() {
+        let destroyed = match (ShareNotificationId::from_str(&id), notices(ctx)) {
+            (Ok(nid), Some(st)) => match st.destroy_notification(ctx.scope, nid).await {
+                Ok(_) => true,
+                Err(Error::NotFound) => false,
+                Err(e) => return Err(e.into()),
+            },
+            _ => false,
+        };
+        if destroyed {
+            out.destroyed.push(id);
+        } else {
+            out.not_destroyed
+                .insert(id, set_error("notFound", None, &[]));
         }
-        log.state
-    });
-    Ok(out.response(&a.account_id, &old, &state_string(ModSeq(new))))
+    }
+    let new = state_string(ModSeq(notice_state(ctx).await?));
+    Ok(out.response(&a.account_id, &old, &new))
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,6 +703,35 @@ struct NoticeFilter {
     object_account_id: Option<String>,
 }
 
+impl NoticeFilter {
+    /// Условие хранилища ([`ShareNotificationFilter`]); неизвестный вид или аккаунт объекта — `None` (ничему не
+    /// удовлетворяет).
+    fn condition(&self) -> MethodResult<Option<ShareNotificationFilter>> {
+        let after = self.after.as_deref().map(utc).transpose()?;
+        let before = self.before.as_deref().map(utc).transpose()?;
+        let object_type = match self.object_type.as_deref() {
+            None => None,
+            Some(t) => match ObjectType::from_name(t) {
+                Some(t) => Some(t.shared()),
+                None => return Ok(None),
+            },
+        };
+        let owner = match self.object_account_id.as_deref() {
+            None => None,
+            Some(a) => match AccountId::from_str(a) {
+                Ok(a) => Some(a),
+                Err(_) => return Ok(None),
+            },
+        };
+        Ok(Some(ShareNotificationFilter {
+            after,
+            before,
+            object_type,
+            owner,
+        }))
+    }
+}
+
 fn utc(s: &str) -> MethodResult<OffsetDateTime> {
     OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .map_err(|_| MethodError::new("unsupportedFilter"))
@@ -741,38 +744,23 @@ pub(crate) async fn notification_query(
 ) -> MethodResult<Map<String, Value>> {
     let a: NoticeQueryArgs = parse_args(args)?;
     ctx.check_account(&a.account_id)?;
-    let f = a.filter.unwrap_or_default();
-    let after = f.after.as_deref().map(utc).transpose()?;
-    let before = f.before.as_deref().map(utc).transpose()?;
+    let filter = a.filter.unwrap_or_default().condition()?;
     let sort = a.sort.unwrap_or_default();
     if sort.iter().any(|c| c.property != "created") {
         return Err(MethodError::new("unsupportedSort"));
     }
     let descending = sort.first().is_some_and(|c| !c.is_ascending);
-    let (state, mut ids) = ctx
-        .jmap
-        .notices
-        .with(ctx.scope.tenant, ctx.scope.account, |log| {
-            let ids: Vec<String> = log
-                .notices
-                .iter()
-                .map(|(_, n)| n)
-                .filter(|n| after.is_none_or(|t| n.created >= t))
-                .filter(|n| before.is_none_or(|t| n.created < t))
-                .filter(|n| {
-                    f.object_type
-                        .as_ref()
-                        .is_none_or(|t| n.object["objectType"] == t.as_str())
-                })
-                .filter(|n| {
-                    f.object_account_id
-                        .as_ref()
-                        .is_none_or(|t| n.object["objectAccountId"] == t.as_str())
-                })
-                .map(|n| n.id.clone())
-                .collect();
-            (log.state, ids)
-        });
+    let state = notice_state(ctx).await?;
+    let mut ids: Vec<String> = match (filter, notices(ctx)) {
+        (Some(f), Some(st)) => st
+            .notifications(ctx.scope)
+            .await?
+            .iter()
+            .filter(|n| f.matches(n))
+            .map(|n| n.id.to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
     if descending {
         ids.reverse();
     }

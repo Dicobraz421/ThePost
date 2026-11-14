@@ -1725,6 +1725,121 @@
         ],
         "type": "string"
       },
+      "QueueEntry": {
+        "description": "Запись очереди исходящей почты.",
+        "properties": {
+          "from": {
+            "description": "Отправитель конверта; пустой — уведомление о недоставке.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Запись (UUID).",
+            "type": "string"
+          },
+          "next_attempt": {
+            "description": "Ближайший срок попытки среди получателей без конечного статуса.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "queued_at": {
+            "description": "Момент постановки (для отложенного письма — срок выпуска, если он позже).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "rcpts": {
+            "description": "Получатели в порядке постановки.",
+            "items": {
+              "$ref": "#/components/schemas/QueueRcptInfo"
+            },
+            "type": "array"
+          },
+          "size": {
+            "description": "Размер письма, байт.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/QueueStatus",
+            "description": "Состояние в момент запроса."
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "queued_at",
+          "next_attempt",
+          "from",
+          "size",
+          "rcpts"
+        ],
+        "type": "object"
+      },
+      "QueueRcptInfo": {
+        "description": "Получатель записи очереди.",
+        "properties": {
+          "address": {
+            "description": "Адрес (`RCPT TO`).",
+            "type": "string"
+          },
+          "attempts": {
+            "description": "Число неудачных попыток.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_error": {
+            "description": "Причина последней неудачи.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_attempt": {
+            "description": "Срок следующей попытки (для `pending`).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reply": {
+            "description": "Ответ принимающего сервера или причина отказа (для `delivered` и `failed`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/QueueRcptStatus",
+            "description": "Состояние."
+          }
+        },
+        "required": [
+          "address",
+          "status",
+          "attempts"
+        ],
+        "type": "object"
+      },
+      "QueueRcptStatus": {
+        "description": "Состояние получателя: `pending` — ждёт попытки, `delivered` — доставлено, `failed` — окончательный отказ.",
+        "enum": [
+          "pending",
+          "delivered",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "QueueStatus": {
+        "description": "Состояние записи очереди: `ready` — ждёт первой попытки (в том числе отложенная отправка), `retry` — ждёт повтора\nпосле временной неудачи, `active` — доставляется (действует лиза узла smtp-out).",
+        "enum": [
+          "ready",
+          "retry",
+          "active"
+        ],
+        "type": "string"
+      },
       "QuotaInfo": {
         "description": "Использование квоты.",
         "properties": {
@@ -7327,6 +7442,198 @@
         "summary": "Задаёт политику организации целиком.",
         "tags": [
           "organizations"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/queue": {
+      "get": {
+        "operationId": "list_queue",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Только записи в этом состоянии: `ready`, `retry`, `active`.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/QueueStatus"
+            }
+          },
+          {
+            "description": "Только записи, у которых отправитель или получатель содержит эту строку (без учёта регистра).",
+            "in": "query",
+            "name": "address",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Размер страницы (по умолчанию и наибольший — из конфигурации).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Продолжение после этой записи — `after` из ссылки `rel=\"next\"` предыдущей страницы.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/QueueEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "headers": {
+              "Link": {
+                "description": "Следующая страница очереди: `<ссылка>; rel=\"next\"`; нет — страница последняя",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Записи очереди организации по возрастанию идентификатора. Есть продолжение — заголовок\n`Link: <…&after=…>; rel=\"next\"` (RFC 8288), нет заголовка — страница последняя.",
+        "tags": [
+          "queue"
+        ]
+      }
+    },
+    "/api/v1/orgs/{org}/queue/{id}/retry": {
+      "post": {
+        "operationId": "retry_queue",
+        "parameters": [
+          {
+            "description": "Организация (UUID)",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Запись очереди (UUID)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {},
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Повтор доставки «сейчас»: срок попытки всех получателей без конечного статуса — момент запроса, отложенное\nписьмо выпускается. Запись доставляется (действует лиза) — 409: попытка уже идёт, срок не перенесён.",
+        "tags": [
+          "queue"
         ]
       }
     },

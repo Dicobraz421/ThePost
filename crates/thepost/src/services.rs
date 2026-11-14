@@ -330,8 +330,8 @@ impl Services {
         cfg.section::<tp_jmap::JmapConfig>(JMAP)?;
         cfg.section::<AdminSection>(ADMIN)?;
         // Приём iTIP — с настройками секции `dav` (календарь по умолчанию, входящие планирования, лимиты).
-        // Бронирование ресурсов (DAV-19, APP-71): правила, занятость и группы бронирующих — `PgMeta`; ответ внешнему
-        // организатору — письмом iMIP в очередь исходящей почты (с подписью DKIM). Доставка узла здесь не подходит:
+        // Бронирование ресурсов (DAV-19, APP-71): правила, занятость и группы бронирующих — `PgMeta`; бронирует только
+        // организатор из организации ресурса, ответ — в его календарь (решение 123). Доставка узла здесь не подходит:
         // она сама держит этот приём iTIP (`Delivery::with_itip`).
         let itip = Arc::new(
             tp_dav::ItipInbox::new(
@@ -343,7 +343,6 @@ impl Services {
                 resources: Arc::new(meta.clone()),
                 freebusy: Arc::new(meta.clone()),
                 group_store: Arc::new(meta.clone()),
-                sender: Some(Arc::new(tp_dav::ImipSender::new(queue.clone()))),
             }),
         );
         let tracking = Tracking::new(Arc::new(meta.clone()), node);
@@ -600,10 +599,12 @@ impl Services {
             .with_freebusy(Some(Arc::new(self.meta.clone())))
             // Приглашения из JMAP (`sendSchedulingMessages`, JMAP-31) — теми же зависимостями, что у CalDAV.
             .with_schedule(Some(self.schedule(outbound)))
-            // Общий доступ к календарям и книгам (JMAP-32): права — единый слой `collections`, записи — `PgMeta`.
+            // Общий доступ к календарям и книгам (JMAP-32): права — единый слой `collections`, записи прав и
+            // уведомления о доступе (JMAP-46) — `PgMeta`.
             .with_sharing(Some(tp_jmap::SharingDeps {
                 authz: self.collections.clone(),
                 acl: Arc::new(self.meta.clone()),
+                notifications: Arc::new(self.meta.clone()),
             })))
     }
 
@@ -745,7 +746,10 @@ impl Services {
                 resources: Arc::new(self.meta.clone()),
                 policy: Arc::new(self.meta.clone()),
                 collections: Arc::new(self.meta.clone()),
-            }))
+            })
+            // Очередь исходящей почты (ADM-45): список записей и повтор доставки — `QueueStore` поверх `PgMeta`
+            // (META-82); без этого `GET /orgs/{org}/queue` и `POST …/retry` отвечают 503.
+            .with_queue(Arc::new(self.meta.clone())))
     }
 
     /// Обучение антиспама (подписчик журнала событий `smtp-learn` роли maintenance): письмо, перенесённое в «Спам»

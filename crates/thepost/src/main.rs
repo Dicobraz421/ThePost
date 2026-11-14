@@ -3,11 +3,10 @@
 //! До запуска рантайма tokio: подпроцесс извлечения текста вложений (`search-extract`, seccomp на все потоки) и
 //! для `serve` — проверка учётной записи и ограничения ролей (seccomp, Landlock; PLT-16, SYS-07).
 
-use clap::Parser;
-use thepost::cli::{Cli, Command};
+use thepost::cli::Command;
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let cli = thepost::cli::parse();
     match cli.command {
         Command::SearchExtract => {
             return match tp_search::extract::run_worker() {
