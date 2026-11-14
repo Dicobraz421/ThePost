@@ -435,7 +435,7 @@ fn next_link(org: TenantId, prefix: &str, after: &str, limit: usize) -> String {
 }
 
 /// Значение параметра запроса: всё, кроме незарезервированных символов и `@` (RFC 3986), — `%XX`.
-fn encode_query(s: &str) -> String {
+pub(crate) fn encode_query(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

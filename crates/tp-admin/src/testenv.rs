@@ -24,7 +24,7 @@ use tp_contracts::{AccountId, DomainId, MessageId, Result, TenantId};
 use tp_testkit::{
     Clock, FakeAuthenticator, MemAppPasswords, MemAuditLog, MemBlobIndex, MemBlobStore,
     MemDeliveryLog, MemEventBus, MemGroups, MemLocalAdminTokens, MemMetadata, MemPolicies,
-    MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
+    MemQueue, MemQuota, MemSieve, MemTransport, MemTrash, SystemClock,
 };
 use tp_testkit::{MemAddressBook, MemDav, MemMailboxAudit, MemSenderLists, MemSyncGate};
 
@@ -333,6 +333,8 @@ pub struct Env {
     pub sync_gate: MemSyncGate,
     /// Календари и адресные книги, права на коллекции (`Admin::with_sharing`).
     pub dav: MemDav,
+    /// Очередь исходящей почты (`Admin::with_queue`).
+    pub queue: MemQueue,
     pub admin: Arc<Admin>,
     pub router: Router,
     pub other_tenant: TenantId,
@@ -403,21 +405,26 @@ impl Env {
 
     /// Без настроек транспорта (маршруты транспорта — 503).
     pub fn without_transport() -> Self {
-        Self::build(config(), Vec::new(), false, true, true)
+        Self::build(config(), Vec::new(), false, true, true, true)
     }
 
     /// Без локального входа (`admin init`, вход по паролю и обмен — 503).
     pub fn without_local() -> Self {
-        Self::build(config(), Vec::new(), true, false, true)
+        Self::build(config(), Vec::new(), true, false, true, true)
     }
 
     /// Без общего доступа, представителей и ресурсов (их маршруты — 503).
     pub fn without_sharing() -> Self {
-        Self::build(config(), Vec::new(), true, true, false)
+        Self::build(config(), Vec::new(), true, true, false, true)
+    }
+
+    /// Без очереди исходящей почты (её маршруты — 503).
+    pub fn without_queue() -> Self {
+        Self::build(config(), Vec::new(), true, true, true, false)
     }
 
     pub fn with(cfg: AdminConfig, modules: Vec<Arc<dyn AdminRoutes>>) -> Self {
-        Self::build(cfg, modules, true, true, true)
+        Self::build(cfg, modules, true, true, true, true)
     }
 
     fn build(
@@ -426,6 +433,7 @@ impl Env {
         with_transport: bool,
         with_local: bool,
         with_sharing: bool,
+        with_queue: bool,
     ) -> Self {
         let auth = FakeAuthenticator::default();
         let other_tenant = TenantId::new();
@@ -462,6 +470,12 @@ impl Env {
         };
         let admin = if with_sharing {
             admin.with_sharing(stores.sharing())
+        } else {
+            admin
+        };
+        let queue = MemQueue::new(Arc::new(SystemClock));
+        let admin = if with_queue {
+            admin.with_queue(Arc::new(queue.clone()))
         } else {
             admin
         };
@@ -511,6 +525,7 @@ impl Env {
             mailbox_audit,
             sync_gate,
             dav,
+            queue,
             router: admin.clone().router(),
             admin,
             other_tenant,
