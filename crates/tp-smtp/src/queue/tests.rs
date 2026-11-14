@@ -860,6 +860,26 @@ impl QueueStore for NoPostpone {
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
         self.0.complete(claim, rcpt, status).await
     }
+
+    async fn list(
+        &self,
+        tenant: tp_contracts::TenantId,
+        filter: &tp_contracts::queue::QueueFilter,
+        after: Option<tp_contracts::QueueId>,
+        limit: usize,
+        now: OffsetDateTime,
+    ) -> Result<Vec<tp_contracts::queue::QueueItem>> {
+        self.0.list(tenant, filter, after, limit, now).await
+    }
+
+    async fn retry(
+        &self,
+        tenant: tp_contracts::TenantId,
+        id: tp_contracts::QueueId,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        self.0.retry(tenant, id, now).await
+    }
 }
 
 #[tokio::test]
@@ -1239,6 +1259,26 @@ impl QueueStore for Counted {
 
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
         self.queue.complete(claim, rcpt, status).await
+    }
+
+    async fn list(
+        &self,
+        tenant: tp_contracts::TenantId,
+        filter: &tp_contracts::queue::QueueFilter,
+        after: Option<tp_contracts::QueueId>,
+        limit: usize,
+        now: OffsetDateTime,
+    ) -> Result<Vec<tp_contracts::queue::QueueItem>> {
+        self.queue.list(tenant, filter, after, limit, now).await
+    }
+
+    async fn retry(
+        &self,
+        tenant: tp_contracts::TenantId,
+        id: tp_contracts::QueueId,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        self.queue.retry(tenant, id, now).await
     }
 }
 

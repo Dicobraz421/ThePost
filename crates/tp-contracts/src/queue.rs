@@ -350,8 +350,7 @@ pub trait QueueStore: Send + Sync + 'static {
     /// Записи организации `tenant` (CTR-85; консоль и TUI) в порядке `id` строго после `after` (`None` — с начала),
     /// не более `limit`, прошедшие фильтр ([`QueueFilter::matches`]); состояние — в момент `now`. Курсор следующей
     /// порции — `id` последней записи; порция короче `limit` — последняя. Записи, поставленные или завершённые между
-    /// порциями, не дают ни пропусков, ни повторов остальных. `limit` = 0 — `Error::Invalid`. По умолчанию —
-    /// `Error::Internal`.
+    /// порциями, не дают ни пропусков, ни повторов остальных. `limit` = 0 — `Error::Invalid`.
     async fn list(
         &self,
         tenant: TenantId,
@@ -359,20 +358,14 @@ pub trait QueueStore: Send + Sync + 'static {
         after: Option<QueueId>,
         limit: usize,
         now: OffsetDateTime,
-    ) -> Result<Vec<QueueItem>> {
-        let _ = (tenant, filter, after, limit, now);
-        Err(Error::internal("queue store does not support list"))
-    }
+    ) -> Result<Vec<QueueItem>>;
 
     /// Повтор доставки по запросу администратора (CTR-85): срок попытки `now` у всех получателей без конечного
     /// статуса записи `id` организации `tenant` (`attempts` и `last_error` не меняются; отложенное письмо выпускается — `queued_at` не позже `now`)
     /// и сигнал [`queue_ready`] после фиксации — `next_due` не позже `now`. `true` — срок перенесён; запись под
     /// действующей лизой (доставляется) — без изменений и без сигнала, `false`. Нет записи (в том числе другой
-    /// организации или уже завершена) — `Error::NotFound`. По умолчанию — `Error::Internal`.
-    async fn retry(&self, tenant: TenantId, id: QueueId, now: OffsetDateTime) -> Result<bool> {
-        let _ = (tenant, id, now);
-        Err(Error::internal("queue store does not support retry"))
-    }
+    /// организации или уже завершена) — `Error::NotFound`.
+    async fn retry(&self, tenant: TenantId, id: QueueId, now: OffsetDateTime) -> Result<bool>;
 }
 
 /// Статус получателя при отправке ([`Outbound::submit`]); JMAP — `deliveryStatus` EmailSubmission (RFC 8621 §7).
@@ -566,51 +559,6 @@ mod tests {
         assert!(!f(Some(QueueState::Active), Some("bob")).matches(&item));
         let s = serde_json::to_string(&item).expect("serialize");
         assert_eq!(serde_json::from_str::<QueueItem>(&s).expect("parse"), item);
-    }
-
-    /// `list` и `retry` по умолчанию — `Internal` (реализация без просмотра очереди).
-    #[tokio::test]
-    async fn list_retry_default_internal() {
-        struct Bare;
-        #[async_trait]
-        impl QueueStore for Bare {
-            async fn enqueue(&self, _: Option<AccountId>, _: OutMessage) -> Result<QueueId> {
-                Err(Error::internal("bare"))
-            }
-            async fn next_due(&self) -> Result<Option<OffsetDateTime>> {
-                Ok(None)
-            }
-            async fn claim(
-                &self,
-                _: OffsetDateTime,
-                _: usize,
-                _: Duration,
-            ) -> Result<Vec<Claimed>> {
-                Ok(Vec::new())
-            }
-            async fn renew(&self, _: &QueueClaim, _: OffsetDateTime) -> Result<()> {
-                Err(Error::Conflict)
-            }
-            async fn reschedule(
-                &self,
-                _: &QueueClaim,
-                _: &str,
-                _: OffsetDateTime,
-                _: &str,
-            ) -> Result<()> {
-                Err(Error::Conflict)
-            }
-            async fn complete(&self, _: &QueueClaim, _: &str, _: RcptStatus) -> Result<bool> {
-                Err(Error::Conflict)
-            }
-        }
-        let now = OffsetDateTime::UNIX_EPOCH;
-        let listed = Bare
-            .list(TenantId::DEFAULT, &QueueFilter::default(), None, 10, now)
-            .await;
-        assert!(matches!(listed, Err(Error::Internal(_))));
-        let retried = Bare.retry(TenantId::DEFAULT, QueueId::new(), now).await;
-        assert!(matches!(retried, Err(Error::Internal(_))));
     }
 
     #[test]

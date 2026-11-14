@@ -109,7 +109,7 @@ CTR-25: раздел журнала событий — `Partition { shard, index
   при обновлении по правилу `meta::account_resource_type(kind, requested)`: у ресурса без типа — `Room`, тип у пользователя — `Invalid`,
   смена вида на пользователя снимает тип. Клиентам — CalDAV `CUTYPE` `ROOM`/`RESOURCE` (DAV-38), JMAP `Principal.type`
   `location`/`resource` (JMAP-45); правила бронирования от типа не зависят. In-memory — `MemMetadata`; набор `suite::account_resource_type`.
-  `PgMeta` проверяет правило, а хранение типа — META-81 (до неё ресурс читается как `Room`); Admin API — ADM-47.
+  `PgMeta` проверяет правило, а тип хранит в БД (META-81); Admin API — ADM-47.
   Состояние ящика (CTR-35, «Удалённые ящики» решения 2026-11-04-exchange-parity): `AccountState::{Active, Disabled { until }}` —
   отключённый ящик (учётная запись исчезла из каталога): вход и приём почты запрещены независимо от `enabled`, нет в GAL, хранится до
   `until` (по умолчанию 30 дней — политика синхронизации). `account_state` (по умолчанию — через `get`, всегда `Active`),
@@ -585,7 +585,7 @@ now) -> Vec<QueueItem { id, state, queued_at, next_attempt, from, size, rcpts: V
 Фильтр — `QueueFilter::matches` (состояние; подстрока адреса отправителя или получателя без учёта регистра). `retry(tenant, id, now) -> bool`
 — срок попытки `now` у незавершённых получателей (`attempts` не меняется; отложенное письмо выпускается, `queued_at` не позже `now`),
 после фиксации — `QueueReady`; под действующей лизой — `false` без изменений; нет записи (другой организации, завершена) — `NotFound`.
-Оба по умолчанию — `Internal`; in-memory — `MemQueue`; набор `suite::lifecycle::queue_list`. PostgreSQL — отдельная волна meta.
+Оба обязательны; in-memory — `MemQueue`; набор `suite::lifecycle::queue_list`. PostgreSQL — `PgMeta` (META-82).
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
@@ -1194,8 +1194,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   (DAV-27), ссылки `DirOrg::manager` на неё остаются. `PATCH` признака в Admin API и консоль — отдельные волны.
 - 2026-11-14 — CTR-88 (волна contracts-59, решение 121): `meta::ResourceType::{Room, Equipment}` и поля `Account::resource_type`,
   `AccountUpsert::resource_type` — тип ресурса бронирования; правило `meta::account_resource_type` (ресурс без типа — `Room`, тип у
-  пользователя — `Invalid`). `MemMetadata` хранит тип; набор `suite::account_resource_type`. `PgMeta` проверяет правило и читает ресурс
-  как `Room` — хранение в БД (миграция) META-81; Admin API — ADM-47, CalDAV — DAV-38, JMAP — JMAP-45. Несовместимо: новые обязательные
+  пользователя — `Invalid`). `MemMetadata` хранит тип; набор `suite::account_resource_type`. `PgMeta` проверяет правило и хранит тип в БД
+  (миграция META-81); Admin API — ADM-47, CalDAV — DAV-38, JMAP — JMAP-45. Несовместимо: новые обязательные
   поля `Account`, `AccountUpsert`; все места сборки в репозитории (`tp-admin`, `tp-auth`, `tp-meta`, `tp-testkit`, тесты `tp-imap`,
   `tp-smtp`, `tp-dav`, `tp-jmap`, `thepost`) дополнены: пересборка из `Account` переносит тип, прочие — `None`.
 - 2026-11-14 — CTR-90 (волна contracts-61): `sharing::MAX_NOTICES` = 1000 — предел уведомлений о доступе на учётную запись:
