@@ -19,10 +19,10 @@
 //! Снаружи — только почта (решение 123, DAV-43): что применять, бронировать и на что отвечать, решает одно место —
 //! матрица [`inbound_allowed`] от типа отправителя ([`SenderKind`], определяет вызывающий) и действия
 //! ([`InboundAction::of`]: метод и получатель-ресурс). Не разрешено — `Ignored`: ни события, ни брони, ни ответа. По
-//! умолчанию своей организации — всё; извне (партнёр, соседняя организация установки, внешний) — только `REPLY` и
-//! `CANCEL` к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2): ответ — от участника события его организатору,
-//! отмена — от организатора события получателю из `ATTENDEE`; новое приглашение, прочие методы и любое сообщение
-//! ресурсу — письмом. `REFRESH` — только от участника события, организатор которого — получатель (RFC 5546 §6.1.6).
+//! умолчанию своей организации — всё; извне (партнёр, соседняя организация установки, внешний) — только обновление,
+//! `REPLY` и `CANCEL` к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2): обновление (`REQUEST`, тот же
+//! `ORGANIZER`, `SEQUENCE` строго больше) и отмена — от организатора события получателю из `ATTENDEE`, ответ — от
+//! участника события его организатору; новое приглашение, прочие методы и любое сообщение ресурсу — письмом. `REFRESH` — только от участника события, организатор которого — получатель (RFC 5546 §6.1.6).
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
 //!
@@ -699,8 +699,9 @@ impl ItipDelivery for ItipInbox {
             Some(b) => b.is_resource(msg.recipient).await?,
             None => false,
         };
+        let update = it.method == ItipMethod::Request && self.update_of(msg.recipient, &it).await?;
         // Решение 123: «кто — что» — только здесь, по матрице.
-        if !inbound_allowed(msg.sender, InboundAction::of(it.method, resource)) {
+        if !inbound_allowed(msg.sender, InboundAction::of(it.method, resource, update)) {
             return refuse("отправителю не разрешено (решение 123)");
         }
         let booked = match &self.booking {
@@ -760,6 +761,22 @@ impl ItipInbox {
             .ok()
             .and_then(|i| itip::meeting(&i))
             .is_some_and(|m| m.organizer.as_deref() == Some(to) && m.attendee(from).is_some()))
+    }
+
+    /// Приглашение `it` — обновление события, уже внесённого в календарь получателя `scope`: тот же `ORGANIZER`,
+    /// `SEQUENCE` строго больше ([`InboundAction::Update`]).
+    async fn update_of(&self, scope: AccountScope, it: &Itip) -> Result<bool> {
+        let Some(o) = find_uid(self.store.as_ref(), scope, &it.meeting.uid).await? else {
+            return Ok(false);
+        };
+        Ok(ICalendar::parse(&o.body)
+            .ok()
+            .and_then(|i| itip::meeting(&i))
+            .is_some_and(|m| {
+                m.organizer.is_some()
+                    && m.organizer == it.meeting.organizer
+                    && it.meeting.sequence > m.sequence
+            }))
     }
 
     /// Ответ ресурса `to` организатору приглашения `it` по решению `b` ([`crate::booking`]) — в календарь его учётной

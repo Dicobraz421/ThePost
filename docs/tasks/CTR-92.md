@@ -16,9 +16,10 @@ manual: no
   `ItipSource::{Internal, Imip}` (поле `ItipMessage::sender` вместо `source`): «откуда пришло» не отвечает на вопрос
   «что можно» — письмо через smtp-in с адресом своего домена и письмо соседней организации установки шли одним
   `Imip`.
-- `InboundAction::{Invite, Reply, Cancel, Other, Booking}` и `InboundAction::of(method, resource)` — клетки матрицы.
+- `InboundAction::{Invite, Update, Reply, Cancel, Other, Booking}` и `InboundAction::of(method, resource, update)` —
+  клетки матрицы; `Update` — `REQUEST` к уже внесённому событию того же организатора со строго большим `SEQUENCE`.
 - Значения по умолчанию — по правилу владельца (решение 123): своей организации (вошедшему) — всё; извне (партнёр,
-  соседняя организация, внешний) — `Reply` и `Cancel` к существующему событию, как у Exchange и Google (RFC 5546 §6.1,
+  соседняя организация, внешний) — `Update`, `Reply` и `Cancel` к существующему событию, как у Exchange и Google (RFC 5546 §6.1,
   RFC 6638 §11.2); `Invite`, `Other`, `Booking` извне — нет (автодобавление приглашений партнёра — будущая
   настройка).
 

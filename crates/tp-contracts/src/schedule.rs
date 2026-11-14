@@ -146,8 +146,12 @@ pub enum SenderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundAction {
-    /// Приглашение (`REQUEST`) сотруднику: новое событие в его календаре или изменение уже принятого.
+    /// Новое приглашение (`REQUEST`) сотруднику: события с этим UID у получателя нет (или оно не того организатора, или
+    /// `SEQUENCE` не больше).
     Invite,
+    /// Обновление (`REQUEST`) события, уже внесённого в календарь сотрудника: тот же `ORGANIZER`, `SEQUENCE` строго
+    /// больше, чем у события получателя (как у Exchange).
+    Update,
     /// Ответ участника (`REPLY`) на событие нашего организатора: статус участника в событии организатора.
     Reply,
     /// Отмена (`CANCEL`) события в календаре сотрудника от его организатора.
@@ -159,10 +163,12 @@ pub enum InboundAction {
 }
 
 impl InboundAction {
-    /// Действие сообщения `method` получателю; `resource` — получатель — ресурс.
-    pub const fn of(method: ItipMethod, resource: bool) -> Self {
+    /// Действие сообщения `method` получателю; `resource` — получатель — ресурс; `update` — `REQUEST` к событию,
+    /// уже внесённому в календарь получателя, того же `ORGANIZER` и со строго большим `SEQUENCE` (определяет приём).
+    pub const fn of(method: ItipMethod, resource: bool, update: bool) -> Self {
         match method {
             _ if resource => InboundAction::Booking,
+            ItipMethod::Request if update => InboundAction::Update,
             ItipMethod::Request => InboundAction::Invite,
             ItipMethod::Reply => InboundAction::Reply,
             ItipMethod::Cancel => InboundAction::Cancel,
@@ -174,22 +180,26 @@ impl InboundAction {
 /// Матрица «кто — что» приёма iTIP (решение 123, «Снаружи — только почта») — единственное место решения «применять,
 /// бронировать, отвечать»; позже — настройка администратора (политика или Sieve) с этими значениями по умолчанию.
 ///
-/// | Отправитель \ действие | `Invite` | `Reply` | `Cancel` | `Other` | `Booking` |
-/// |---|---|---|---|---|---|
-/// | `Own` — своя организация (вошедший) | да | да | да | да | да |
-/// | `Partner` — домен-партнёр | нет¹ | да | да | нет | нет |
-/// | `Neighbor` — соседняя организация установки | нет | да | да | нет | нет |
-/// | `External` — внешний | нет | да | да | нет | нет |
+/// | Отправитель \ действие | `Invite` | `Update` | `Reply` | `Cancel` | `Other` | `Booking` |
+/// |---|---|---|---|---|---|---|
+/// | `Own` — своя организация (вошедший) | да | да | да | да | да | да |
+/// | `Partner` — домен-партнёр | нет¹ | да | да | да | нет | нет |
+/// | `Neighbor` — соседняя организация установки | нет | да | да | да | нет | нет |
+/// | `External` — внешний | нет | да | да | да | нет | нет |
 ///
-/// «Нет» — письмо остаётся письмом: ни события, ни брони, ни ответа. `Reply` и `Cancel` извне — как у Exchange и
-/// Google: только к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2) — `REPLY` от участника этого события его
-/// организатору, `CANCEL` от организатора события получателю из `ATTENDEE`, UID и `ORGANIZER` совпадают; проверяет
-/// приём. ¹ Новое приглашение партнёра — письмом, пока администратор не включит автодобавление (настройки ещё нет).
+/// «Нет» — письмо остаётся письмом: ни события, ни брони, ни ответа. `Update`, `Reply` и `Cancel` извне — как у
+/// Exchange и Google: только к существующему событию (RFC 5546 §6.1, RFC 6638 §11.2) — обновление и отмена от
+/// организатора события (тот же `ORGANIZER`, у обновления `SEQUENCE` строго больше) получателю из `ATTENDEE`, `REPLY`
+/// от участника этого события его организатору; UID совпадает, письмо прошло DMARC; проверяет приём. ¹ Новое
+/// приглашение партнёра — письмом, пока администратор не включит автодобавление (настройки ещё нет).
 pub const fn inbound_allowed(sender: SenderKind, action: InboundAction) -> bool {
-    use InboundAction::{Booking, Cancel, Invite, Other, Reply};
+    use InboundAction::{Booking, Cancel, Invite, Other, Reply, Update};
     match (sender, action) {
         (SenderKind::Own, _) => true,
-        (SenderKind::Partner | SenderKind::Neighbor | SenderKind::External, Reply | Cancel) => true,
+        (
+            SenderKind::Partner | SenderKind::Neighbor | SenderKind::External,
+            Update | Reply | Cancel,
+        ) => true,
         (
             SenderKind::Partner | SenderKind::Neighbor | SenderKind::External,
             Invite | Other | Booking,
@@ -533,23 +543,25 @@ mod tests {
 
     #[test]
     fn inbound_matrix() {
-        use InboundAction::{Booking, Cancel, Invite, Other, Reply};
+        use InboundAction::{Booking, Cancel, Invite, Other, Reply, Update};
         use SenderKind::{External, Neighbor, Own, Partner};
-        for action in [Invite, Reply, Cancel, Other, Booking] {
+        for action in [Invite, Update, Reply, Cancel, Other, Booking] {
             assert!(inbound_allowed(Own, action));
             for sender in [Partner, Neighbor, External] {
                 assert_eq!(
                     inbound_allowed(sender, action),
-                    matches!(action, Reply | Cancel),
+                    matches!(action, Update | Reply | Cancel),
                     "{sender:?} {action:?}"
                 );
             }
         }
-        assert_eq!(InboundAction::of(ItipMethod::Request, false), Invite);
-        assert_eq!(InboundAction::of(ItipMethod::Reply, false), Reply);
-        assert_eq!(InboundAction::of(ItipMethod::Cancel, false), Cancel);
+        assert_eq!(InboundAction::of(ItipMethod::Request, false, false), Invite);
+        assert_eq!(InboundAction::of(ItipMethod::Request, false, true), Update);
+        assert_eq!(InboundAction::of(ItipMethod::Reply, false, false), Reply);
+        assert_eq!(InboundAction::of(ItipMethod::Cancel, false, false), Cancel);
         for m in ItipMethod::ALL {
-            assert_eq!(InboundAction::of(m, true), Booking);
+            assert_eq!(InboundAction::of(m, true, true), Booking);
+            assert_eq!(InboundAction::of(m, true, false), Booking);
         }
         for m in [
             ItipMethod::Add,
@@ -557,7 +569,7 @@ mod tests {
             ItipMethod::Counter,
             ItipMethod::DeclineCounter,
         ] {
-            assert_eq!(InboundAction::of(m, false), Other);
+            assert_eq!(InboundAction::of(m, false, false), Other);
         }
     }
 

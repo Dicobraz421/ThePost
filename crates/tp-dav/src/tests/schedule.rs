@@ -838,8 +838,9 @@ async fn deliver_each_method_idempotent() {
 }
 
 /// Решение 123 (DAV-43): извне — партнёр, соседняя организация установки, внешний — новое приглашение и прочие методы
-/// остаются письмом; `REPLY` и `CANCEL` к существующему событию применяются (RFC 5546 §6.1, RFC 6638 §11.2): ответ —
-/// от участника события его организатору, отмена — от организатора получателю из `ATTENDEE`.
+/// остаются письмом; обновление, `REPLY` и `CANCEL` к существующему событию применяются (RFC 5546 §6.1, RFC 6638
+/// §11.2): обновление — того же организатора со строго большим `SEQUENCE`, ответ — от участника события его
+/// организатору, отмена — от организатора получателю из `ATTENDEE`.
 #[tokio::test]
 async fn outside_reply_and_cancel_only_to_existing_event() {
     let env = Sched::new().await;
@@ -867,6 +868,62 @@ async fn outside_reply_and_cancel_only_to_existing_event() {
         env.deliver(PETR, ANNA, ItipMethod::Request, &request).await,
         ItipOutcome::Applied
     );
+    // Обновление извне (как у Exchange): тот же ORGANIZER и SEQUENCE строго больше; иначе — письмом.
+    let out = env
+        .deliver_as(
+            SenderKind::External,
+            PETR,
+            ANNA,
+            ItipMethod::Request,
+            &request,
+        )
+        .await;
+    assert!(
+        matches!(out, ItipOutcome::Ignored(_)),
+        "тот же SEQUENCE: {out:?}"
+    );
+    let moved = itip_msg(
+        "REQUEST",
+        &meeting("m-43", ANNA, T14, 1, &attendee(PETR, "NEEDS-ACTION")),
+    );
+    assert_eq!(
+        env.deliver_as(SenderKind::Partner, PETR, ANNA, ItipMethod::Request, &moved)
+            .await,
+        ItipOutcome::Applied
+    );
+    assert!(
+        env.body(PETR, "m-43").await.contains(T14),
+        "время перенесено"
+    );
+    let out = env
+        .deliver_as(
+            SenderKind::Neighbor,
+            PETR,
+            ANNA,
+            ItipMethod::Request,
+            &moved,
+        )
+        .await;
+    assert!(matches!(out, ItipOutcome::Ignored(_)), "повтор: {out:?}");
+    let eve = "eve@evil.example";
+    let hijack = itip_msg(
+        "REQUEST",
+        &meeting("m-43", eve, T10, 5, &attendee(PETR, "NEEDS-ACTION")),
+    );
+    let out = env
+        .deliver_as(
+            SenderKind::External,
+            PETR,
+            eve,
+            ItipMethod::Request,
+            &hijack,
+        )
+        .await;
+    assert!(
+        matches!(out, ItipOutcome::Ignored(_)),
+        "чужой ORGANIZER: {out:?}"
+    );
+    assert!(env.body(PETR, "m-43").await.contains(T14));
     let foreign = itip_msg(
         "CANCEL",
         &meeting("m-43", ANNA, T10, 1, &attendee(OLGA, "NEEDS-ACTION")),

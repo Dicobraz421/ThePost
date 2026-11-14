@@ -751,9 +751,9 @@ iMIP (RFC 6047), занятость. iCalendar контракты не разб�
   приглашение из почтового клиента (submission, JMAP `EmailSubmission`; SMTP-36), если `From` письма принадлежит вошедшей учётной записи
   (свой адрес, псевдоним, право Send As); иначе — письмо без доставки iTIP. CTR-92 (решение 123): `sender` — тип отправителя
   относительно организации получателя `SenderKind::{Own, Partner, Neighbor, External}` (определяет вызывающий по пути и домену `From`);
-  что можно — только `inbound_allowed(sender, InboundAction::of(method, resource))`, действия `InboundAction::{Invite, Reply, Cancel,
-  Other, Booking}`; по умолчанию своей организации (вошедшему) — всё, извне (партнёр, соседняя организация, внешний) — только `Reply`
-  и `Cancel` к существующему событию (не разрешено — `Ok(Ignored)`, ни события, ни брони, ни ответа). Недопустимое (`ItipMessage::validate`),
+  что можно — только `inbound_allowed(sender, InboundAction::of(method, resource, update))`, действия `InboundAction::{Invite, Update, Reply,
+  Cancel, Other, Booking}`; по умолчанию своей организации (вошедшему) — всё, извне (партнёр, соседняя организация, внешний) — только `Update`,
+  `Reply` и `Cancel` к существующему событию (не разрешено — `Ok(Ignored)`, ни события, ни брони, ни ответа). Недопустимое (`ItipMessage::validate`),
   подделанный отправитель, устаревший `SEQUENCE`, чужой `UID` организатора — `Ok(Ignored)`; `Err` — сбой хранилища (идемпотентно,
   повтор безопасен); письмо iMIP при любом итоге остаётся в ящике. Реализация — `tp-dav` (DAV-15); вызывают `tp-smtp` (SMTP-33,
   `Delivery::with_itip`), `tp-dav` (DAV-13), `tp-jmap` (JMAP-31). Заглушка — `FakeItip` (`set(to, outcome)`, `fail_next`, `calls`).
@@ -1204,6 +1204,6 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   типом отправителя `schedule::SenderKind::{Own, Partner, Neighbor, External}` (поле `ItipMessage::sender` вместо `source`): путь
   сообщения не отвечает на вопрос «что можно» — письмо через smtp-in с адресом своего домена и письмо соседней организации установки
   шли одним `Imip`. Матрица «кто — что» — `schedule::inbound_allowed(SenderKind, InboundAction) -> bool`, действия
-  `InboundAction::{Invite, Reply, Cancel, Other, Booking}` (`InboundAction::of(method, resource)`): единственное место решения
+  `InboundAction::{Invite, Update, Reply, Cancel, Other, Booking}` (`InboundAction::of(method, resource, update)`): единственное место решения
   «применять, бронировать, отвечать», позже — настройка администратора с теми же значениями по умолчанию. Несовместимо: поле и тип
   `ItipMessage` (вызывающие — `tp-smtp`, `tp-dav`, `tp-testkit` — в той же волне).
