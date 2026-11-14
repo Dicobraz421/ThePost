@@ -843,6 +843,14 @@
 | [APP-53](APP-53.md) | узел: планирование в JMAP и очистка входящих | app | A | app-46 | done | JMAP-31,DAV-32 |
 | [SMTP-38](SMTP-38.md) | iMIP: отправитель «от имени» (`SENT-BY`) | smtp | A | smtp-19 | ready | SMTP-33,CTR-48 |
 | [APP-58](APP-58.md) | узел: вход GSSAPI | app | A | app-51 | done | DEPS-12 |
+| [APP-71](APP-71.md) | узел — общий доступ, представители и бронирование CalDAV (хвост dav-05) | app | A | app-68 | todo | DAV-17,DAV-18,DAV-19 |
+| [DOC-09](DOC-09.md) | INSTALL — ключи поиска принципалов `dav.principal_search_scan`, `dav.principal_search_results` | docs | A | docs-09 | todo | DAV-19 |
+| [CTR-88](CTR-88.md) | тип ресурса бронирования — помещение или оборудование — в контракте | contracts | B | contracts-59 | ready | — |
+| [META-81](META-81.md) | тип ресурса бронирования в PostgreSQL — миграция и хранилище | meta | A | meta-54 | todo | CTR-88 |
+| [ADM-47](ADM-47.md) | тип ресурса бронирования в Admin API и CLI | admin | A | admin-33 | todo | CTR-88,ADM-44 |
+| [UI-21](UI-21.md) | консоль — тип ресурса бронирования | console | A | console-12 | todo | ADM-47 |
+| [DAV-38](DAV-38.md) | `calendar-user-type` по типу ресурса — `ROOM` или `RESOURCE` | dav | A | dav-17 | todo | CTR-88,DAV-19 |
+| [JMAP-45](JMAP-45.md) | `Principal.type` по типу ресурса — `location` или `resource` | jmap | A | jmap-28 | todo | CTR-88 |
 
 ## Ф4. Выпуск: карточки, заведённые заранее
 
@@ -860,6 +868,8 @@
 | [ADM-43](ADM-43.md) | организация должна существовать; ошибки разбора запроса — 400 problem+json | admin | B | — |
 | [AUTH-09](AUTH-09.md) | пароли приложений на контракте AppPasswordStore | auth | A | CTR-22 |
 | [CTR-22](CTR-22.md) | контракт AppPasswordStore (пароли приложений) | contracts | B | CTR-19,AUTH-02 |
+| [CTR-84](CTR-84.md) | контракт проверки прав на коллекции — `SharingAuthorizer` | contracts | B | CTR-48 |
 | [DAV-36](DAV-36.md) | `dav.schedule_keep_processed` по умолчанию включён | dav | A | DAV-32,APP-53 |
+| [DAV-37](DAV-37.md) | GAL: почтовые контакты в книге «Организация» | dav | B | META-80,DAV-27 |
 | [DOC-07](DOC-07.md) | ожидания APP-28 и CMP-10 по `inbox/`/`outbox/` и ленте уведомлений; значение по умолчанию в INSTALL | docs | A | DAV-36 |
 | [META-80](META-80.md) | почтовые контакты в каталоге PostgreSQL (`Directory::contacts_since`) | meta | A | META-65 |
