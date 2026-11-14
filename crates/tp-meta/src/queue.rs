@@ -18,6 +18,11 @@
 //! Без опроса (CTR-73): после фиксации `enqueue`, `reschedule` и `postpone` — сигнал `QueueReady` организации
 //! записи ([`queue_ready`]); ближайший срок `next_due` — `queue.next_attempt` (наименьший срок незавершённых
 //! получателей, его поддерживает `settle`), у записи под лизой — не раньше конца лизы.
+//!
+//! Просмотр и повтор (META-82, CTR-85): `list` — транзакция организации, записи по `queue_id` порциями, фильтр —
+//! правило контракта [`QueueFilter::matches`]; `retry` — срок попытки `now` под блокировкой строки записи, запись
+//! с действующей лизой не меняется. Миграция не нужна: состояние и лиза — в `queue` и `queue_rcpts`. С шардами
+//! `list` сливает порции шардов по `queue_id`, `retry` идёт на шард записи.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -27,8 +32,8 @@ use sqlx::{FromRow, PgConnection};
 use time::OffsetDateTime;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::queue::{
-    Claimed, DsnNotify, DsnParams, DsnRet, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt,
-    RcptStatus, queue_ready,
+    Claimed, DsnNotify, DsnParams, DsnRet, OutMessage, OutRcpt, QueueClaim, QueueFilter, QueueItem,
+    QueueItemRcpt, QueueRcptState, QueueState, QueueStore, QueuedRcpt, RcptStatus, queue_ready,
 };
 use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, QueueId, Result, TenantId};
 use uuid::Uuid;
@@ -229,6 +234,146 @@ async fn settle(tx: &mut PgConnection, id: QueueId) -> Result<bool> {
                 .await
                 .map_err(db_err)?;
             Ok(false)
+        }
+    }
+}
+
+/// Наименьшая порция строк `queue` за один запрос `list`: фильтр отсеивает часть записей.
+const LIST_CHUNK: usize = 100;
+
+#[derive(FromRow)]
+struct ListRow {
+    queue_id: Uuid,
+    queued_at: OffsetDateTime,
+    next_attempt: OffsetDateTime,
+    mail_from: String,
+    size: i64,
+    lease_until: Option<OffsetDateTime>,
+}
+
+#[derive(FromRow)]
+struct ListRcptRow {
+    queue_id: Uuid,
+    address: String,
+    notify: Option<i16>,
+    orcpt: Option<String>,
+    status: String,
+    next_attempt: OffsetDateTime,
+    attempts: i32,
+    last_error: Option<String>,
+    reply: Option<String>,
+}
+
+impl ListRcptRow {
+    fn into_item(self) -> Result<QueueItemRcpt> {
+        let reply = self.reply.unwrap_or_default();
+        let state = match self.status.as_str() {
+            "pending" => QueueRcptState::Pending {
+                next_attempt: self.next_attempt,
+            },
+            "delivered" => QueueRcptState::Done(RcptStatus::Delivered { reply }),
+            "failed" => QueueRcptState::Done(RcptStatus::Failed { reply }),
+            other => return Err(Error::internal(format!("queue_rcpts.status: {other}"))),
+        };
+        Ok(QueueItemRcpt {
+            rcpt: OutRcpt {
+                address: self.address,
+                notify: parse_notify(self.notify),
+                orcpt: self.orcpt,
+            },
+            state,
+            attempts: u32::try_from(self.attempts)
+                .map_err(|_| Error::internal("отрицательное число попыток"))?,
+            last_error: self.last_error,
+        })
+    }
+}
+
+/// Состояние записи в момент `now` (CTR-85): лиза действует — `Active`, у незавершённого получателя была
+/// временная неудача — `Retry`, иначе `Ready`.
+fn queue_state(
+    lease_until: Option<OffsetDateTime>,
+    rcpts: &[QueueItemRcpt],
+    now: OffsetDateTime,
+) -> QueueState {
+    if lease_until.is_some_and(|u| u > now) {
+        QueueState::Active
+    } else if rcpts
+        .iter()
+        .any(|r| matches!(r.state, QueueRcptState::Pending { .. }) && r.attempts > 0)
+    {
+        QueueState::Retry
+    } else {
+        QueueState::Ready
+    }
+}
+
+/// Записи организации `tenant` после `after` по `queue_id`, прошедшие `filter`, не более `limit` (CTR-85).
+/// Строки читаются порциями по `queue_id` в одной транзакции: фильтр — правило контракта, результат короче
+/// `limit` только на конце очереди организации.
+async fn list_items(
+    tx: &mut PgConnection,
+    tenant: TenantId,
+    filter: &QueueFilter,
+    after: Option<QueueId>,
+    limit: usize,
+    now: OffsetDateTime,
+) -> Result<Vec<QueueItem>> {
+    let chunk = limit.max(LIST_CHUNK);
+    let mut cursor = after.map(|a| *a.as_uuid());
+    let mut out = Vec::new();
+    loop {
+        let entries: Vec<ListRow> = sqlx::query_as(
+            "SELECT queue_id, queued_at, next_attempt, mail_from, size, lease_until FROM queue
+             WHERE tenant_id = $1 AND ($2::uuid IS NULL OR queue_id > $2)
+             ORDER BY queue_id
+             LIMIT $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(cursor)
+        .bind(i64::try_from(chunk).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some(last) = entries.last() else {
+            return Ok(out);
+        };
+        cursor = Some(last.queue_id);
+        let full = entries.len() == chunk;
+        let ids: Vec<Uuid> = entries.iter().map(|e| e.queue_id).collect();
+        let rows: Vec<ListRcptRow> = sqlx::query_as(
+            "SELECT queue_id, address, notify, orcpt, status, next_attempt, attempts, last_error, reply
+             FROM queue_rcpts WHERE queue_id = ANY($1)
+             ORDER BY queue_id, ord",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let mut rcpts: HashMap<Uuid, Vec<QueueItemRcpt>> = HashMap::with_capacity(ids.len());
+        for r in rows {
+            rcpts.entry(r.queue_id).or_default().push(r.into_item()?);
+        }
+        for e in entries {
+            let rcpts = rcpts.remove(&e.queue_id).unwrap_or_default();
+            let item = QueueItem {
+                id: QueueId::from_uuid(e.queue_id),
+                state: queue_state(e.lease_until, &rcpts, now),
+                queued_at: e.queued_at,
+                next_attempt: e.next_attempt,
+                from: e.mail_from,
+                size: to_u64(e.size)?,
+                rcpts,
+            };
+            if filter.matches(&item) {
+                out.push(item);
+                if out.len() == limit {
+                    return Ok(out);
+                }
+            }
+        }
+        if !full {
+            return Ok(out);
         }
     }
 }
@@ -587,6 +732,88 @@ impl QueueStore for PgMeta {
             Ok(!pending)
         })
         .await
+    }
+
+    async fn list(
+        &self,
+        tenant: TenantId,
+        filter: &QueueFilter,
+        after: Option<QueueId>,
+        limit: usize,
+        now: OffsetDateTime,
+    ) -> Result<Vec<QueueItem>> {
+        if limit == 0 {
+            return Err(Error::invalid("просмотр очереди: limit = 0"));
+        }
+        if let Some(views) = self.shard_views().await? {
+            // Каждый шард отдаёт первые `limit` своих записей после курсора: первые `limit` слияния — порция.
+            let mut out = Vec::new();
+            for (_, view) in &views {
+                out.extend(QueueStore::list(view, tenant, filter, after, limit, now).await?);
+            }
+            out.sort_unstable_by_key(|i| i.id);
+            out.truncate(limit);
+            return Ok(out);
+        }
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.pool, tenant).await?;
+            let items = list_items(&mut tx, tenant, filter, after, limit, now).await?;
+            crate::commits::commit(tx).await?;
+            Ok(items)
+        })
+        .await
+    }
+
+    /// Повтор идемпотентен: срок «сейчас» второй раз ничего не меняет. Блокировка строки записи упорядочивает
+    /// повтор с `claim` (`FOR UPDATE SKIP LOCKED`) и операциями захвата.
+    async fn retry(&self, tenant: TenantId, id: QueueId, now: OffsetDateTime) -> Result<bool> {
+        if let Some(views) = self.shard_views().await? {
+            let view = queue_view(self, &views, id).await?;
+            return QueueStore::retry(view, tenant, id, now).await;
+        }
+        let moved = self
+            .idempotent(|| async move {
+                let mut tx = begin(&self.pool, tenant).await?;
+                let lease: Option<Option<OffsetDateTime>> = sqlx::query_scalar(
+                    "SELECT lease_until FROM queue WHERE tenant_id = $1 AND queue_id = $2 FOR UPDATE",
+                )
+                .bind(tenant.as_uuid())
+                .bind(id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let Some(lease) = lease else {
+                    return Err(Error::NotFound);
+                };
+                if lease.is_some_and(|u| u > now) {
+                    crate::commits::commit(tx).await?;
+                    return Ok(false);
+                }
+                sqlx::query(
+                    "UPDATE queue_rcpts SET next_attempt = $2 WHERE queue_id = $1 AND status = 'pending'",
+                )
+                .bind(id.as_uuid())
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                // Отложенное письмо выпускается: от `queued_at` `tp-smtp` считает срок доставки.
+                sqlx::query(
+                    "UPDATE queue SET next_attempt = $2, queued_at = least(queued_at, $2) WHERE queue_id = $1",
+                )
+                .bind(id.as_uuid())
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::commits::commit(tx).await?;
+                Ok(true)
+            })
+            .await?;
+        if moved {
+            self.signal(queue_ready(tenant)).await;
+        }
+        Ok(moved)
     }
 }
 
