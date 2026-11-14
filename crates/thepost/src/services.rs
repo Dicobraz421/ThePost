@@ -639,6 +639,7 @@ impl Services {
             tp_dav::GalDeps {
                 directory: self.org_directory(),
                 groups: Some(Arc::new(self.meta.clone())),
+                contacts: Some(Arc::new(self.meta.clone())),
             },
             Arc::new(self.meta.clone()),
             self.tenant,
