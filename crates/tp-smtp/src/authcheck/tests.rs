@@ -262,12 +262,15 @@ async fn gateway_results_by_authserv_id() {
         .expect("results");
     assert!(out.junk);
     assert!(out.headers.is_empty());
-    let pass = format!("Authentication-Results: gw.example.org; dmarc=pass\r\n{MAIL}");
+    let pass = format!(
+        "Authentication-Results: gw.example.org; dmarc=pass header.from=example.com\r\n{MAIL}"
+    );
     let out = check
         .gateway(pass.as_bytes(), "gw.example.org")
         .await
         .expect("results");
     assert!(!out.junk);
+    assert!(out.dmarc_pass);
     // Результатов шлюза нет — обычные проверки.
     assert!(
         check
@@ -312,6 +315,102 @@ async fn gateway_results_from_arc() {
             .await
             .is_none()
     );
+}
+
+// ---------- Волна smtp-28: доверие к шлюзу (SMTP-47) ----------
+
+/// DMARC пройден по результатам шлюза `results` в `Authentication-Results` письма `mail`.
+async fn gateway_dmarc(check: &AuthCheck, results: &str, mail: &str) -> bool {
+    let raw = format!("Authentication-Results: gw.example.org; {results}\r\n{mail}");
+    check
+        .gateway(raw.as_bytes(), "gw.example.org")
+        .await
+        .expect("results")
+        .dmarc_pass
+}
+
+#[tokio::test]
+async fn gateway_dmarc_pass_needs_header_from_of_message() {
+    let check = checker();
+    let pass = "spf=pass smtp.mailfrom=example.com;\r\n\tdmarc=pass (p=reject dis=none) header.from=Example.COM.";
+    assert!(gateway_dmarc(&check, pass, MAIL).await);
+    // Поддельный AR: `dmarc=pass` о другом домене, без `header.from=` или рядом с несовпадающим результатом.
+    for forged in [
+        "dmarc=pass header.from=attacker.example",
+        "dmarc=pass",
+        "dmarc=pass header.from=example.com; dmarc=pass header.from=attacker.example",
+        "dmarc=fail header.from=example.com policy.dmarc=none",
+        "spf=pass smtp.mailfrom=example.com",
+    ] {
+        assert!(!gateway_dmarc(&check, forged, MAIL).await, "{forged}");
+    }
+    // Адреса `From` разных доменов (в одном заголовке или в двух): домена автора нет — DMARC не пройден.
+    let list = MAIL.replace(
+        "From: sender@example.com",
+        "From: sender@example.com, x@attacker.example",
+    );
+    assert!(!gateway_dmarc(&check, pass, &list).await);
+    let two = MAIL.replace(
+        "From: sender@example.com\r\n",
+        "From: sender@example.com\r\nFrom: x@attacker.example\r\n",
+    );
+    assert!(!gateway_dmarc(&check, pass, &two).await);
+}
+
+/// Письмо `MAIL` со звеном ARC: печать ключом `sealer`, результаты — с authserv-id `authserv_id`.
+async fn arc_sealed(check: &AuthCheck, sealer: &Signer, authserv_id: &str) -> String {
+    let msg = AuthenticatedMessage::parse(MAIL.as_bytes()).expect("parse");
+    let arc = check.resolver.verify_arc(check.params(&msg)).await;
+    let ar = AuthenticationResults::new(authserv_id)
+        .with_arc_result(&arc, "192.0.2.10".parse().expect("ip"));
+    let set = ArcSealer::from_key(sealer.key())
+        .domain(sealer.domain)
+        .selector(sealer.selector)
+        .headers(["From", "To", "Subject"])
+        .seal(&msg, &ar, &arc)
+        .expect("seal");
+    format!("{}{MAIL}", set.to_header())
+}
+
+#[tokio::test]
+async fn gateway_arc_needs_seal_of_gateway_domain() {
+    let check = checker();
+    // Поддельный ARC: цепочка верна, authserv-id шлюза, но печать — ключом чужого домена.
+    let attacker = Signer::new("attacker.example", "arc");
+    attacker.publish(check.cache());
+    let forged = arc_sealed(&check, &attacker, "gw.example.org").await;
+    assert!(
+        check
+            .gateway(forged.as_bytes(), "gw.example.org")
+            .await
+            .is_none()
+    );
+    // Печать родительского домена шлюза — звено шлюза.
+    let org = Signer::new("example.org", "arc");
+    org.publish(check.cache());
+    let sealed = arc_sealed(&check, &org, "gw.example.org").await;
+    assert!(
+        check
+            .gateway(sealed.as_bytes(), "gw.example.org")
+            .await
+            .is_some()
+    );
+}
+
+#[test]
+fn gateway_domain_of_seal() {
+    for (host, domain, want) in [
+        ("gw.example.org", "gw.example.org", true),
+        ("GW.example.org.", "example.ORG", true),
+        ("gw.example.org", "attacker.example", false),
+        ("gw.example.org", "le.org", false),
+        ("gw.example.org", "xgw.example.org", false),
+        ("example.org", "gw.example.org", false),
+        // Домен верхнего уровня — не домен шлюза.
+        ("gw.example.org", "org", false),
+    ] {
+        assert_eq!(within(host, domain), want, "{host} / {domain}");
+    }
 }
 
 #[tokio::test]

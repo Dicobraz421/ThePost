@@ -825,6 +825,34 @@ async fn deliver_each_method_idempotent() {
 }
 
 #[tokio::test]
+async fn request_only_to_attendee() {
+    // DAV-41: приглашение извне тому, кого нет среди участников, в календарь не попадает.
+    let env = Sched::new().await;
+    let spam = itip_msg(
+        "REQUEST",
+        &meeting("m-41", ANNA, T10, 0, &attendee(OLGA, "NEEDS-ACTION")),
+    );
+    let out = env.deliver(PETR, ANNA, ItipMethod::Request, &spam).await;
+    assert!(matches!(out, ItipOutcome::Ignored(_)), "{out:?}");
+    assert!(env.by_uid(PETR, "m-41").await.is_none(), "события нет");
+    assert_eq!(
+        env.inbox_len(PETR).await,
+        0,
+        "во входящих планирования пусто"
+    );
+    let add = spam.replace("METHOD:REQUEST", "METHOD:ADD");
+    let out = env.deliver(PETR, ANNA, ItipMethod::Add, &add).await;
+    assert!(matches!(out, ItipOutcome::Ignored(_)), "{out:?}");
+    assert_eq!(env.inbox_len(PETR).await, 0);
+    // Участнику то же приглашение — в календарь.
+    assert_eq!(
+        env.deliver(OLGA, ANNA, ItipMethod::Request, &spam).await,
+        ItipOutcome::Applied
+    );
+    assert!(env.by_uid(OLGA, "m-41").await.is_some());
+}
+
+#[tokio::test]
 async fn reply_only_from_attendee() {
     let env = Sched::new().await;
     let v = meeting(

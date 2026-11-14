@@ -4,6 +4,13 @@
 //! Результат — заголовки `Authentication-Results` (RFC 8601) и `Received-SPF`, добавляемые к письму перед
 //! доставкой, и признак «в Спам»: проверка DMARC не прошла, а политика домена отправителя — `quarantine` или
 //! `reject`. Письмо не отклоняется: решение о нём — у получателя (папка «Спам»).
+//!
+//! Письмо от доверенного шлюза без данных об исходном клиенте не проверяется повторно: принимаются результаты
+//! шлюза ([`AuthCheck::gateway`]). Им можно верить, только если шлюз выполняет RFC 8601 §5: удаляет из входящего
+//! письма заголовки `Authentication-Results` со своим authserv-id, поставленные не им. Иначе отправитель впишет их
+//! сам, и подделку, совпадающую с письмом, узел не отличит. Что узел проверяет сам: `dmarc=pass` засчитывается
+//! только с `header.from=` домена `From` письма, а звено ARC — только с печатью `d=` домена шлюза (authserv-id —
+//! этот домен или его поддомен), ключ которого опубликован в DNS.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -233,42 +240,47 @@ impl AuthCheck {
 impl AuthCheck {
     /// Результаты проверок шлюза (SMTP-20) — письмо от доверенного шлюза без данных об исходном клиенте:
     /// верхний заголовок `Authentication-Results` с authserv-id `authserv_id`, иначе — `ARC-Authentication-Results`
-    /// последнего звена цепочки ARC, если цепочка проходит проверку и звено поставил этот authserv-id. Признак
-    /// «в Спам» — DMARC `fail` при политике `quarantine` или `reject` в результатах шлюза. Заголовки не
-    /// добавляются (результаты шлюза уже в письме). `None` — результатов шлюза нет: проверки — как обычно.
+    /// последнего звена цепочки ARC, если цепочка проходит проверку, звено поставил этот authserv-id, а печать звена
+    /// подписана доменом шлюза (SMTP-47). DMARC пройден — `dmarc=pass` с `header.from=` домена `From` письма; признак
+    /// «в Спам» — DMARC `fail` при политике `quarantine` или `reject` в результатах шлюза. Заголовки не добавляются
+    /// (результаты шлюза уже в письме). `None` — результатов шлюза нет: проверки — как обычно.
     pub async fn gateway(&self, raw: &[u8], authserv_id: &str) -> Option<Outcome> {
+        let msg = AuthenticatedMessage::parse(raw)?;
         let results = match trusted_results(raw, authserv_id) {
             Some(r) => r,
-            None => {
-                let msg = AuthenticatedMessage::parse(raw)?;
-                let arc = self.resolver.verify_arc(self.params(&msg)).await;
-                if !matches!(arc.result(), mail_auth::DkimResult::Pass) {
-                    return None;
-                }
-                let last = arc.chain().last()?;
-                let value = String::from_utf8_lossy(last.results.value).into_owned();
-                // `i=N; authserv-id; результаты`.
-                let (_, rest) = value.split_once(';')?;
-                let (id, results) = rest.split_once(';').unwrap_or((rest, ""));
-                if !id.trim().eq_ignore_ascii_case(authserv_id) {
-                    return None;
-                }
-                results.to_owned()
-            }
+            None => self.arc_results(&msg, authserv_id).await?,
         };
-        let lower = results.to_ascii_lowercase();
-        let has = |token: &str| {
-            lower
-                .split([';', ' ', '\t', '\r', '\n'])
-                .any(|t| t == token)
-        };
-        let junk = has("dmarc=fail")
-            && (lower.contains("policy.dmarc=quarantine") || lower.contains("policy.dmarc=reject"));
+        let (dmarc_pass, junk) = dmarc_verdict(&results, msg.from_addresses());
         Some(Outcome {
             headers: String::new(),
             junk,
-            dmarc_pass: has("dmarc=pass"),
+            dmarc_pass,
         })
+    }
+
+    /// Результаты последнего звена ARC письма `msg`, если цепочка проходит проверку, а звено поставил шлюз
+    /// `authserv_id`: authserv-id в `ARC-Authentication-Results` впишет кто угодно, домен печати `d=` подтверждён
+    /// ключом в DNS — он должен быть доменом шлюза.
+    async fn arc_results(
+        &self,
+        msg: &AuthenticatedMessage<'_>,
+        authserv_id: &str,
+    ) -> Option<String> {
+        let arc = self.resolver.verify_arc(self.params(msg)).await;
+        if !matches!(arc.result(), mail_auth::DkimResult::Pass) {
+            return None;
+        }
+        let last = arc.chain().last()?;
+        if !within(authserv_id, &last.seal.header.d) {
+            return None;
+        }
+        let value = String::from_utf8_lossy(last.results.value).into_owned();
+        // `i=N; authserv-id; результаты`.
+        let (_, rest) = value.split_once(';')?;
+        let (id, results) = rest.split_once(';').unwrap_or((rest, ""));
+        let id = id.split_whitespace().next()?;
+        id.eq_ignore_ascii_case(authserv_id)
+            .then(|| results.to_owned())
     }
 
     /// Заголовки набора ARC (RFC 8617) узла для пересылаемого письма `raw` (с `\r\n`); `ip` — адрес клиента,
@@ -293,6 +305,50 @@ impl AuthCheck {
             }
         }
     }
+}
+
+/// Имя `host` — домен `domain` или его поддомен; домен — не верхнего уровня.
+fn within(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    domain.contains('.')
+        && (host == domain
+            || host
+                .strip_suffix(domain.as_str())
+                .is_some_and(|sub| sub.ends_with('.')))
+}
+
+/// DMARC в результатах шлюза `results` для письма с адресами `From` `from`: (пройден, «в Спам»). Пройден — есть
+/// результат `dmarc` и каждый — `pass` с `header.from=` домена автора: результат о другом `From` к письму не
+/// относится. Домен автора — один у всех адресов `From` (как у DMARC в mail-auth), иначе DMARC не пройден.
+fn dmarc_verdict(results: &str, from: &[String]) -> (bool, bool) {
+    let lower = results.to_ascii_lowercase();
+    let mut domains = from
+        .iter()
+        .map(|a| a.rsplit_once('@').map(|(_, d)| d.trim_end_matches('.')));
+    let author = match domains.next() {
+        Some(Some(d)) if domains.all(|x| x == Some(d)) => Some(d),
+        _ => None,
+    };
+    let (mut any, mut pass, mut junk) = (false, true, false);
+    for resinfo in lower.split(';') {
+        let mut tokens = resinfo.split_whitespace();
+        let Some(result) = tokens.next().and_then(|t| t.strip_prefix("dmarc=")) else {
+            continue;
+        };
+        any = true;
+        let props: Vec<&str> = tokens.collect();
+        let header_from = props
+            .iter()
+            .find_map(|t| t.strip_prefix("header.from="))
+            .map(|d| d.trim_matches('"').trim_end_matches('.'));
+        pass &= result == "pass" && author.is_some() && header_from == author;
+        junk |= result == "fail"
+            && props
+                .iter()
+                .any(|t| matches!(*t, "policy.dmarc=quarantine" | "policy.dmarc=reject"));
+    }
+    (any && pass, junk)
 }
 
 /// Результаты верхнего заголовка `Authentication-Results` с authserv-id `id` (без него).
