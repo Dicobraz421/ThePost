@@ -4079,7 +4079,7 @@ mod tests {
             .await
             .expect("source list");
         for part in [
-            "192.0.2.0/24",
+            "198.51.100.0/24",
             "XCLIENT",
             "authserv-id mx.res.test",
             "сертификат mfu.res.test",
