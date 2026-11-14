@@ -1,4 +1,4 @@
-# DOC-10: INSTALL — брендинг заказчика
+# DOC-11: INSTALL — брендинг заказчика
 
 lane: docs
 deps: [ADM-48]
