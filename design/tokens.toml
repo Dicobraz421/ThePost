@@ -158,7 +158,7 @@ err = ["bold"]
 # 8–15 — яркие. Красные (1, 9) — только у err.
 [palette16]
 colors = [
-  "#0F1317", "#C62828", "#0E8483", "#9A6F00", "#177CAA", "#E3107F", "#1EA19F", "#D8E7F4",
+  "#0F1317", "#C62828", "#0E8483", "#9A6F00", "#177CAA", "#E3107F", "#1A9694", "#D8E7F4",
   "#7E8A96", "#FF5C5C", "#2EBCBA", "#E7B512", "#3A9BD5", "#FB5FB0", "#2EBCBA", "#FFFFFF",
 ]
 
@@ -227,7 +227,7 @@ min = 3.0
 # Подсветка вывода CLI (`thepost admin`, `doctor`, `config check`, справка) — добавлено по запросу владельца.
 # CLI не знает фон терминала: по умолчанию — коды ANSI (ansi, параметры SGR) из палитры терминала; фирменные
 # значения (brand, с атрибутами attrs) — только при COLORTERM=truecolor. Каждый brand не ниже min на обоих фонах.
-# ok и json_number — #1EA19F, а не #1FA5A3: на #FAFAFA #1FA5A3 даёт 2,89:1.
+# ok и json_number — #1A9694, а не #1FA5A3 (решение 120): на #FAFAFA #1FA5A3 даёт 2,89:1.
 [cli]
 backgrounds = ["#0C0C0C", "#FAFAFA"]
 min = 3.0
@@ -235,12 +235,12 @@ min = 3.0
 [cli.roles]
 head = { ansi = "1;94", brand = "#2A8BC4", attrs = ["bold"] }
 accent = { ansi = "95", brand = "#E4107F", attrs = [] }
-ok = { ansi = "92", brand = "#1EA19F", attrs = [] }
+ok = { ansi = "92", brand = "#1A9694", attrs = [] }
 warn = { ansi = "1;33", brand = "#B07D00", attrs = ["bold"] }
 err = { ansi = "1;91", brand = "#E5484D", attrs = ["bold"] }
 muted = { ansi = "2", brand = "#7E8A96", attrs = ["dim"] }
 json_key = { ansi = "94", brand = "#2A8BC4", attrs = [] }
-json_number = { ansi = "96", brand = "#1EA19F", attrs = [] }
+json_number = { ansi = "96", brand = "#1A9694", attrs = [] }
 json_bool = { ansi = "95", brand = "#E4107F", attrs = [] }
 
 [cli.rules]
