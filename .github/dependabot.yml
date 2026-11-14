@@ -20,6 +20,11 @@ updates:
     schedule: { interval: weekly, day: monday }
     groups:
       npm: { patterns: ["*"], update-types: [minor, patch] }
+    # react-router 8 несовместим с @refinedev/react-router 2.x (peer ^7, две копии роутера — консоль не работает,
+    # #452 закрыт после теста). Снять, когда адаптер Refine поддержит 8.
+    ignore:
+      - dependency-name: react-router
+        update-types: [version-update:semver-major]
     open-pull-requests-limit: 2
     commit-message: { prefix: build, include: scope }
   - package-ecosystem: docker
