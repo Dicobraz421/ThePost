@@ -247,13 +247,10 @@ blob:
 
     #[test]
     fn cli_parses_admin_init() {
-        use clap::Parser;
+        use crate::cli::{AdminAction, Command, try_parse_from};
 
-        use crate::cli::{AdminAction, Cli, Command};
-
-        let cli =
-            Cli::try_parse_from(["thepost", "admin", "init", "--email", "a@b.test", "--force"])
-                .expect("parse");
+        let cli = try_parse_from(["thepost", "admin", "init", "--email", "a@b.test", "--force"])
+            .expect("parse");
         let Command::Admin {
             action: AdminAction::Init { email, force, .. },
             ..
@@ -262,7 +259,7 @@ blob:
             panic!("{:?}", cli.command)
         };
         assert_eq!((email.as_deref(), force), (Some("a@b.test"), true));
-        assert!(Cli::try_parse_from(["thepost", "admin", "init", "--mail", "x"]).is_err());
+        assert!(try_parse_from(["thepost", "admin", "init", "--mail", "x"]).is_err());
     }
 
     /// Клиент: запрос строкой JSON, ответ узла — текст с паролем и токеном или ошибка с причиной.

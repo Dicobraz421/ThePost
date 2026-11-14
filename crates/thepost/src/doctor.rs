@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use serde::Serialize;
+use tp_admin_client::style::{self, Role, State, Theme};
 use tp_cluster::NodeTls;
 use tp_contracts::blob::BlobStore;
 use tp_contracts::secrets::{Secret, SecretStore};
@@ -52,6 +53,18 @@ impl Status {
             Status::Warn => "WARN",
             Status::Fail => "FAIL",
         }
+    }
+
+    /// Знак и метка в цвете итога: ✓ `OK`, ▲ `WARN`, × `FAIL`; у пропущенной проверки знака нет — `SKIP` (`muted`)
+    /// с отступом под знак.
+    fn render(self, theme: Theme) -> String {
+        let state = match self {
+            Status::Skipped => return format!("  {}", theme.paint(Role::Muted, self.label())),
+            Status::Ok => State::Done,
+            Status::Warn => State::Warn,
+            Status::Fail => State::Err,
+        };
+        theme.state(state, self.label())
     }
 }
 
@@ -137,43 +150,62 @@ impl Report {
         self.checks.iter().find(|c| c.id == id)
     }
 
-    /// JSON (`--json`).
-    pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(self).map_err(|e| Error::internal(e.to_string()))
+    /// JSON (`--json`) в оформлении `theme` (решение 120): без цвета — `serde_json::to_string_pretty` байт в байт.
+    pub fn to_json(&self, theme: Theme) -> Result<String> {
+        style::json(theme, self).map_err(|e| Error::internal(e.to_string()))
     }
 
-    /// Таблица для терминала.
-    pub fn to_table(&self) -> String {
-        let width = |f: fn(&Check) -> usize, title: &str| {
-            self.checks
-                .iter()
-                .map(f)
-                .max()
-                .unwrap_or(0)
-                .max(title.chars().count())
-        };
-        let w_id = width(|c| c.id.chars().count(), "ПРОВЕРКА");
-        let w_value = width(|c| c.value.chars().count(), "ЗНАЧЕНИЕ");
-        let pad =
-            |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(s.chars().count())));
-        let mut out = format!(
-            "{}  {}  {}  ПОЯСНЕНИЕ\n",
-            pad("ИТОГ", 4),
-            pad("ПРОВЕРКА", w_id),
-            pad("ЗНАЧЕНИЕ", w_value)
-        );
-        for c in &self.checks {
-            out.push_str(&format!(
-                "{}  {}  {}  {}\n",
-                pad(c.status.label(), 4),
-                pad(&c.id, w_id),
-                pad(&c.value, w_value),
-                c.message
-            ));
-        }
-        out.push_str(&format!("Итог: {}\n", self.worst().label()));
+    /// Таблица для терминала в оформлении `theme` (решение 120, APP-70): шапка — `head`; итог проверки — знак и
+    /// метка (✓ `OK`, ▲ `WARN`, × `FAIL`); пути файлов — `muted`; последняя строка — счёт ошибок и предупреждений
+    /// в цвете худшего итога. Без цвета знаки те же.
+    pub fn render(&self, theme: Theme) -> String {
+        let rows: Vec<Vec<String>> = self
+            .checks
+            .iter()
+            .map(|c| {
+                let value = if c.value.starts_with('/') {
+                    theme.paint(Role::Muted, &c.value)
+                } else {
+                    c.value.clone()
+                };
+                vec![
+                    c.status.render(theme),
+                    c.id.clone(),
+                    value,
+                    c.message.clone(),
+                ]
+            })
+            .collect();
+        let mut out = style::table(theme, &["ИТОГ", "ПРОВЕРКА", "ЗНАЧЕНИЕ", "ПОЯСНЕНИЕ"], &rows);
+        out.push_str(&self.summary(theme));
+        out.push('\n');
         out
     }
+
+    /// «итог: 1 ошибка, 1 предупреждение» в цвете худшего итога со знаком.
+    fn summary(&self, theme: Theme) -> String {
+        let count = |s: Status| self.checks.iter().filter(|c| c.status == s).count();
+        let (fails, warns) = (count(Status::Fail), count(Status::Warn));
+        let fails_text = plural(fails, "ошибка", "ошибки", "ошибок");
+        let warns_text = plural(warns, "предупреждение", "предупреждения", "предупреждений");
+        match (fails, warns) {
+            (0, 0) => theme.state(State::Done, "итог: ошибок и предупреждений нет"),
+            (0, _) => theme.state(State::Warn, &format!("итог: {warns_text}")),
+            (_, 0) => theme.state(State::Err, &format!("итог: {fails_text}")),
+            _ => theme.state(State::Err, &format!("итог: {fails_text}, {warns_text}")),
+        }
+    }
+}
+
+/// Число и слово в нужной форме: 1 ошибка, 2 ошибки, 5 ошибок.
+fn plural(n: usize, one: &str, few: &str, many: &str) -> String {
+    let word = match (n % 10, n % 100) {
+        (_, 11..=14) => many,
+        (1, _) => one,
+        (2..=4, _) => few,
+        _ => many,
+    };
+    format!("{n} {word}")
 }
 
 /// Сообщение ошибки без префикса варианта.
@@ -1104,9 +1136,9 @@ mod tests {
             Some(Status::Fail)
         );
         assert_eq!(report.exit_code(), 1);
-        let json = report.to_json().expect("json");
+        let json = report.to_json(Theme::PLAIN).expect("json");
         assert!(json.contains("\"status\": \"fail\""), "{json}");
-        assert!(report.to_table().contains("FAIL"));
+        assert!(report.render(Theme::PLAIN).contains("× FAIL"));
     }
 
     #[tokio::test]
