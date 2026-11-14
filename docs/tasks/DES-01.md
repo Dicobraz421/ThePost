@@ -4,7 +4,7 @@ lane: design
 deps: []
 class: B
 files: [design/*, lanes.toml, scripts/design_contrast.py, .github/workflows/ci.yml, deploy/docker/Dockerfile]
-read: [docs/decisions/2026-11-11-stage2-followups.md#119]
+read: [docs/decisions/2026-11-11-stage2-followups.md#119, docs/decisions/2026-11-11-stage2-followups.md#120]
 checks: [ci]
 manual: no
 
@@ -14,6 +14,11 @@ manual: no
   рамка активной панели, норма, внимание, ошибка) для режимов truecolor тёмный и светлый, 256 и 16 цветов, монохром
   (атрибуты вместо цвета); знаки состояний (● ▲ ×); шрифты (Bebas Neue Bold, Evolventa) — имена и начертания. Красный —
   только у ролей ошибки и безопасности.
+- Раздел `[cli]` (решение 120) — роли вывода CLI `head`, `accent`, `ok`, `warn`, `err`, `muted` и роли JSON (ключ, число,
+  `true`/`false`): у каждой SGR для 16 цветов (`1;94`, `95`, `92`, `1;33`, `1;91`, `2`; JSON — `94`, `96`, `95`) и
+  фирменное значение truecolor (`#2A8BC4`, `#E4107F`, `#1FA5A3`, `#B07D00`, `#E5484D`, `#7E8A96`); знаки ✓ ● ▲ ×.
+  Фон терминала неизвестен: фирменные значения `[cli]` проверяются на контраст не ниже 3:1 и на светлом `#FAFAFA`, и
+  на тёмном `#0C0C0C`.
 - `design/logo.svg` — знак IT TASK (куб: верх `#E4107F`, левая грань `#D8E7F4` → `#177CAA` сверху вниз, правая
   `#177CAA` → `#E4107F` снизу вверх); надпись белая и чёрная — два варианта.
 - `scripts/design_contrast.py` (`tomllib`, без зависимостей): у каждой пары «текст на фоне» — не ниже 4,5:1 (WCAG AA),
