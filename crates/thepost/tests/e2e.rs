@@ -20,6 +20,9 @@
 //! представитель через `PROPPATCH group-member-set`, приглашение переговорной — бронь в её календаре и ответ
 //! организатору.
 //!
+//! Ответ ресурса внешнему организатору (APP-73): приглашение переговорной письмом iMIP через доверенный шлюз —
+//! отказ (организатор вне организации) и `REPLY` письмом iMIP в очереди исходящей почты.
+//!
 //! Без `TEST_DATABASE_URL` тесты пропускаются.
 
 use std::path::{Path, PathBuf};
@@ -2086,6 +2089,275 @@ async fn sharing_delegates_and_booking() {
         Some("ACCEPTED"),
         "ответа переговорной нет у организатора: {mine}"
     );
+
+    pool.close().await;
+    shutdown.cancel();
+    let report = running.wait().await.expect("report");
+    assert!(report.failed.is_empty(), "{report:?}");
+    drop_database(&url, &db_name).await;
+}
+
+// ---------- APP-73: ответ ресурса внешнему организатору ----------
+
+/// Ответ `EHLO` целиком (строки расширений).
+async fn smtp_ehlo(addr: std::net::SocketAddr) -> String {
+    let mut s = TcpStream::connect(addr).await.expect("smtp connect");
+    assert_eq!(smtp_reply(&mut s).await, 220);
+    s.write_all(b"EHLO client.test\r\n")
+        .await
+        .expect("smtp write");
+    let mut text = String::new();
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        s.read_exact(&mut byte).await.expect("smtp read");
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            buf.clear();
+            text.push_str(&line);
+            if line.len() >= 4 && line.as_bytes()[3] == b' ' {
+                return text;
+            }
+        }
+    }
+}
+
+/// Письма очереди исходящей почты получателю `address`: тело каждого из BLOB (с распаковкой).
+async fn queued_bodies(
+    pool: &tp_meta::pool::DbPool,
+    meta: &PgMeta,
+    dir: &Path,
+    address: &str,
+) -> Vec<Vec<u8>> {
+    use futures::TryStreamExt as _;
+    use tp_contracts::blob::BlobStore;
+    use tp_contracts::ids::{BlobHash, BlobKey, Gen};
+
+    let mut tx = tp_meta::schema::begin(pool, TenantId::DEFAULT)
+        .await
+        .expect("begin");
+    let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT q.blob_hash, q.blob_gen FROM queue q JOIN queue_rcpts r USING (queue_id) \
+         WHERE r.address = $1 ORDER BY q.queued_at",
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("queue");
+    drop(tx);
+    let local = tp_blob::LocalStore::open(tp_blob::LocalConfig {
+        root: dir.join("blob"),
+        ..tp_blob::LocalConfig::default()
+    })
+    .await
+    .expect("blob");
+    let blobs = tp_blob::Decompressing::new(Arc::new(local), Arc::new(meta.clone()));
+    let mut out = Vec::new();
+    for (hash, generation) in rows {
+        let key = BlobKey {
+            tenant: TenantId::DEFAULT,
+            hash: BlobHash(hash.try_into().expect("sha-256")),
+            generation: Gen(u32::try_from(generation).expect("generation")),
+        };
+        let chunks: Vec<_> = blobs
+            .get(&key, None)
+            .await
+            .expect("blob get")
+            .try_collect()
+            .await
+            .expect("blob read");
+        out.push(chunks.concat());
+    }
+    out
+}
+
+/// Часть `text/calendar` письма: (параметр `method`, текст iCalendar).
+fn calendar_part(raw: &[u8]) -> Option<(String, String)> {
+    use mail_parser::MimeHeaders as _;
+
+    let msg = mail_parser::MessageParser::default().parse(raw)?;
+    msg.parts.iter().find_map(|p| {
+        let ct = p.content_type()?;
+        let calendar = ct.ctype().eq_ignore_ascii_case("text")
+            && ct
+                .subtype()
+                .is_some_and(|s| s.eq_ignore_ascii_case("calendar"));
+        let method = ct.attribute("method").filter(|_| calendar)?;
+        Some((
+            method.to_owned(),
+            String::from_utf8_lossy(p.contents()).into_owned(),
+        ))
+    })
+}
+
+/// Приглашение переговорной письмом iMIP с внешнего адреса (APP-73, после #764): письмо `REQUEST` приходит через
+/// доверенный шлюз (`Authentication-Results` с `dmarc=pass`), приём iTIP узла решает по правилам бронирования —
+/// организатор вне организации бронировать не может (`BookingPolicy::allows`), поэтому брони в календаре ресурса нет,
+/// а ответ `REPLY` со статусом `DECLINED` и причиной (`COMMENT`) уходит внешнему организатору письмом iMIP в очередь
+/// исходящей почты (`ImipSender` узла). Принятие (`ACCEPTED`) организатору из организации проверяет
+/// `sharing_delegates_and_booking`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resource_reply_to_external_organizer() {
+    use tp_contracts::dav::{CollectionKind, DavStore};
+    use tp_contracts::schedule::ItipMethod;
+    use tp_contracts::sharing::{BookingPolicy, ResourceStore};
+    use tp_contracts::transport::{SourceKind, SourceMatch, TrustedSource};
+
+    let Some(url) = tp_testkit::pg_url() else {
+        eprintln!("TEST_DATABASE_URL не задан — тест пропущен");
+        return;
+    };
+    let url = dev_url(&url);
+    let (db_name, url_db) = create_database(&url).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db_url, password) = split_password(&url_db);
+    let secrets = node_secrets(password);
+
+    let domain = "example.ru".to_owned();
+    let path = dir.path().join("config.yaml");
+    // Без роли smtp-out: письмо iMIP остаётся в очереди, его никто не забирает.
+    let text = config(dir.path(), &db_url, &domain).replace(
+        "roles: [all]",
+        "roles: [smtp-in, imap, jmap, dav, search, indexer, maintenance]",
+    );
+    assert!(!text.contains("roles: [all]"), "{text}");
+    std::fs::write(&path, text).expect("config");
+    let shutdown = CancellationToken::new();
+    let running = start(ServeOptions {
+        config: path,
+        secrets: Some(secrets.clone() as Arc<dyn SecretStore>),
+        telemetry: false,
+        shutdown: shutdown.clone(),
+        modules: thepost::modules::BUILTIN,
+    })
+    .await
+    .expect("start");
+    let until = deadline();
+    while !running.health.is_ready() {
+        retry(until, "узел готов").await;
+    }
+    let smtp = addr(&running, "smtp-in");
+
+    let pool = db_pool(&url_db).await;
+    let meta = PgMeta::new(pool.clone(), MetaConfig::default());
+    let tenant = TenantId::DEFAULT;
+    let domain_id = accept_domain(&meta, tenant, &domain).await;
+    let room = format!("room@{domain}");
+    let account = meta
+        .upsert(
+            tenant,
+            AccountUpsert {
+                domain: domain_id,
+                login: room.clone(),
+                display_name: "Переговорная".to_owned(),
+                external_id: None,
+                enabled: true,
+                aliases: Vec::new(),
+                kind: AccountKind::Resource,
+                hidden_from_gal: false,
+                resource_type: None,
+            },
+        )
+        .await
+        .expect("account");
+    let room_scope = AccountScope {
+        tenant,
+        account: account.id,
+    };
+    ResourceStore::set_booking_policy(
+        &meta,
+        room_scope,
+        Some(BookingPolicy {
+            horizon: None,
+            ..BookingPolicy::default()
+        }),
+    )
+    .await
+    .expect("правила бронирования");
+
+    // Доверенный шлюз кластера для 127.0.0.1: результаты его проверок (`Authentication-Results`) — вместо DNS.
+    let authserv = "gw.example.ru";
+    let version = TransportStore::cluster(&meta)
+        .await
+        .expect("transport")
+        .version;
+    meta.put_source(
+        version,
+        &TrustedSource {
+            name: "gateway".to_owned(),
+            tenant: None,
+            matcher: SourceMatch::Networks(vec!["127.0.0.1/32".parse().expect("net")]),
+            kind: SourceKind::Gateway {
+                xclient: true,
+                authserv_id: Some(authserv.to_owned()),
+            },
+        },
+    )
+    .await
+    .expect("источник");
+    // Снимок без перезапуска (`TransportChanged`): шлюзу `EHLO` объявляет `XCLIENT`.
+    let until = deadline();
+    while !smtp_ehlo(smtp).await.contains("XCLIENT") {
+        retry(until, "шлюз действует на новую сессию").await;
+    }
+
+    // Приглашение письмом iMIP с внешнего адреса (`smtp_send` переводит `\n` в `\r\n`).
+    let organizer = "carol@external.test";
+    let uid = "app-73-room";
+    let ics = format!(
+        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//external//e2e//EN\nMETHOD:REQUEST\nBEGIN:VEVENT\n\
+         UID:{uid}\nDTSTAMP:20261112T100000Z\nDTSTART:20270114T070000Z\n\
+         DTEND:20270114T080000Z\nSEQUENCE:0\nSUMMARY:External booking\n\
+         ORGANIZER:mailto:{organizer}\n\
+         ATTENDEE;PARTSTAT=ACCEPTED:mailto:{organizer}\n\
+         ATTENDEE;CUTYPE=ROOM;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{room}\n\
+         END:VEVENT\nEND:VCALENDAR\n"
+    );
+    let message = format!(
+        "Authentication-Results: {authserv}; spf=pass smtp.mailfrom=external.test;\n \
+         dkim=pass header.d=external.test; dmarc=pass header.from=external.test\n\
+         From: Carol <{organizer}>\nTo: <{room}>\nSubject: Invitation: External booking\n\
+         Message-ID: <app73-{}@external.test>\nDate: Thu, 12 Nov 2026 10:00:00 +0000\n\
+         MIME-Version: 1.0\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\n\n{ics}",
+        std::process::id()
+    );
+    smtp_send(smtp, organizer, &room, &message).await;
+
+    // Ответ ресурса — письмо iMIP внешнему организатору в очереди исходящей почты.
+    let until = deadline();
+    let bodies = loop {
+        let bodies = queued_bodies(&pool, &meta, dir.path(), organizer).await;
+        if !bodies.is_empty() {
+            break bodies;
+        }
+        retry(until, "ответ ресурса в очереди исходящей почты").await;
+    };
+    assert_eq!(bodies.len(), 1, "ответ ресурса не один");
+    let raw = &bodies[0];
+    let (method, reply) = calendar_part(raw)
+        .unwrap_or_else(|| panic!("нет части text/calendar: {}", String::from_utf8_lossy(raw)));
+    assert!(method.eq_ignore_ascii_case("REPLY"), "{method}");
+    let itip = tp_dav::itip::parse(&reply).unwrap_or_else(|e| panic!("не iTIP ({e:?}): {reply}"));
+    assert_eq!(itip.method, ItipMethod::Reply, "{reply}");
+    assert_eq!(itip.meeting.uid, uid);
+    assert_eq!(itip.meeting.organizer.as_deref(), Some(organizer));
+    let attendee = itip
+        .meeting
+        .attendee(&room)
+        .unwrap_or_else(|| panic!("в ответе нет ресурса: {reply}"));
+    assert_eq!(attendee.partstat, "DECLINED", "{reply}");
+    assert!(reply.contains("COMMENT"), "у отказа нет причины: {reply}");
+    // Отказ: брони в календаре ресурса нет.
+    for c in DavStore::list_collections(&meta, room_scope, CollectionKind::Calendar)
+        .await
+        .expect("calendars")
+    {
+        let booked = DavStore::object_by_uid(&meta, room_scope, c.id, uid)
+            .await
+            .expect("object");
+        assert!(booked.is_none(), "бронь внешнего организатора: {booked:?}");
+    }
 
     pool.close().await;
     shutdown.cancel();
