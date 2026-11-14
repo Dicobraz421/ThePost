@@ -188,8 +188,6 @@ pub struct Jmap {
     pub(crate) org: Option<Arc<dyn OrgStore>>,
     /// Общий доступ к календарям и адресным книгам (JMAP-32); `None` — только свои коллекции.
     pub(crate) sharing: Option<SharingDeps>,
-    /// `ShareNotification` учётных записей (в памяти узла).
-    pub(crate) notices: crate::sharing::Notices,
     stop: watch::Sender<bool>,
     /// Открытые соединения push: закрытие по `AccountDisabled` (JMAP-41).
     pub(crate) push: crate::disable::Sessions,
@@ -331,7 +329,6 @@ impl Jmap {
             sender_lists: None,
             org: None,
             sharing: None,
-            notices: crate::sharing::Notices::default(),
             stop: watch::channel(false).0,
             push: crate::disable::Sessions::default(),
         })
@@ -397,7 +394,7 @@ impl Jmap {
     }
 
     /// Подключает планирование встреч (CONTRACTS.md#Schedule, JMAP-31): `CalendarEvent/set` с
-    /// `sendSchedulingMessages` рассылает iTIP теми же зависимостями, что CalDAV (`tp_dav::router_with`):
+    /// `sendSchedulingMessages` рассылает iTIP теми же зависимостями, что CalDAV (`tp_dav::router_shared`):
     /// учётным записям организации — `ItipDelivery`, внешним — `ItipSender`. `None` — запрос с
     /// `sendSchedulingMessages: true` отклоняется (`invalidArguments`).
     #[must_use]
@@ -426,7 +423,8 @@ impl Jmap {
     /// Подключает общий доступ к календарям и адресным книгам (CONTRACTS.md#Sharing, JMAP-32): чужие коллекции с
     /// правами субъекта — в аккаунтах владельцев (`isPersonal` = `false`); `myRights`, видимость и выдача прав — по
     /// единому слою прав [`tp_contracts::sharing::SharingAuthorizer`], `shareWith` — записи
-    /// [`tp_contracts::sharing::CollectionAcl`]; `ShareNotification`. `None` — только свои коллекции, `shareWith` —
+    /// [`tp_contracts::sharing::CollectionAcl`]; `ShareNotification` — записи
+    /// [`tp_contracts::sharing::ShareNotificationStore`]. `None` — только свои коллекции, `shareWith` —
     /// `null`.
     #[must_use]
     pub fn with_sharing(mut self, sharing: Option<SharingDeps>) -> Self {
