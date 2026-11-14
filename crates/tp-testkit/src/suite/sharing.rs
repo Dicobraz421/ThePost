@@ -1,19 +1,20 @@
 //! Наборы проверок общего доступа (CTR-48, CONTRACTS.md#Sharing): права на коллекции, представители, правила
-//! бронирования ресурсов, политика организации. In-memory (`MemDav`, `MemMetadata`) и `PgMeta` (META-52) проходят
-//! одни и те же проверки.
+//! бронирования ресурсов, политика организации, уведомления о доступе (CTR-86). In-memory (`MemDav`, `MemMetadata`,
+//! `MemShareNotifications`) и `PgMeta` (META-52) проходят одни и те же проверки.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use time::Time;
+use time::{OffsetDateTime, Time};
 use tp_contracts::dav::{Collection, CollectionId, CollectionKind, DavStore};
 use tp_contracts::meta::{AccountKind, AccountScope, AccountStore, AccountUpsert};
 use tp_contracts::sharing::{
     ANYONE, Bookers, BookingPolicy, CollectionAcl, CollectionAclEntry, CollectionRights, DayOfWeek,
-    Delegate, DelegateLevel, DelegateStore, Delegation, ResourceStore, SharedCollection,
-    SharingPolicy, SharingPolicyStore, SharingScope, WorkingHours,
+    Delegate, DelegateLevel, DelegateStore, Delegation, ResourceStore, ShareChangedBy,
+    ShareNotification, ShareNotificationFilter, ShareNotificationStore, SharedCollection,
+    SharedObjectType, SharingPolicy, SharingPolicyStore, SharingScope, WorkingHours,
 };
-use tp_contracts::{AccountId, Error, GroupId, TenantId};
+use tp_contracts::{AccountId, Error, GroupId, ShareNotificationId, TenantId};
 
 /// Учётные записи наборов: `owner`, `peer` — пользователи одной организации, `resource` — учётная запись вида
 /// [`AccountKind::Resource`] той же организации, `foreign` — учётная запись другой организации.
@@ -598,4 +599,172 @@ pub async fn sharing_policy_store(
         .await
         .expect("замена");
     assert_eq!(store.sharing_policy(tenant).await, Ok(nobody));
+}
+
+/// Набор проверок `ShareNotificationStore` (CTR-86): уведомление видно только получателю, по (`created`, `id`);
+/// повтор идентификатора — `Conflict`, права без изменения — `Invalid`; изменения по состоянию (записанное и удалённое
+/// после `since` не входит, `limit`, `has_more`, состояние из будущего — `Conflict`); удалённое не возвращается; срок
+/// хранения удаляет старые у всех получателей и попадает в изменения. `recipient`, `other` — новые учётные записи
+/// без уведомлений (разных организаций или одной).
+pub async fn share_notifications(
+    store: &dyn ShareNotificationStore,
+    recipient: AccountScope,
+    other: AccountScope,
+) {
+    let t0 = OffsetDateTime::UNIX_EPOCH + time::Duration::days(400);
+    let sec = time::Duration::seconds;
+    let (o1, o2) = (AccountId::new(), AccountId::new());
+    let notice = |at: i64, object_type, owner, new_rights| ShareNotification {
+        id: ShareNotificationId::new(),
+        created: t0 + sec(at),
+        changed_by: ShareChangedBy {
+            name: "Алиса".into(),
+            email: Some("alice@example.org".into()),
+            account: Some(owner),
+        },
+        object_type,
+        owner,
+        collection: CollectionId::new(),
+        old_rights: CollectionRights::NONE,
+        new_rights,
+        name: "Общая".into(),
+    };
+    let sorted = |mut ids: Vec<ShareNotificationId>| {
+        ids.sort_unstable();
+        ids
+    };
+    let n1 = notice(0, SharedObjectType::Calendar, o1, CollectionRights::READ);
+    let n2 = notice(
+        10,
+        SharedObjectType::AddressBook,
+        o2,
+        CollectionRights::WRITE,
+    );
+    let n3 = notice(20, SharedObjectType::TaskList, o1, CollectionRights::ALL);
+
+    assert_eq!(store.notification_state(recipient).await, Ok(0));
+    assert_eq!(store.record(recipient, n1.clone()).await, Ok(1));
+    assert_eq!(store.record(recipient, n2.clone()).await, Ok(2));
+    assert_eq!(
+        store.record(recipient, n1.clone()).await,
+        Err(Error::Conflict)
+    );
+    let unchanged = notice(5, SharedObjectType::Calendar, o1, CollectionRights::NONE);
+    assert!(matches!(
+        store.record(recipient, unchanged).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(store.record(recipient, n3.clone()).await, Ok(3));
+
+    assert_eq!(
+        store.notifications(recipient).await,
+        Ok(vec![n1.clone(), n2.clone(), n3.clone()])
+    );
+    assert_eq!(
+        store.notification(recipient, n2.id).await,
+        Ok(Some(n2.clone()))
+    );
+    assert_eq!(
+        store.notifications(other).await,
+        Ok(Vec::new()),
+        "чужой ящик"
+    );
+    assert_eq!(store.notification(other, n1.id).await, Ok(None));
+    assert_eq!(store.notification_state(other).await, Ok(0));
+    let by_owner = ShareNotificationFilter {
+        owner: Some(o1),
+        ..ShareNotificationFilter::default()
+    };
+    let mine: Vec<_> = store
+        .notifications(recipient)
+        .await
+        .expect("notifications")
+        .into_iter()
+        .filter(|n| by_owner.matches(n))
+        .collect();
+    assert_eq!(mine, [n1.clone(), n3.clone()]);
+
+    let c = store
+        .notification_changes(recipient, 0, 10)
+        .await
+        .expect("changes");
+    assert_eq!(c.created, sorted(vec![n1.id, n2.id, n3.id]));
+    assert!(c.destroyed.is_empty());
+    assert_eq!((c.new_state, c.has_more), (3, false));
+    let c = store
+        .notification_changes(recipient, 0, 2)
+        .await
+        .expect("changes limit");
+    assert_eq!(c.created, sorted(vec![n1.id, n2.id]));
+    assert_eq!((c.new_state, c.has_more), (2, true));
+    let c = store
+        .notification_changes(recipient, 2, 2)
+        .await
+        .expect("changes rest");
+    assert_eq!(c.created, [n3.id]);
+    assert_eq!((c.new_state, c.has_more), (3, false));
+
+    // Удаление (`/set destroy`).
+    assert_eq!(store.destroy_notification(recipient, n2.id).await, Ok(4));
+    assert_eq!(
+        store.destroy_notification(recipient, n2.id).await,
+        Err(Error::NotFound)
+    );
+    assert_eq!(
+        store.destroy_notification(other, n1.id).await,
+        Err(Error::NotFound),
+        "чужое не удаляется"
+    );
+    assert_eq!(store.notification(recipient, n2.id).await, Ok(None));
+    assert_eq!(
+        store.notifications(recipient).await,
+        Ok(vec![n1.clone(), n3.clone()])
+    );
+    let c = store
+        .notification_changes(recipient, 3, 10)
+        .await
+        .expect("changes destroy");
+    assert_eq!((c.created, c.destroyed), (Vec::new(), vec![n2.id]));
+    let c = store
+        .notification_changes(recipient, 0, 10)
+        .await
+        .expect("changes from start");
+    assert_eq!(
+        c.created,
+        sorted(vec![n1.id, n3.id]),
+        "записанное и удалённое"
+    );
+    assert!(c.destroyed.is_empty());
+    assert_eq!(c.new_state, 4);
+    assert_eq!(
+        store.notification_changes(recipient, 5, 10).await,
+        Err(Error::Conflict)
+    );
+    assert!(matches!(
+        store.notification_changes(recipient, 0, 0).await,
+        Err(Error::Invalid(_))
+    ));
+
+    // Срок хранения: старше `t0 + 15` — у всех получателей.
+    let n4 = notice(5, SharedObjectType::Calendar, o2, CollectionRights::READ);
+    assert_eq!(store.record(other, n4.clone()).await, Ok(1));
+    let removed = store
+        .expire_notifications(t0 + sec(15), 1000)
+        .await
+        .expect("expire");
+    assert!(removed >= 2, "удалено {removed}");
+    assert_eq!(store.notifications(recipient).await, Ok(vec![n3.clone()]));
+    assert_eq!(store.notifications(other).await, Ok(Vec::new()));
+    assert_eq!(store.notification_state(recipient).await, Ok(5));
+    assert_eq!(store.notification_state(other).await, Ok(2));
+    let c = store
+        .notification_changes(recipient, 4, 10)
+        .await
+        .expect("changes expire");
+    assert_eq!((c.created, c.destroyed), (Vec::new(), vec![n1.id]));
+    assert_eq!(
+        store.expire_notifications(t0 + sec(15), 1000).await,
+        Ok(0),
+        "повтор — нечего удалять"
+    );
 }

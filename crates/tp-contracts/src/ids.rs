@@ -110,6 +110,11 @@ uuid_id!(
     /// Подразделение оргструктуры (`addressbook::OrgStore`, CTR-35).
     OrgUnitId
 );
+uuid_id!(
+    /// Уведомление об изменении прав на коллекцию (`sharing::ShareNotificationStore`, CTR-86); JMAP id
+    /// `ShareNotification`.
+    ShareNotificationId
+);
 
 impl TenantId {
     /// Организация по умолчанию — единственная в базовой поставке (SRS 3.8).

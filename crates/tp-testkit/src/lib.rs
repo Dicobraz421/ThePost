@@ -65,6 +65,6 @@ pub use rpc::{MemRpc, MemRpcNet};
 pub use schedule::{FakeItip, MemItipSender};
 pub use secrets::MemSecretStore;
 pub use senders::MemSenderLists;
-pub use sharing::FakeSharingAuthorizer;
+pub use sharing::{FakeSharingAuthorizer, MemShareNotifications};
 pub use sieve::{FakeRules, MemSieve, MemVacationLog, RulesCall};
 pub use transport::MemTransport;

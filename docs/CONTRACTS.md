@@ -336,7 +336,7 @@ SRS 5.1, 3.8. Каталог организации: `accounts_since(tenant, Opt
 Реализация — `tp-auth` (LDAP); модуль «Мультитенантность» подключает каталог на организацию. Код — `auth.rs`.
 CTR-35: `DirAccount::org: DirOrg { department (external_id подразделения), title, manager (external_id), seniority }` (`#[serde(default)]`);
 `contacts_since(tenant, cursor, limit) -> DirPage<DirContact { external_id, display_name, email, attributes }>` (класс и ветка — настройка;
-по умолчанию — пустая порция с прежним курсором), `units(tenant) -> Vec<DirUnit { external_id, name, parent }>` (по умолчанию — пусто);
+без реализации по умолчанию, CTR-87: контакты отдают все каталоги — LDAP, `PgMeta`, `FakeDirectory`), `units(tenant) -> Vec<DirUnit { external_id, name, parent }>` (по умолчанию — пусто);
 `DirGroup::members` — также `external_id` контактов. In-memory — `FakeDirectory` (`upsert_contact`, `remove_contact`, `set_units`).
 Порог массового удаления: `exceeds_removal_threshold(removed, total, percent)`, `MASS_REMOVAL_PERCENT` = 5; `SyncGate` — остановка
 синхронизации до подтверждения: `hold_sync(tenant, removed, total, at) -> MassRemoval { removed, total, detected_at, approved }` (подтверждение
@@ -818,6 +818,18 @@ Vec<Delegation>` (уровень в пределах политики, по `own
 `check_delegate(&Principal, owner, &Delegate)` (только владелец, в пределах политики). Набор — `suite::sharing_authorizer`
 (`SharingAuthorizerFixture` — хранилища реализации, организация набора — новая); фейк для протоколов — `FakeSharingAuthorizer` (права по
 таблице, без политики).
+Уведомления о доступе (CTR-86; JMAP `ShareNotification`, RFC 9670 §5): `ShareNotification { id: ShareNotificationId (задаёт вызывающий),
+created, changed_by: ShareChangedBy { name, email?, account? }, object_type: SharedObjectType::{Calendar, TaskList, AddressBook}, owner,
+collection, old_rights, new_rights (`NONE` — не было или отозваны), name }` (`validate()`: права не изменились — `Invalid`); уведомления
+не меняются. `ShareNotificationStore` — общее для узлов, видит только получатель: `record(recipient, n) -> u64` (занятый id — `Conflict`),
+`notifications(scope)` — по (`created`, `id`), `notification(scope, id) -> Option`, `destroy_notification(scope, id) -> u64` (`/set destroy`;
+нет — `NotFound`), `notification_state(scope) -> u64` (у новой — 0), `notification_changes(scope, since, limit) ->
+ShareNotificationChanges { created, destroyed, new_state, has_more }` (записанное и удалённое после `since` не входит; `limit` = 0 —
+`Invalid`; состояние из будущего или старше истории — `Conflict`), `expire_notifications(before, limit) -> usize` — срок хранения во всех
+организациях (удалённые — в изменениях; срок — настройка протокола). Фильтр `/query` — `ShareNotificationFilter { after, before,
+object_type, owner }::matches`. Записывает вызывающий, изменивший права (`CollectionAcl::set_collection_acl`), — каждой учётной записи с
+изменившимися правами; удаление учётной записи удаляет её уведомления. Все методы обязательные; in-memory — `MemShareNotifications`; набор
+`suite::sharing::share_notifications`. PostgreSQL (миграция) и перевод JMAP с памяти узла — отдельные волны.
 
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
@@ -1135,6 +1147,16 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `thepost admin init`». Без реализации по умолчанию: `PgMeta` (таблица `installation_admins`, миграция 0040 переносит роль учётной
   записи `admin init` по прежнему признаку), `MemMetadata`; набор `suite::account_installation_admin`. Несовместимо: новые
   обязательные методы `AccountStore`.
+- 2026-11-14 — CTR-86 (волна contracts-58): `sharing::ShareNotificationStore` — хранилище уведомлений о доступе (JMAP
+  `ShareNotification`) вместо памяти узла `tp-jmap` (хвост jmap-19, #737): запись, список, удаление, изменения по состоянию, срок
+  хранения; типы `ShareNotification`, `ShareChangedBy`, `SharedObjectType`, `ShareNotificationFilter`, `ShareNotificationChanges`,
+  идентификатор `ShareNotificationId`. Все методы обязательные (реализаций вне `tp-testkit` пока нет). In-memory —
+  `MemShareNotifications`, набор `suite::sharing::share_notifications`. По сравнению с карточкой: `MemShareNotifications` — в этой волне
+  (иначе набору не на чем пройти); вытеснение сверх `MAX_NOTICES` в контракт не входит — только срок хранения. `tp-meta` (миграция —
+  номер у оркестратора) и перевод JMAP — отдельные волны.
+- 2026-11-14 — CTR-87 (волна contracts-58): `Directory::contacts_since` — без реализации по умолчанию (было «каталог без контактов»:
+  прятало реализацию, забывшую контакты). Реализации — `LdapDirectory`, `PgMeta` (META-80), `FakeDirectory` — уже были, других
+  реализаторов нет. Несовместимо: новый обязательный метод `Directory`.
 - 2026-11-13 — CTR-84 (волна contracts-56): `sharing::SharingAuthorizer` — проверка прав на коллекции для протоколов (`rights`, `check`,
   `shared_with`, `delegations`, `check_grant`, `check_delegate`), все методы обязательные. Новый трейт, а не расширение `Authorizer`: у
   папок и коллекций разные хранилища и реализации, CalDAV и CardDAV права на папки не нужны. `tp_auth::CollectionAuthorizer` реализует

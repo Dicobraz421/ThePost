@@ -1,6 +1,7 @@
 //! Фейк [`SharingAuthorizer`] для тестов протоколов (CTR-84; `tp-dav`, `tp-jmap`, `tp-admin`): права на коллекции и
 //! представительства задаёт тест таблицей, правил политики и записей прав в фейке нет — их проверяет набор
 //! [`suite::sharing_authorizer`](crate::suite::sharing_authorizer()) на реализации `tp-auth`.
+//! [`MemShareNotifications`] — уведомления о доступе в памяти (CTR-86).
 //!
 //! ```
 //! # futures::executor::block_on(async {
@@ -17,17 +18,19 @@
 //! # });
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tp_contracts::auth::Principal;
 use tp_contracts::dav::CollectionId;
+use tp_contracts::meta::AccountScope;
 use tp_contracts::sharing::{
-    CollectionRights, Delegate, Delegation, SharedCollection, SharingAuthorizer,
-    validate_identifier,
+    CollectionRights, Delegate, Delegation, ShareNotification, ShareNotificationChanges,
+    ShareNotificationStore, SharedCollection, SharingAuthorizer, validate_identifier,
 };
-use tp_contracts::{AccountId, Error, Result};
+use tp_contracts::{AccountId, Error, Result, ShareNotificationId};
 
 use crate::infra::lock;
 
@@ -163,6 +166,161 @@ impl SharingAuthorizer for FakeSharingAuthorizer {
     }
 }
 
+// ---------- Уведомления о доступе (CTR-86) ----------
+
+/// Запись журнала уведомлений учётной записи: состояние после изменения, уведомление, запись (`true`) или удаление.
+type NoticeChange = (u64, ShareNotificationId, bool);
+
+#[derive(Debug, Default)]
+struct Notices {
+    items: BTreeMap<ShareNotificationId, ShareNotification>,
+    state: u64,
+    log: Vec<NoticeChange>,
+}
+
+impl Notices {
+    fn change(&mut self, id: ShareNotificationId, created: bool) -> u64 {
+        self.state += 1;
+        self.log.push((self.state, id, created));
+        self.state
+    }
+}
+
+/// [`ShareNotificationStore`] в памяти; журнал изменений хранится целиком. Клоны разделяют данные.
+#[derive(Debug, Clone, Default)]
+pub struct MemShareNotifications {
+    state: Arc<Mutex<HashMap<AccountScope, Notices>>>,
+}
+
+impl MemShareNotifications {
+    /// Пустое хранилище.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl ShareNotificationStore for MemShareNotifications {
+    async fn record(
+        &self,
+        recipient: AccountScope,
+        notification: ShareNotification,
+    ) -> Result<u64> {
+        notification.validate()?;
+        let mut st = lock(&self.state);
+        let n = st.entry(recipient).or_default();
+        if n.items.contains_key(&notification.id) {
+            return Err(Error::Conflict);
+        }
+        let id = notification.id;
+        n.items.insert(id, notification);
+        Ok(n.change(id, true))
+    }
+
+    async fn notifications(&self, scope: AccountScope) -> Result<Vec<ShareNotification>> {
+        let mut list: Vec<_> = lock(&self.state)
+            .get(&scope)
+            .map(|n| n.items.values().cloned().collect())
+            .unwrap_or_default();
+        list.sort_by_key(|n| (n.created, n.id));
+        Ok(list)
+    }
+
+    async fn notification(
+        &self,
+        scope: AccountScope,
+        id: ShareNotificationId,
+    ) -> Result<Option<ShareNotification>> {
+        Ok(lock(&self.state)
+            .get(&scope)
+            .and_then(|n| n.items.get(&id).cloned()))
+    }
+
+    async fn destroy_notification(
+        &self,
+        scope: AccountScope,
+        id: ShareNotificationId,
+    ) -> Result<u64> {
+        let mut st = lock(&self.state);
+        let n = st.get_mut(&scope).ok_or(Error::NotFound)?;
+        n.items.remove(&id).ok_or(Error::NotFound)?;
+        Ok(n.change(id, false))
+    }
+
+    async fn notification_state(&self, scope: AccountScope) -> Result<u64> {
+        Ok(lock(&self.state).get(&scope).map_or(0, |n| n.state))
+    }
+
+    async fn notification_changes(
+        &self,
+        scope: AccountScope,
+        since: u64,
+        limit: usize,
+    ) -> Result<ShareNotificationChanges> {
+        if limit == 0 {
+            return Err(Error::invalid(
+                "share notification changes limit must be positive",
+            ));
+        }
+        let st = lock(&self.state);
+        let current = st.get(&scope).map_or(0, |n| n.state);
+        if since > current {
+            return Err(Error::Conflict);
+        }
+        let Some(n) = st.get(&scope) else {
+            return Ok(ShareNotificationChanges::default());
+        };
+        // Первое и последнее изменение каждого уведомления после `since`, не более `limit` уведомлений.
+        let mut seen: BTreeMap<ShareNotificationId, (bool, bool)> = BTreeMap::new();
+        let mut out = ShareNotificationChanges {
+            new_state: since,
+            ..ShareNotificationChanges::default()
+        };
+        for &(state, id, created) in n.log.iter().filter(|(s, _, _)| *s > since) {
+            if !seen.contains_key(&id) && seen.len() == limit {
+                out.has_more = true;
+                break;
+            }
+            seen.entry(id)
+                .and_modify(|(_, last)| *last = created)
+                .or_insert((created, created));
+            out.new_state = state;
+        }
+        for (id, (first, last)) in seen {
+            match (first, last) {
+                (true, true) => out.created.push(id),
+                (false, false) => out.destroyed.push(id),
+                // Записано и удалено после `since` — не входит; удаление и повторная запись того же id невозможны.
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    async fn expire_notifications(&self, before: OffsetDateTime, limit: usize) -> Result<usize> {
+        let mut st = lock(&self.state);
+        let mut old: Vec<(OffsetDateTime, ShareNotificationId, AccountScope)> = st
+            .iter()
+            .flat_map(|(scope, n)| {
+                n.items
+                    .values()
+                    .filter(|x| x.created < before)
+                    .map(|x| (x.created, x.id, *scope))
+            })
+            .collect();
+        old.sort_unstable_by_key(|(created, id, _)| (*created, *id));
+        old.truncate(limit);
+        for (_, id, scope) in &old {
+            if let Some(n) = st.get_mut(scope)
+                && n.items.remove(id).is_some()
+            {
+                n.change(*id, false);
+            }
+        }
+        Ok(old.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tp_contracts::TenantId;
@@ -170,6 +328,17 @@ mod tests {
 
     use super::*;
     use crate::principal;
+
+    /// CTR-86: набор уведомлений о доступе.
+    #[tokio::test]
+    async fn share_notifications_pass_suite() {
+        let scope = || AccountScope {
+            tenant: TenantId::new(),
+            account: AccountId::new(),
+        };
+        crate::suite::sharing::share_notifications(&MemShareNotifications::new(), scope(), scope())
+            .await;
+    }
 
     #[tokio::test]
     async fn table() {
