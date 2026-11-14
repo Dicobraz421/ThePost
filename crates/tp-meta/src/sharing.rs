@@ -8,22 +8,30 @@
 //! - [`DelegateStore`] — `account_delegates` каталога (внешние ключи к обеим учётным записям).
 //! - [`ResourceStore`] — `accounts.booking_policy` (JSON контракта); смену вида на пользователя снимает триггер.
 //! - [`SharingPolicyStore`] — `sharing_policies` (JSON контракта); нет строки — политика по умолчанию.
+//! - [`ShareNotificationStore`] — каталог (META-83, CTR-86, миграция 0042): `share_notifications`, состояние
+//!   получателя `share_notification_state` и журнал состояний `share_notification_log` для `changes`; удаление
+//!   учётной записи-получателя удаляет их внешними ключами. Срок хранения убирает и историю удалённых уведомлений
+//!   старше срока (граница `floor`: `since` ниже — `Conflict`).
+
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use sqlx::PgConnection;
 use sqlx::types::Json;
+use sqlx::{FromRow, PgConnection};
+use time::OffsetDateTime;
 use tp_contracts::dav::CollectionId;
 use tp_contracts::meta::AccountScope;
 use tp_contracts::sharing::{
     BookingPolicy, CollectionAcl, CollectionAclEntry, CollectionRights, Delegate, DelegateLevel,
-    DelegateStore, Delegation, ResourceStore, SharedCollection, SharingPolicy, SharingPolicyStore,
-    validate_identifier,
+    DelegateStore, Delegation, ResourceStore, ShareChangedBy, ShareNotification,
+    ShareNotificationChanges, ShareNotificationStore, SharedCollection, SharedObjectType,
+    SharingPolicy, SharingPolicyStore, validate_identifier,
 };
-use tp_contracts::{AccountId, Error, Result, TenantId};
+use tp_contracts::{AccountId, Error, Result, ShareNotificationId, TenantId};
 use uuid::Uuid;
 
 use crate::PgMeta;
-use crate::schema::{begin, db_err};
+use crate::schema::{begin, begin_system, db_err, to_u64};
 use crate::shards::ShardId;
 
 /// Права строки `collection_acl`: `free_busy`, `read`, `write`, `schedule`, `admin`.
@@ -471,6 +479,409 @@ impl SharingPolicyStore for PgMeta {
             .map_err(db_err)?;
             crate::commits::commit(tx).await?;
             Ok(())
+        })
+        .await
+    }
+}
+
+// ---------- Уведомления о доступе (META-83, CTR-86) ----------
+
+/// Права уведомления → битовая маска столбцов `old_rights`, `new_rights` (миграция 0042).
+fn rights_bits(r: CollectionRights) -> i16 {
+    i16::from(r.free_busy)
+        | (i16::from(r.read) << 1)
+        | (i16::from(r.write) << 2)
+        | (i16::from(r.schedule) << 3)
+        | (i16::from(r.admin) << 4)
+}
+
+fn bits_rights(b: i16) -> CollectionRights {
+    CollectionRights {
+        free_busy: b & 1 != 0,
+        read: b & 2 != 0,
+        write: b & 4 != 0,
+        schedule: b & 8 != 0,
+        admin: b & 16 != 0,
+    }
+}
+
+fn object_type_str(t: SharedObjectType) -> &'static str {
+    match t {
+        SharedObjectType::Calendar => "calendar",
+        SharedObjectType::TaskList => "task_list",
+        SharedObjectType::AddressBook => "address_book",
+    }
+}
+
+fn parse_object_type(s: &str) -> Result<SharedObjectType> {
+    match s {
+        "calendar" => Ok(SharedObjectType::Calendar),
+        "task_list" => Ok(SharedObjectType::TaskList),
+        "address_book" => Ok(SharedObjectType::AddressBook),
+        other => Err(Error::internal(format!(
+            "share_notifications.object_type: {other}"
+        ))),
+    }
+}
+
+#[derive(FromRow)]
+struct NoticeRow {
+    notification_id: Uuid,
+    created: OffsetDateTime,
+    changed_by_name: String,
+    changed_by_email: Option<String>,
+    changed_by_account: Option<Uuid>,
+    object_type: String,
+    owner_id: Uuid,
+    collection_id: Uuid,
+    old_rights: i16,
+    new_rights: i16,
+    name: String,
+}
+
+impl NoticeRow {
+    fn into_notice(self) -> Result<ShareNotification> {
+        Ok(ShareNotification {
+            id: ShareNotificationId::from_uuid(self.notification_id),
+            created: self.created,
+            changed_by: ShareChangedBy {
+                name: self.changed_by_name,
+                email: self.changed_by_email,
+                account: self.changed_by_account.map(AccountId::from_uuid),
+            },
+            object_type: parse_object_type(&self.object_type)?,
+            owner: AccountId::from_uuid(self.owner_id),
+            collection: CollectionId::from_uuid(self.collection_id),
+            old_rights: bits_rights(self.old_rights),
+            new_rights: bits_rights(self.new_rights),
+            name: self.name,
+        })
+    }
+}
+
+/// Следующее состояние уведомлений получателя `scope` (строка состояния блокируется до фиксации: шаги журнала
+/// получателя идут подряд).
+async fn bump_notice_state(tx: &mut PgConnection, scope: AccountScope) -> Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO share_notification_state (tenant_id, account_id, state) VALUES ($1, $2, 1)
+         ON CONFLICT (tenant_id, account_id) DO UPDATE SET state = share_notification_state.state + 1
+         RETURNING state",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)
+}
+
+/// Шаг `state` журнала получателя `scope`: запись (`created`) или удаление уведомления `id`.
+async fn log_notice(
+    tx: &mut PgConnection,
+    scope: AccountScope,
+    state: i64,
+    id: ShareNotificationId,
+    created: bool,
+    notice_created: OffsetDateTime,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO share_notification_log (tenant_id, account_id, state, notification_id, created, notice_created)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(scope.tenant.as_uuid())
+    .bind(scope.account.as_uuid())
+    .bind(state)
+    .bind(id.as_uuid())
+    .bind(created)
+    .bind(notice_created)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Таблицы миграции 0042. Запись — состояние получателя первым (блокировка строки), затем уведомление; удаление
+/// и срок хранения — уведомление первым, затем состояние: порядок блокировок без взаимного ожидания.
+#[async_trait]
+impl ShareNotificationStore for PgMeta {
+    /// Повтор после обрыва во время COMMIT ответил бы `Conflict` — один раз.
+    async fn record(
+        &self,
+        recipient: AccountScope,
+        notification: ShareNotification,
+    ) -> Result<u64> {
+        notification.validate()?;
+        let n = &notification;
+        self.once(async move {
+            let mut tx = begin(&self.pool, recipient.tenant).await?;
+            let state = bump_notice_state(&mut tx, recipient).await?;
+            let inserted = sqlx::query(
+                "INSERT INTO share_notifications (tenant_id, account_id, notification_id, created,
+                     changed_by_name, changed_by_email, changed_by_account, object_type, owner_id, collection_id,
+                     old_rights, new_rights, name)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 ON CONFLICT (tenant_id, account_id, notification_id) DO NOTHING",
+            )
+            .bind(recipient.tenant.as_uuid())
+            .bind(recipient.account.as_uuid())
+            .bind(n.id.as_uuid())
+            .bind(n.created)
+            .bind(&n.changed_by.name)
+            .bind(&n.changed_by.email)
+            .bind(n.changed_by.account.map(|a| *a.as_uuid()))
+            .bind(object_type_str(n.object_type))
+            .bind(n.owner.as_uuid())
+            .bind(n.collection.as_uuid())
+            .bind(rights_bits(n.old_rights))
+            .bind(rights_bits(n.new_rights))
+            .bind(&n.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if inserted == 0 {
+                // Откат: состояние не растёт.
+                return Err(Error::Conflict);
+            }
+            log_notice(&mut tx, recipient, state, n.id, true, n.created).await?;
+            crate::commits::commit(tx).await?;
+            to_u64(state)
+        })
+        .await
+    }
+
+    async fn notifications(&self, scope: AccountScope) -> Result<Vec<ShareNotification>> {
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, scope.tenant).await?;
+            let rows: Vec<NoticeRow> = sqlx::query_as(
+                "SELECT notification_id, created, changed_by_name, changed_by_email, changed_by_account,
+                        object_type, owner_id, collection_id, old_rights, new_rights, name
+                 FROM share_notifications WHERE tenant_id = $1 AND account_id = $2
+                 ORDER BY created, notification_id",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            rows.into_iter().map(NoticeRow::into_notice).collect()
+        })
+        .await
+    }
+
+    async fn notification(
+        &self,
+        scope: AccountScope,
+        id: ShareNotificationId,
+    ) -> Result<Option<ShareNotification>> {
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, scope.tenant).await?;
+            let row: Option<NoticeRow> = sqlx::query_as(
+                "SELECT notification_id, created, changed_by_name, changed_by_email, changed_by_account,
+                        object_type, owner_id, collection_id, old_rights, new_rights, name
+                 FROM share_notifications WHERE tenant_id = $1 AND account_id = $2 AND notification_id = $3",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            row.map(NoticeRow::into_notice).transpose()
+        })
+        .await
+    }
+
+    /// Удаление с ответом `NotFound` об отсутствии — один раз (повтор ответил бы `NotFound`).
+    async fn destroy_notification(
+        &self,
+        scope: AccountScope,
+        id: ShareNotificationId,
+    ) -> Result<u64> {
+        self.once(async move {
+            let mut tx = begin(&self.pool, scope.tenant).await?;
+            let created: Option<OffsetDateTime> = sqlx::query_scalar(
+                "DELETE FROM share_notifications WHERE tenant_id = $1 AND account_id = $2 AND notification_id = $3
+                 RETURNING created",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some(created) = created else {
+                return Err(Error::NotFound);
+            };
+            let state = bump_notice_state(&mut tx, scope).await?;
+            log_notice(&mut tx, scope, state, id, false, created).await?;
+            crate::commits::commit(tx).await?;
+            to_u64(state)
+        })
+        .await
+    }
+
+    async fn notification_state(&self, scope: AccountScope) -> Result<u64> {
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, scope.tenant).await?;
+            let state: Option<i64> = sqlx::query_scalar(
+                "SELECT state FROM share_notification_state WHERE tenant_id = $1 AND account_id = $2",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            to_u64(state.unwrap_or(0))
+        })
+        .await
+    }
+
+    /// У уведомления после `since` не больше двух шагов журнала (запись и удаление): `2 * limit + 1` строк хватает,
+    /// чтобы набрать `limit` уведомлений и узнать о следующем.
+    async fn notification_changes(
+        &self,
+        scope: AccountScope,
+        since: u64,
+        limit: usize,
+    ) -> Result<ShareNotificationChanges> {
+        if limit == 0 {
+            return Err(Error::invalid("изменения уведомлений о доступе: limit = 0"));
+        }
+        let since_i = i64::try_from(since).unwrap_or(i64::MAX);
+        let rows_limit = i64::try_from(limit)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(2)
+            .saturating_add(1);
+        self.idempotent(|| async move {
+            let mut tx = begin(&self.read_pool(ShardId::MAIN).await?, scope.tenant).await?;
+            let (current, floor): (i64, i64) = sqlx::query_as(
+                "SELECT state, floor FROM share_notification_state WHERE tenant_id = $1 AND account_id = $2",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .unwrap_or((0, 0));
+            if since_i > current || since_i < floor {
+                return Err(Error::Conflict);
+            }
+            let rows: Vec<(i64, Uuid, bool)> = sqlx::query_as(
+                "SELECT state, notification_id, created FROM share_notification_log
+                 WHERE tenant_id = $1 AND account_id = $2 AND state > $3
+                 ORDER BY state
+                 LIMIT $4",
+            )
+            .bind(scope.tenant.as_uuid())
+            .bind(scope.account.as_uuid())
+            .bind(since_i)
+            .bind(rows_limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            crate::commits::commit(tx).await?;
+            // Первое и последнее изменение каждого уведомления после `since`, не более `limit` уведомлений.
+            let mut seen: BTreeMap<ShareNotificationId, (bool, bool)> = BTreeMap::new();
+            let mut out = ShareNotificationChanges {
+                new_state: since,
+                ..ShareNotificationChanges::default()
+            };
+            for (state, id, created) in rows {
+                let id = ShareNotificationId::from_uuid(id);
+                if !seen.contains_key(&id) && seen.len() == limit {
+                    out.has_more = true;
+                    break;
+                }
+                seen.entry(id)
+                    .and_modify(|(_, last)| *last = created)
+                    .or_insert((created, created));
+                out.new_state = to_u64(state)?;
+            }
+            for (id, (first, last)) in seen {
+                match (first, last) {
+                    (true, true) => out.created.push(id),
+                    (false, false) => out.destroyed.push(id),
+                    // Записано и удалено после `since` — не входит.
+                    _ => {}
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Одна системная транзакция. Сначала журнал: история уведомлений, удалённых до этого вызова и созданных
+    /// раньше `before`, убирается (не более `limit` шагов), `floor` получателей поднимается. Затем до `limit`
+    /// старших уведомлений удаляются, их удаление — шаги журнала получателей (видны в `changes` до следующего
+    /// прохода). Число удалённых при повторе было бы другим — один раз.
+    async fn expire_notifications(&self, before: OffsetDateTime, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.once(async move {
+            let mut tx = begin_system(&self.pool).await?;
+            sqlx::query(
+                "WITH gone AS (
+                     DELETE FROM share_notification_log l USING (
+                         SELECT g.tenant_id, g.account_id, g.state FROM share_notification_log g
+                         WHERE g.notice_created < $1 AND NOT EXISTS (
+                             SELECT 1 FROM share_notifications n
+                             WHERE n.tenant_id = g.tenant_id AND n.account_id = g.account_id
+                               AND n.notification_id = g.notification_id)
+                         ORDER BY g.notice_created
+                         LIMIT $2
+                     ) t
+                     WHERE l.tenant_id = t.tenant_id AND l.account_id = t.account_id AND l.state = t.state
+                     RETURNING l.tenant_id, l.account_id, l.state
+                 )
+                 UPDATE share_notification_state s SET floor = greatest(s.floor, g.floor)
+                 FROM (SELECT tenant_id, account_id, max(state) AS floor FROM gone GROUP BY tenant_id, account_id) g
+                 WHERE s.tenant_id = g.tenant_id AND s.account_id = g.account_id",
+            )
+            .bind(before)
+            .bind(limit)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let removed = sqlx::query(
+                "WITH old AS (
+                     DELETE FROM share_notifications n USING (
+                         SELECT tenant_id, account_id, notification_id FROM share_notifications
+                         WHERE created < $1
+                         ORDER BY created, notification_id
+                         LIMIT $2
+                     ) o
+                     WHERE n.tenant_id = o.tenant_id AND n.account_id = o.account_id
+                       AND n.notification_id = o.notification_id
+                     RETURNING n.tenant_id, n.account_id, n.notification_id, n.created
+                 ), numbered AS (
+                     SELECT tenant_id, account_id, notification_id, created,
+                            row_number() OVER (PARTITION BY tenant_id, account_id
+                                               ORDER BY created, notification_id) AS k
+                     FROM old
+                 ), bumped AS (
+                     UPDATE share_notification_state s SET state = s.state + c.cnt
+                     FROM (SELECT tenant_id, account_id, count(*) AS cnt FROM old GROUP BY tenant_id, account_id) c
+                     WHERE s.tenant_id = c.tenant_id AND s.account_id = c.account_id
+                     RETURNING s.tenant_id, s.account_id, s.state - c.cnt AS base
+                 )
+                 INSERT INTO share_notification_log (tenant_id, account_id, state, notification_id, created,
+                                                     notice_created)
+                 SELECT n.tenant_id, n.account_id, b.base + n.k, n.notification_id, false, n.created
+                 FROM numbered n JOIN bumped b ON b.tenant_id = n.tenant_id AND b.account_id = n.account_id",
+            )
+            .bind(before)
+            .bind(limit)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            crate::commits::commit(tx).await?;
+            Ok(usize::try_from(removed).unwrap_or(usize::MAX))
         })
         .await
     }
