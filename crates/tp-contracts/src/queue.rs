@@ -14,6 +14,11 @@
 //! один таймер. Сигнал публикует реализация после фиксации постановки и переноса; потерянный сигнал (at-most-once)
 //! покрывает сверка `next_due` по `Resync` и при запуске.
 //!
+//! # Просмотр и повтор (CTR-85)
+//!
+//! Раздел «Очередь» консоли и текстового интерфейса: [`QueueStore::list`] — записи организации порциями с фильтром
+//! по состоянию ([`QueueState`]) и адресу, [`QueueStore::retry`] — повтор доставки «сейчас» по запросу администратора.
+//!
 //! # Тело письма
 //!
 //! Вызывающий загружает письмо одним объектом и учитывает одну ссылку на него в `BlobIndex` до `enqueue`
@@ -178,9 +183,93 @@ pub struct Claimed {
     pub rcpts: Vec<QueuedRcpt>,
 }
 
+/// Состояние записи очереди в момент `now` ([`QueueStore::list`], фильтр [`QueueFilter::state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueState {
+    /// Ждёт попытки: лизы нет и неудачных попыток у получателей без конечного статуса не было (в том числе
+    /// отложенная отправка до срока выпуска).
+    Ready,
+    /// Повтор: лизы нет, у получателя без конечного статуса была временная неудача (`attempts` > 0).
+    Retry,
+    /// Доставляется: действует лиза (`until > now`).
+    Active,
+}
+
+/// Состояние получателя записи очереди ([`QueueItem::rcpts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueRcptState {
+    /// Ждёт попытки не раньше `next_attempt`.
+    Pending {
+        /// Срок следующей попытки.
+        next_attempt: OffsetDateTime,
+    },
+    /// Конечный статус ([`QueueStore::complete`]); запись остаётся в очереди, пока не завершены все получатели.
+    Done(RcptStatus),
+}
+
+/// Получатель записи очереди ([`QueueStore::list`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueItemRcpt {
+    /// Получатель.
+    pub rcpt: OutRcpt,
+    /// Состояние.
+    pub state: QueueRcptState,
+    /// Число неудачных попыток (как [`QueuedRcpt::attempts`]).
+    pub attempts: u32,
+    /// Причина последней неудачи.
+    pub last_error: Option<String>,
+}
+
+/// Запись очереди для просмотра ([`QueueStore::list`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueItem {
+    /// Запись.
+    pub id: QueueId,
+    /// Состояние в момент запроса.
+    pub state: QueueState,
+    /// Момент постановки (для отложенного письма — срок выпуска, если он позже), как [`Claimed::queued_at`].
+    pub queued_at: OffsetDateTime,
+    /// Ближайший срок попытки: наименьший среди получателей без конечного статуса (у записи всегда есть такой).
+    pub next_attempt: OffsetDateTime,
+    /// Отправитель конверта.
+    pub from: String,
+    /// Размер письма, байт.
+    pub size: u64,
+    /// Получатели в порядке постановки.
+    pub rcpts: Vec<QueueItemRcpt>,
+}
+
+/// Фильтр [`QueueStore::list`]; поля по умолчанию — все записи организации.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct QueueFilter {
+    /// Только записи в этом состоянии.
+    pub state: Option<QueueState>,
+    /// Только записи, у которых отправитель или хотя бы один получатель содержит эту строку без учёта регистра;
+    /// пустая строка — без фильтра по адресу.
+    pub address: Option<String>,
+}
+
+impl QueueFilter {
+    /// Запись `item` проходит фильтр (правило для реализаций в памяти и проверки реализаций хранилища).
+    pub fn matches(&self, item: &QueueItem) -> bool {
+        let state = self.state.is_none_or(|s| s == item.state);
+        let address = match self.address.as_deref() {
+            None | Some("") => true,
+            Some(needle) => {
+                let needle = needle.to_lowercase();
+                std::iter::once(item.from.as_str())
+                    .chain(item.rcpts.iter().map(|r| r.rcpt.address.as_str()))
+                    .any(|a| a.to_lowercase().contains(&needle))
+            }
+        };
+        state && address
+    }
+}
+
 /// Сигнал «очередь организации `tenant` пополнена или срок перенесён» (системный, `account = None`,
 /// [`EventKind::QueueReady`]; тема `<tenant>/queue/outbound`, CTR-73). Публикует реализация [`QueueStore`] после
-/// фиксации `enqueue`, `reschedule` и `postpone`.
+/// фиксации `enqueue`, `reschedule`, `postpone` и `retry`, перенёсшего срок.
 pub fn queue_ready(tenant: TenantId) -> Event {
     Event {
         tenant,
@@ -256,6 +345,33 @@ pub trait QueueStore: Send + Sync + 'static {
         Err(Error::internal(
             "queue store does not support cancel_queued",
         ))
+    }
+
+    /// Записи организации `tenant` (CTR-85; консоль и TUI) в порядке `id` строго после `after` (`None` — с начала),
+    /// не более `limit`, прошедшие фильтр ([`QueueFilter::matches`]); состояние — в момент `now`. Курсор следующей
+    /// порции — `id` последней записи; порция короче `limit` — последняя. Записи, поставленные или завершённые между
+    /// порциями, не дают ни пропусков, ни повторов остальных. `limit` = 0 — `Error::Invalid`. По умолчанию —
+    /// `Error::Internal`.
+    async fn list(
+        &self,
+        tenant: TenantId,
+        filter: &QueueFilter,
+        after: Option<QueueId>,
+        limit: usize,
+        now: OffsetDateTime,
+    ) -> Result<Vec<QueueItem>> {
+        let _ = (tenant, filter, after, limit, now);
+        Err(Error::internal("queue store does not support list"))
+    }
+
+    /// Повтор доставки по запросу администратора (CTR-85): срок попытки `now` у всех получателей без конечного
+    /// статуса записи `id` организации `tenant` (`attempts` и `last_error` не меняются; отложенное письмо выпускается — `queued_at` не позже `now`)
+    /// и сигнал [`queue_ready`] после фиксации — `next_due` не позже `now`. `true` — срок перенесён; запись под
+    /// действующей лизой (доставляется) — без изменений и без сигнала, `false`. Нет записи (в том числе другой
+    /// организации или уже завершена) — `Error::NotFound`. По умолчанию — `Error::Internal`.
+    async fn retry(&self, tenant: TenantId, id: QueueId, now: OffsetDateTime) -> Result<bool> {
+        let _ = (tenant, id, now);
+        Err(Error::internal("queue store does not support retry"))
     }
 }
 
@@ -415,6 +531,86 @@ mod tests {
         );
         let canceled = ob.cancel_scheduled(TenantId::DEFAULT, QueueId::new()).await;
         assert!(matches!(canceled, Err(Error::Internal(_))));
+    }
+
+    /// Фильтр списка очереди (CTR-85): состояние и подстрока адреса отправителя или получателя без учёта регистра.
+    #[test]
+    fn queue_filter_matches() {
+        let item = QueueItem {
+            id: QueueId::new(),
+            state: QueueState::Retry,
+            queued_at: OffsetDateTime::UNIX_EPOCH,
+            next_attempt: OffsetDateTime::UNIX_EPOCH,
+            from: "Alice@Example.org".into(),
+            size: 10,
+            rcpts: vec![QueueItemRcpt {
+                rcpt: OutRcpt::new("bob@example.net"),
+                state: QueueRcptState::Pending {
+                    next_attempt: OffsetDateTime::UNIX_EPOCH,
+                },
+                attempts: 1,
+                last_error: Some("451 later".into()),
+            }],
+        };
+        let f = |state: Option<QueueState>, address: Option<&str>| QueueFilter {
+            state,
+            address: address.map(str::to_owned),
+        };
+        assert!(QueueFilter::default().matches(&item));
+        assert!(f(Some(QueueState::Retry), None).matches(&item));
+        assert!(!f(Some(QueueState::Ready), None).matches(&item));
+        assert!(f(None, Some("alice@EXAMPLE")).matches(&item), "отправитель");
+        assert!(f(None, Some("example.net")).matches(&item), "получатель");
+        assert!(f(None, Some("")).matches(&item), "пустая строка");
+        assert!(!f(None, Some("carol")).matches(&item));
+        assert!(!f(Some(QueueState::Active), Some("bob")).matches(&item));
+        let s = serde_json::to_string(&item).expect("serialize");
+        assert_eq!(serde_json::from_str::<QueueItem>(&s).expect("parse"), item);
+    }
+
+    /// `list` и `retry` по умолчанию — `Internal` (реализация без просмотра очереди).
+    #[tokio::test]
+    async fn list_retry_default_internal() {
+        struct Bare;
+        #[async_trait]
+        impl QueueStore for Bare {
+            async fn enqueue(&self, _: Option<AccountId>, _: OutMessage) -> Result<QueueId> {
+                Err(Error::internal("bare"))
+            }
+            async fn next_due(&self) -> Result<Option<OffsetDateTime>> {
+                Ok(None)
+            }
+            async fn claim(
+                &self,
+                _: OffsetDateTime,
+                _: usize,
+                _: Duration,
+            ) -> Result<Vec<Claimed>> {
+                Ok(Vec::new())
+            }
+            async fn renew(&self, _: &QueueClaim, _: OffsetDateTime) -> Result<()> {
+                Err(Error::Conflict)
+            }
+            async fn reschedule(
+                &self,
+                _: &QueueClaim,
+                _: &str,
+                _: OffsetDateTime,
+                _: &str,
+            ) -> Result<()> {
+                Err(Error::Conflict)
+            }
+            async fn complete(&self, _: &QueueClaim, _: &str, _: RcptStatus) -> Result<bool> {
+                Err(Error::Conflict)
+            }
+        }
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let listed = Bare
+            .list(TenantId::DEFAULT, &QueueFilter::default(), None, 10, now)
+            .await;
+        assert!(matches!(listed, Err(Error::Internal(_))));
+        let retried = Bare.retry(TenantId::DEFAULT, QueueId::new(), now).await;
+        assert!(matches!(retried, Err(Error::Internal(_))));
     }
 
     #[test]
