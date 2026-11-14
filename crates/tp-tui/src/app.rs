@@ -2,7 +2,7 @@
 //! Сети здесь нет: действия возвращают [`Effect`], ответы Admin API приходят в [`App::on_result`] — поэтому экран
 //! проверяется тестами без узла.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
@@ -10,6 +10,8 @@ use tp_admin::server::WhoAmI;
 
 use crate::cli;
 use crate::engine::{self, Context, Form, Request, ScreenKind};
+use crate::layout::{self, Act, Layout, Rows};
+use crate::node::{ConfigFile, Param, SaveError, Saved};
 use crate::schema::{Kind, Operation, catalog};
 use crate::theme::Theme;
 use crate::tree::{ORG_ROWS, SECTIONS};
@@ -18,6 +20,34 @@ use crate::tree::{ORG_ROWS, SECTIONS};
 pub const LIST_ROWS: usize = 14;
 /// Строк карточки, формы и меню в правой панели.
 pub const BODY_ROWS: usize = 15;
+
+/// Подписи F-клавиш экранов движка; раскладка раздела задаёт свои.
+pub const KEYS: [&str; 10] = [
+    "Помощь",
+    "Фильтр",
+    "Просм",
+    "Правка",
+    "",
+    "",
+    "Создать",
+    "Удалить",
+    "Меню",
+    "Выход",
+];
+
+/// Подписи F-клавиш конфигурации узла.
+pub const CONFIG_KEYS: [&str; 10] = [
+    "Помощь",
+    "Перечит",
+    "",
+    "Правка",
+    "",
+    "",
+    "",
+    "",
+    "Меню",
+    "Выход",
+];
 
 /// Способ входа.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +249,17 @@ pub enum Effect {
     Login(LoginRequest),
     /// Запрос к Admin API; ответ — [`App::on_result`] с тем же номером.
     Call(u64, Request),
+    /// Прочитать `config.yaml` узла; ответ — [`App::on_config`].
+    ConfigLoad,
+    /// Записать значение параметра конфигурации узла; ответ — [`App::on_config_saved`].
+    ConfigSave {
+        /// Путь параметра.
+        path: Vec<String>,
+        /// Значение; `None` — убрать (действует значение по умолчанию).
+        value: Option<Value>,
+        /// Текст файла на момент чтения.
+        loaded: String,
+    },
     /// Выйти из интерфейса.
     Quit,
 }
@@ -276,6 +317,12 @@ pub struct ListView {
     pub top: usize,
     /// Параметры запроса следующей страницы.
     pub next: Option<Vec<(String, String)>>,
+    /// Ручная раскладка раздела; нет — колонки движка.
+    pub layout: Option<&'static Layout>,
+    /// Запись, из которой взяты строки (участники группы, уровень политики); у страницы списка — `null`.
+    pub record: Value,
+    /// Экран, из которого открыт этот (Esc — назад).
+    pub back: Option<Box<ListView>>,
 }
 
 impl ListView {
@@ -325,6 +372,100 @@ pub enum View {
     List(ListView),
     /// Карточка.
     Card(CardView),
+    /// Конфигурация узла.
+    Config(ConfigView),
+}
+
+/// Конфигурация узла: дерево параметров схемы со значениями файла.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigView {
+    /// Прочитанный файл.
+    pub file: ConfigFile,
+    /// Раскрытые секции (ключи через точку).
+    pub open: BTreeSet<String>,
+    /// Выделенная строка.
+    pub sel: usize,
+    /// Первая видимая строка.
+    pub top: usize,
+}
+
+impl ConfigView {
+    /// Видимые строки дерева.
+    pub fn rows(&self) -> Vec<&Param> {
+        self.file.visible(&self.open)
+    }
+
+    /// Выделенный параметр.
+    pub fn selected(&self) -> Option<&Param> {
+        self.rows().get(self.sel).copied()
+    }
+
+    fn select(&mut self, sel: usize) {
+        let n = self.rows().len();
+        self.sel = sel.min(n.saturating_sub(1));
+        if self.sel < self.top {
+            self.top = self.sel;
+        } else if self.sel >= self.top + LIST_ROWS {
+            self.top = self.sel + 1 - LIST_ROWS;
+        }
+    }
+}
+
+/// Правка значения параметра конфигурации узла.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigEdit {
+    /// Параметр.
+    pub param: Param,
+    /// Введённое значение; пустое — убрать (действует значение по умолчанию).
+    pub value: String,
+    /// Ошибка проверки у поля или отказ записи.
+    pub error: Option<String>,
+    /// Идёт проверка и запись.
+    pub busy: bool,
+}
+
+impl View {
+    /// Раскладка списка на экране или списка, из которого открыта карточка.
+    pub fn layout(&self) -> Option<&'static Layout> {
+        match self {
+            Self::List(l) => l.layout,
+            Self::Card(c) => c.back.as_ref().and_then(|b| b.layout),
+            Self::Info { .. } | Self::Config(_) => None,
+        }
+    }
+}
+
+/// Что сделать с найденной по имени входа учётной записью.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Then {
+    /// Открыть операцию с параметром пути `account`.
+    Open {
+        /// Операция.
+        op: &'static Operation,
+        /// Раскладка.
+        layout: Option<&'static Layout>,
+        /// Контекст без `account`.
+        ctx: Context,
+        /// Вложить экран в текущий.
+        nest: bool,
+    },
+    /// Добавить участником группы (`patch_group` с полным списком участников).
+    AddMember {
+        /// Запрос группы.
+        group: Request,
+        /// Участники до добавления.
+        members: Vec<Value>,
+    },
+}
+
+impl Then {
+    /// Заголовок формы поиска.
+    pub fn title(&self) -> String {
+        match self {
+            Self::Open { op, .. } => format!("{} — учётная запись", op.title()),
+            Self::AddMember { .. } => "Новый участник группы".to_owned(),
+        }
+    }
 }
 
 /// Окно поверх правой панели.
@@ -339,8 +480,12 @@ pub enum Overlay {
     },
     /// Форма.
     Form(Box<Form>),
+    /// Учётная запись по имени входа (форма поиска `list_accounts`), затем действие.
+    Lookup(Box<Form>, Then),
     /// Подтверждение удаления.
     Confirm(Request),
+    /// Правка параметра конфигурации узла.
+    ConfigEdit(ConfigEdit),
 }
 
 /// Состояние основного экрана.
@@ -362,6 +507,8 @@ pub struct Main {
     pub view: View,
     /// Окно поверх правой панели.
     pub overlay: Option<Overlay>,
+    /// Интерфейс запущен на узле с доступом к `config.yaml`.
+    pub node: bool,
 }
 
 /// Строка дерева.
@@ -407,17 +554,35 @@ pub enum Stage {
     Main(Box<Main>),
 }
 
+/// Как ответ списка ложится на экран.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nav {
+    /// Новый экран вместо текущего.
+    Replace,
+    /// Следующая страница текущего списка.
+    Append,
+    /// Новый экран поверх текущего (Esc — назад).
+    Nest,
+    /// Перечитать текущий список (раскладка, выделение и путь назад сохраняются).
+    Reload,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Pending {
     Orgs,
     Load {
         req: Request,
         form: Option<Box<Form>>,
-        append: bool,
+        nav: Nav,
+        layout: Option<&'static Layout>,
     },
     Submit {
         req: Request,
         form: Option<Box<Form>>,
+    },
+    Lookup {
+        form: Box<Form>,
+        then: Then,
     },
 }
 
@@ -436,8 +601,22 @@ impl Bus {
         Effect::Call(self.seq, req)
     }
 
-    fn load(&mut self, req: Request, form: Option<Box<Form>>, append: bool) -> Effect {
-        self.call(req.clone(), Pending::Load { req, form, append })
+    fn load(
+        &mut self,
+        req: Request,
+        form: Option<Box<Form>>,
+        nav: Nav,
+        layout: Option<&'static Layout>,
+    ) -> Effect {
+        self.call(
+            req.clone(),
+            Pending::Load {
+                req,
+                form,
+                nav,
+                layout,
+            },
+        )
     }
 
     fn submit(&mut self, req: Request, form: Option<Box<Form>>) -> Effect {
@@ -456,6 +635,8 @@ pub struct App {
     pub theme: Theme,
     /// Этап.
     pub stage: Stage,
+    /// Интерфейс запущен на узле с доступом к `config.yaml` (раздел «Конфигурация узла» правит файл).
+    pub node: bool,
     bus: Bus,
 }
 
@@ -465,6 +646,7 @@ impl App {
         Self {
             theme,
             stage: Stage::Login(login),
+            node: false,
             bus: Bus::default(),
         }
     }
@@ -477,6 +659,32 @@ impl App {
     /// Сообщение строки состояния.
     pub fn status(&self) -> Option<&(Level, String)> {
         self.bus.status.as_ref()
+    }
+
+    /// Подписи F-клавиш: экраны движка — [`KEYS`]; раскладка раздела — свои; у строк записи (участники,
+    /// политика) — только свои, Помощь, Меню и Выход.
+    pub fn keys(&self) -> [&'static str; 10] {
+        let Stage::Main(m) = &self.stage else {
+            return KEYS;
+        };
+        if matches!(m.view, View::Config(_)) && m.overlay.is_none() {
+            return CONFIG_KEYS;
+        }
+        let Some(l) = m.view.layout().filter(|_| m.overlay.is_none()) else {
+            return KEYS;
+        };
+        let mut keys = KEYS;
+        if l.rows != Rows::Page {
+            for (i, k) in keys.iter_mut().enumerate() {
+                if ![0, 8, 9].contains(&i) {
+                    *k = "";
+                }
+            }
+        }
+        for k in l.keys {
+            keys[usize::from(k.n - 1)] = k.label;
+        }
+        keys
     }
 
     /// Клавиша.
@@ -525,6 +733,7 @@ impl App {
                 lines: Vec::new(),
             },
             overlay: None,
+            node: self.node,
         });
         let mut out = Vec::new();
         if let Some(op) = catalog().get("list_orgs")
@@ -535,6 +744,73 @@ impl App {
         out.extend(open_tree(&mut m, &mut self.bus));
         self.stage = Stage::Main(m);
         out
+    }
+
+    /// Прочитанный `config.yaml` узла (или ошибка чтения).
+    pub fn on_config(&mut self, result: Result<ConfigFile, String>) {
+        let Stage::Main(m) = &mut self.stage else {
+            return;
+        };
+        match result {
+            Ok(file) => {
+                let (open, sel) = match &m.view {
+                    View::Config(c) => (c.open.clone(), c.sel),
+                    _ => (BTreeSet::new(), 0),
+                };
+                let mut v = ConfigView {
+                    file,
+                    open,
+                    sel: 0,
+                    top: 0,
+                };
+                v.select(sel);
+                if let Some(reason) = v.file.access.reason() {
+                    self.bus
+                        .say(Level::Warn, format!("только чтение: {reason}"));
+                }
+                m.view = View::Config(v);
+            }
+            Err(e) => {
+                m.view = View::Info {
+                    title: crate::tree::NODE_CONFIG.to_owned(),
+                    lines: vec![e.clone()],
+                };
+                self.bus.say(Level::Err, e);
+            }
+        }
+    }
+
+    /// Итог записи параметра конфигурации узла: ошибка — у поля правки; записано — файл перечитывается.
+    pub fn on_config_saved(&mut self, result: Result<Saved, SaveError>) -> Vec<Effect> {
+        let Stage::Main(m) = &mut self.stage else {
+            return Vec::new();
+        };
+        match result {
+            Ok(saved) => {
+                m.overlay = None;
+                self.bus.say(
+                    Level::Ok,
+                    format!(
+                        "записано, копия — {}; узел перечитает файл без перезапуска",
+                        saved.backup.display()
+                    ),
+                );
+                vec![Effect::ConfigLoad]
+            }
+            Err(e) => {
+                if let Some(Overlay::ConfigEdit(edit)) = &mut m.overlay {
+                    edit.busy = false;
+                    edit.error = Some(e.message.clone());
+                }
+                let what = if e.at_field {
+                    "не записано: ошибка проверки"
+                } else {
+                    "не записано"
+                };
+                self.bus.say(Level::Err, format!("{what}: {}", e.message));
+                Vec::new()
+            }
+        }
     }
 
     /// Адрес и код входа с устройства.
@@ -559,20 +835,26 @@ impl App {
         let page = match result {
             Ok(page) => page,
             Err(e) => {
-                if let (
-                    Pending::Load {
-                        form: Some(mut f), ..
-                    }
-                    | Pending::Submit {
-                        form: Some(mut f), ..
-                    },
-                    tp_admin_client::Error::Api {
-                        problem: Some(pr), ..
-                    },
-                ) = (p, &e)
+                if let tp_admin_client::Error::Api {
+                    problem: Some(pr), ..
+                } = &e
                 {
-                    f.apply_problem(pr);
-                    m.overlay = Some(Overlay::Form(f));
+                    match p {
+                        Pending::Load {
+                            form: Some(mut f), ..
+                        }
+                        | Pending::Submit {
+                            form: Some(mut f), ..
+                        } => {
+                            f.apply_problem(pr);
+                            m.overlay = Some(Overlay::Form(f));
+                        }
+                        Pending::Lookup { mut form, then } => {
+                            form.apply_problem(pr);
+                            m.overlay = Some(Overlay::Lookup(form, then));
+                        }
+                        _ => {}
+                    }
                 }
                 self.bus.say(Level::Err, e.to_string());
                 return Vec::new();
@@ -592,10 +874,13 @@ impl App {
                     .collect();
                 Vec::new()
             }
-            Pending::Load { req, append, .. } => {
-                loaded(m, req, page, append);
+            Pending::Load {
+                req, nav, layout, ..
+            } => {
+                loaded(m, req, page, nav, layout);
                 Vec::new()
             }
+            Pending::Lookup { form, then } => found(m, &mut self.bus, form, then, &page.value),
             Pending::Submit { req, .. } => {
                 self.bus
                     .say(Level::Ok, format!("готово: {}", req.op.title()));
@@ -615,7 +900,7 @@ impl App {
                     Some(list) => {
                         let r = list.req.clone();
                         m.view = View::List(*list);
-                        vec![self.bus.load(r, None, false)]
+                        vec![self.bus.load(r, None, Nav::Reload, None)]
                     }
                     None => Vec::new(),
                 }
@@ -647,7 +932,7 @@ fn main_command(m: &Main) -> String {
     let home = Some(m.session.home_org.as_str());
     let show = |req: &Request| cli::command(req, home);
     match &m.overlay {
-        Some(Overlay::Form(f)) => return show(&f.preview()),
+        Some(Overlay::Form(f) | Overlay::Lookup(f, _)) => return show(&f.preview()),
         Some(Overlay::Confirm(req)) => return show(req),
         Some(Overlay::Menu { sel }) => {
             return catalog()
@@ -656,13 +941,13 @@ fn main_command(m: &Main) -> String {
                 .map(|op| show(&Form::new(op, &m.ctx(), false, &Map::new()).preview()))
                 .unwrap_or_default();
         }
+        Some(Overlay::ConfigEdit(_)) => return "thepost config check".to_owned(),
         Some(Overlay::Help) | None => {}
     }
     if m.focus == Panel::Tree {
         return match m.tree_rows().get(m.tree) {
-            Some(TreeRow::Section(i)) => SECTIONS[*i]
-                .op
-                .and_then(|id| catalog().get(id))
+            Some(TreeRow::Section(i)) => catalog()
+                .get(SECTIONS[*i].op)
                 .map(|op| show(&Form::new(op, &m.ctx(), false, &Map::new()).preview()))
                 .unwrap_or_default(),
             Some(TreeRow::Config) => "thepost config check".to_owned(),
@@ -673,13 +958,16 @@ fn main_command(m: &Main) -> String {
         View::List(l) => {
             let ops = engine::item_ops(catalog(), l.req.op);
             match (ops.view, ops.param, l.row()) {
-                (Some(view), Some(param), Some(row)) => item_ctx(&l.req, param, row)
-                    .and_then(|ctx| Request::new(view, &ctx, Vec::new()).ok())
-                    .map_or_else(|| show(&l.req), |r| show(&r)),
+                (Some(view), Some(param), Some(row)) if l.record.is_null() => {
+                    item_ctx(&l.req, param, row)
+                        .and_then(|ctx| Request::new(view, &ctx, Vec::new()).ok())
+                        .map_or_else(|| show(&l.req), |r| show(&r))
+                }
                 _ => show(&l.req),
             }
         }
         View::Card(c) => show(&c.req),
+        View::Config(_) => "thepost config check".to_owned(),
         View::Info { .. } => String::new(),
     }
 }
@@ -719,8 +1007,14 @@ fn take_list(view: &mut View) -> Option<Box<ListView>> {
     }
 }
 
-fn loaded(m: &mut Main, req: Request, page: Page, append: bool) {
-    if !req.op.is_list() {
+fn loaded(m: &mut Main, req: Request, page: Page, nav: Nav, layout: Option<&'static Layout>) {
+    let current = match (&m.view, nav) {
+        (View::List(l), Nav::Reload | Nav::Append) if l.req.op.id == req.op.id => l.layout,
+        _ => None,
+    };
+    let layout = layout.or(current).or_else(|| layout::of(&req.op.id));
+    let rows_of_record = layout.is_some_and(|l| l.rows != Rows::Page);
+    if !req.op.is_list() && !rows_of_record {
         let back = take_list(&mut m.view);
         m.view = View::Card(CardView {
             title: req.op.title(),
@@ -732,7 +1026,10 @@ fn loaded(m: &mut Main, req: Request, page: Page, append: bool) {
         });
         return;
     }
-    let (rows, cursor) = engine::page(req.op, &page.value);
+    let (rows, cursor) = match layout {
+        Some(l) => l.rows(req.op, &page.value),
+        None => engine::page(req.op, &page.value),
+    };
     let next = page.next.or_else(|| {
         cursor.map(|(k, v)| {
             let mut q: Vec<(String, String)> =
@@ -741,36 +1038,146 @@ fn loaded(m: &mut Main, req: Request, page: Page, append: bool) {
             q
         })
     });
-    if append && let View::List(l) = &mut m.view {
-        l.rows.extend(rows);
-        l.next = next;
-        let sel = l.sel + 1;
-        l.select(sel);
-        return;
+    let record = if rows_of_record {
+        page.value
+    } else {
+        Value::Null
+    };
+    if let View::List(l) = &mut m.view
+        && l.req.op.id == req.op.id
+    {
+        match nav {
+            Nav::Append => {
+                l.rows.extend(rows);
+                l.next = next;
+                let sel = l.sel + 1;
+                l.select(sel);
+                return;
+            }
+            Nav::Reload => {
+                let sel = if l.req == req { l.sel } else { 0 };
+                l.req = req;
+                l.rows = rows;
+                l.next = next;
+                l.record = record;
+                l.top = 0;
+                l.select(sel);
+                return;
+            }
+            Nav::Replace | Nav::Nest => {}
+        }
     }
+    let back = match nav {
+        Nav::Nest => take_list(&mut m.view),
+        _ => None,
+    };
     m.view = View::List(ListView {
         req,
         rows,
         sel: 0,
         top: 0,
         next,
+        layout,
+        record,
+        back,
     });
 }
 
+/// Учётная запись по имени входа найдена (или нет): действие `then`.
+fn found(
+    m: &mut Main,
+    bus: &mut Bus,
+    mut form: Box<Form>,
+    then: Then,
+    rows: &Value,
+) -> Vec<Effect> {
+    let id = rows
+        .as_array()
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(id) = id else {
+        if let Some(f) = form.fields.first_mut() {
+            f.error = Some("нет учётной записи с этим именем входа".to_owned());
+        }
+        m.overlay = Some(Overlay::Lookup(form, then));
+        return Vec::new();
+    };
+    match then {
+        Then::Open {
+            op,
+            layout,
+            mut ctx,
+            nest,
+        } => {
+            ctx.insert("account".to_owned(), id);
+            let nav = if nest { Nav::Nest } else { Nav::Replace };
+            open_op(m, bus, op, &ctx, &Map::new(), nav, layout)
+        }
+        Then::AddMember { group, mut members } => {
+            members.push(serde_json::json!({ "account": id }));
+            match patch_members(&group, members) {
+                Some(req) => vec![bus.submit(req, None)],
+                None => Vec::new(),
+            }
+        }
+    }
+}
+
+/// Запрос `patch_group` с полным списком участников группы `group`.
+fn patch_members(group: &Request, members: Vec<Value>) -> Option<Request> {
+    let op = catalog().get("patch_group")?;
+    let mut req = Request::new(op, &req_ctx(group), Vec::new()).ok()?;
+    req.body = Some(serde_json::json!({ "members": members }));
+    Some(req)
+}
+
+/// Форма поиска учётной записи по имени входа в организации контекста.
+fn lookup(ctx: &Context, then: Then) -> Option<Overlay> {
+    let op = catalog().get("list_accounts")?;
+    let mut org = ctx.clone();
+    org.retain(|k, _| k == "org");
+    let mut form = Form::new(op, &org, true, &Map::new());
+    form.retain(&["login"]);
+    if let Some(f) = form.fields.first_mut() {
+        f.error = None;
+    }
+    Some(Overlay::Lookup(Box::new(form), then))
+}
+
 /// Открыть экран операции `op` в контексте `ctx`: список и карточка загружаются, если известны все параметры
-/// пути и нет обязательных параметров запроса, иначе — форма; удаление — подтверждение.
+/// пути и нет обязательных параметров запроса, иначе — форма; удаление — подтверждение. Нет только учётной
+/// записи — она ищется по имени входа.
 fn open_op(
     m: &mut Main,
     bus: &mut Bus,
     op: &'static Operation,
     ctx: &Context,
     prefill: &Map<String, Value>,
+    nav: Nav,
+    layout: Option<&'static Layout>,
 ) -> Vec<Effect> {
+    let missing: Vec<&str> = op
+        .path_names()
+        .into_iter()
+        .filter(|n| !ctx.contains_key(*n))
+        .collect();
+    if missing == ["account"] {
+        let then = Then::Open {
+            op,
+            layout,
+            ctx: ctx.clone(),
+            nest: nav == Nav::Nest,
+        };
+        m.overlay = lookup(ctx, then);
+        return Vec::new();
+    }
     let form = || Overlay::Form(Box::new(Form::new(op, ctx, false, prefill)));
     let ready = Request::new(op, ctx, Vec::new()).ok();
     match (engine::screen_kind(op), ready) {
         (ScreenKind::List | ScreenKind::Card, Some(req)) if !op.query().any(|f| f.required) => {
-            return vec![bus.load(req, None, false)];
+            return vec![bus.load(req, None, nav, layout)];
         }
         (ScreenKind::Confirm, Some(req)) if !op.query().any(|f| f.required) => {
             m.overlay = Some(Overlay::Confirm(req));
@@ -781,31 +1188,17 @@ fn open_op(
 }
 
 fn open_tree(m: &mut Main, bus: &mut Bus) -> Vec<Effect> {
-    let info = |title: &str, lines: &[&str]| View::Info {
-        title: title.to_owned(),
-        lines: lines.iter().map(|l| (*l).to_owned()).collect(),
-    };
     match m.tree_rows().get(m.tree).copied() {
         Some(TreeRow::Section(i)) => {
             let s = SECTIONS[i];
             m.section = s.label.to_owned();
             m.focus = Panel::Main;
-            match s.op.and_then(|id| catalog().get(id)) {
+            match catalog().get(s.op) {
                 Some(op) => {
                     let ctx = m.ctx();
-                    open_op(m, bus, op, &ctx, &Map::new())
+                    open_op(m, bus, op, &ctx, &Map::new(), Nav::Replace, None)
                 }
-                None => {
-                    m.view = info(
-                        s.label,
-                        &[
-                            "В Admin API пока нет операции этого раздела.",
-                            "Раздел заработает, когда операция появится",
-                            "в схеме Admin API.",
-                        ],
-                    );
-                    Vec::new()
-                }
+                None => Vec::new(),
             }
         }
         Some(TreeRow::Org(i)) => {
@@ -817,16 +1210,29 @@ fn open_tree(m: &mut Main, bus: &mut Bus) -> Vec<Effect> {
             m.tree = 0;
             open_tree(m, bus)
         }
+        Some(TreeRow::Config) if m.node => {
+            m.section = crate::tree::NODE_CONFIG.to_owned();
+            m.focus = Panel::Main;
+            if !matches!(m.view, View::Config(_)) {
+                m.view = View::Info {
+                    title: crate::tree::NODE_CONFIG.to_owned(),
+                    lines: vec!["чтение config.yaml…".to_owned()],
+                };
+            }
+            vec![Effect::ConfigLoad]
+        }
         Some(TreeRow::Config) => {
             m.section = crate::tree::NODE_CONFIG.to_owned();
-            m.view = info(
-                crate::tree::NODE_CONFIG,
-                &[
+            m.view = View::Info {
+                title: crate::tree::NODE_CONFIG.to_owned(),
+                lines: [
                     "Правка config.yaml — на самом узле, когда",
                     "интерфейс запущен там с правом на файл.",
                     "Проверка: thepost config check.",
-                ],
-            );
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            };
             Vec::new()
         }
         None => Vec::new(),
@@ -891,12 +1297,19 @@ fn view_key(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
                             ..l.req.clone()
                         };
                         bus.say(Level::Ok, "загрузка следующей страницы…");
-                        return vec![bus.load(req, None, true)];
+                        return vec![bus.load(req, None, Nav::Append, None)];
                     }
                 }
                 KeyCode::Down => l.select(l.sel + 1),
                 KeyCode::PageDown => l.select(l.sel + LIST_ROWS),
                 KeyCode::End => l.select(last),
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
+                    if let Some(back) = l.back.take() {
+                        let r = back.req.clone();
+                        m.view = View::List(*back);
+                        return vec![bus.load(r, None, Nav::Reload, None)];
+                    }
+                }
                 _ => return list_action(m, bus, key),
             }
             Vec::new()
@@ -913,7 +1326,7 @@ fn view_key(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
                         let reload = c.reload.then(|| back.req.clone());
                         m.view = View::List(*back);
                         if let Some(r) = reload {
-                            return vec![bus.load(r, None, false)];
+                            return vec![bus.load(r, None, Nav::Reload, None)];
                         }
                     }
                 }
@@ -921,34 +1334,187 @@ fn view_key(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
             }
             Vec::new()
         }
+        View::Config(c) => config_key(c, bus, &mut m.overlay, key),
         View::Info { .. } => Vec::new(),
     }
 }
 
-/// Действия F2–F8 над списком или карточкой записи.
+/// Клавиши дерева конфигурации узла: ←→ и Enter — секции, Enter и F4 — правка параметра, F2 — перечитать.
+fn config_key(
+    c: &mut ConfigView,
+    bus: &mut Bus,
+    overlay: &mut Option<Overlay>,
+    key: KeyEvent,
+) -> Vec<Effect> {
+    let n = c.rows().len();
+    let sel = c.selected().cloned();
+    match key.code {
+        KeyCode::Up => c.select(c.sel.saturating_sub(1)),
+        KeyCode::Down => c.select(c.sel + 1),
+        KeyCode::PageUp => c.select(c.sel.saturating_sub(LIST_ROWS)),
+        KeyCode::PageDown => c.select(c.sel + LIST_ROWS),
+        KeyCode::Home => c.select(0),
+        KeyCode::End => c.select(n.saturating_sub(1)),
+        KeyCode::F(2) => return vec![Effect::ConfigLoad],
+        KeyCode::Right | KeyCode::Enter if sel.as_ref().is_some_and(|p| p.section) => {
+            let k = sel.map(|p| p.key()).unwrap_or_default();
+            if key.code == KeyCode::Enter && c.open.contains(&k) {
+                c.open.remove(&k);
+            } else {
+                c.open.insert(k);
+            }
+        }
+        KeyCode::Left => {
+            let Some(p) = sel else {
+                return Vec::new();
+            };
+            if p.section && c.open.remove(&p.key()) {
+                return Vec::new();
+            }
+            if p.path.len() > 1 {
+                let parent = p.path[..p.path.len() - 1].join(".");
+                if let Some(i) = c.rows().iter().position(|r| r.key() == parent) {
+                    c.select(i);
+                }
+            }
+        }
+        KeyCode::Enter | KeyCode::F(4) => {
+            let Some(p) = sel.filter(|p| !p.section) else {
+                return Vec::new();
+            };
+            if let Some(reason) = c.file.access.reason() {
+                bus.say(Level::Warn, format!("только чтение: {reason}"));
+                return Vec::new();
+            }
+            let value = c
+                .file
+                .value(&p)
+                .map(|v| engine::text(v, p.field.kind))
+                .unwrap_or_default();
+            *overlay = Some(Overlay::ConfigEdit(ConfigEdit {
+                param: p,
+                value,
+                error: None,
+                busy: false,
+            }));
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Клавиши правки параметра конфигурации: Enter — проверить и записать (пусто — значение по умолчанию).
+fn config_edit_key(m: &mut Main, mut e: ConfigEdit, key: KeyEvent) -> Vec<Effect> {
+    if e.busy {
+        m.overlay = Some(Overlay::ConfigEdit(e));
+        return Vec::new();
+    }
+    let f = &e.param.field;
+    match key.code {
+        KeyCode::Esc => return Vec::new(),
+        KeyCode::Enter => {
+            let raw = e.value.trim();
+            let value = if raw.is_empty() {
+                Ok(None)
+            } else {
+                engine::parse(f, raw).map(Some)
+            };
+            let View::Config(c) = &m.view else {
+                return Vec::new();
+            };
+            match value {
+                Ok(value) => {
+                    let save = Effect::ConfigSave {
+                        path: e.param.path.clone(),
+                        value,
+                        loaded: c.file.text.clone(),
+                    };
+                    e.busy = true;
+                    e.error = None;
+                    m.overlay = Some(Overlay::ConfigEdit(e));
+                    return vec![save];
+                }
+                Err(err) => e.error = Some(err),
+            }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            let mut choices = f.choices.clone();
+            if f.kind == Kind::Boolean {
+                choices = vec!["да".to_owned(), "нет".to_owned()];
+            }
+            if !choices.is_empty() {
+                choices.insert(0, String::new());
+                let k = choices.len();
+                let j = match (choices.iter().position(|c| *c == e.value), key.code) {
+                    (None, _) => 0,
+                    (Some(i), KeyCode::Left) => (i + k - 1) % k,
+                    (Some(i), _) => (i + 1) % k,
+                };
+                e.value = choices[j].clone();
+            }
+        }
+        KeyCode::Backspace => {
+            e.value.pop();
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => e.value.push(ch),
+        _ => {}
+    }
+    m.overlay = Some(Overlay::ConfigEdit(e));
+    Vec::new()
+}
+
+/// Список (или карточка записи из него), над которым выполняется действие.
+struct Target {
+    list: Request,
+    row: Option<Value>,
+    item: Option<Context>,
+    record: Value,
+}
+
+/// Действия F2–F8 над списком или карточкой записи: сначала клавиши раскладки раздела, затем — движка.
 fn list_action(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
     let c = catalog();
-    let (list_req, row, item): (Request, Option<Value>, Option<Context>) = match &m.view {
+    let t = match &m.view {
         View::List(l) => {
             let ops = engine::item_ops(c, l.req.op);
             let item = ops
                 .param
                 .zip(l.row())
                 .and_then(|(p, row)| item_ctx(&l.req, p, row));
-            (l.req.clone(), l.row().cloned(), item)
+            Target {
+                list: l.req.clone(),
+                row: l.row().cloned(),
+                item,
+                record: l.record.clone(),
+            }
         }
         View::Card(card) => match &card.back {
-            Some(back) => (
-                back.req.clone(),
-                Some(card.value.clone()),
-                Some(req_ctx(&card.req)),
-            ),
+            Some(back) => Target {
+                list: back.req.clone(),
+                row: Some(card.value.clone()),
+                item: Some(req_ctx(&card.req)),
+                record: back.record.clone(),
+            },
             None => return Vec::new(),
         },
-        View::Info { .. } => return Vec::new(),
+        View::Info { .. } | View::Config(_) => return Vec::new(),
     };
-    let ops = engine::item_ops(c, list_req.op);
-    let row_map = row
+    let n = match key.code {
+        KeyCode::Enter => 3,
+        KeyCode::F(n) => n,
+        _ => return Vec::new(),
+    };
+    if let Some(l) = m.view.layout() {
+        if let Some(act) = l.key(n) {
+            return run(m, bus, act, &t);
+        }
+        if l.rows != Rows::Page {
+            return Vec::new();
+        }
+    }
+    let ops = engine::item_ops(c, t.list.op);
+    let row_map = t
+        .row
         .as_ref()
         .and_then(Value::as_object)
         .cloned()
@@ -957,33 +1523,30 @@ fn list_action(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
         bus.say(Level::Warn, format!("{what}: нет в разделе"));
         Vec::new()
     };
-    match key.code {
-        KeyCode::F(2) => {
+    match n {
+        2 => {
             let mut prefill = Map::new();
-            for (k, v) in req_ctx(&list_req) {
+            for (k, v) in req_ctx(&t.list) {
                 prefill.insert(k, Value::String(v));
             }
-            for (k, v) in &list_req.query {
+            for (k, v) in &t.list.query {
                 prefill.insert(k.clone(), Value::String(v.clone()));
             }
             let mut ctx = m.ctx();
-            ctx.retain(|k, _| list_req.op.path_names().contains(&k.as_str()));
+            ctx.retain(|k, _| t.list.op.path_names().contains(&k.as_str()));
             m.overlay = Some(Overlay::Form(Box::new(Form::new(
-                list_req.op,
-                &ctx,
-                false,
-                &prefill,
+                t.list.op, &ctx, false, &prefill,
             ))));
             Vec::new()
         }
-        KeyCode::Enter | KeyCode::F(3) => match (ops.view, &item) {
-            (Some(view), Some(ctx)) => open_op(m, bus, view, ctx, &Map::new()),
-            (None, _) if matches!(m.view, View::List(_)) && row.is_some() => {
+        3 => match (ops.view, &t.item) {
+            (Some(view), Some(ctx)) => open_op(m, bus, view, ctx, &Map::new(), Nav::Replace, None),
+            (None, _) if matches!(m.view, View::List(_)) && t.row.is_some() => {
                 let back = take_list(&mut m.view);
                 m.view = View::Card(CardView {
-                    title: list_req.op.title(),
-                    req: list_req,
-                    value: row.unwrap_or_default(),
+                    title: t.list.op.title(),
+                    req: t.list,
+                    value: t.row.unwrap_or_default(),
                     top: 0,
                     back,
                     reload: false,
@@ -992,52 +1555,153 @@ fn list_action(m: &mut Main, bus: &mut Bus, key: KeyEvent) -> Vec<Effect> {
             }
             _ => Vec::new(),
         },
-        KeyCode::F(4) => match (ops.edit, &item) {
-            (Some(op), Some(ctx)) => open_op(m, bus, op, ctx, &row_map),
+        4 => match (ops.edit, &t.item) {
+            (Some(op), Some(ctx)) => open_op(m, bus, op, ctx, &row_map, Nav::Replace, None),
             _ => need(bus, "правка"),
         },
-        KeyCode::F(5) => {
-            let block = ops.edit.filter(|op| {
-                op.body.as_ref().is_some_and(|b| {
-                    b.fields
-                        .iter()
-                        .any(|f| f.name == "enabled" && f.kind == Kind::Boolean)
-                })
-            });
-            match (block, &item) {
-                (Some(op), Some(ctx)) => {
-                    let enabled = row_map
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    let prefill = Map::from_iter([("enabled".to_owned(), Value::Bool(!enabled))]);
-                    open_op(m, bus, op, ctx, &prefill)
-                }
-                _ => need(bus, "блокировка"),
-            }
-        }
-        KeyCode::F(6) => match (ops.password, &item) {
-            (Some(op), Some(ctx)) => open_op(m, bus, op, ctx, &Map::new()),
-            _ => need(bus, "пароль"),
-        },
-        KeyCode::F(7) => match ops.create {
+        7 => match ops.create {
             Some(op) => {
-                let ctx = req_ctx(&list_req);
-                open_op(m, bus, op, &ctx, &Map::new())
+                let ctx = req_ctx(&t.list);
+                open_op(m, bus, op, &ctx, &Map::new(), Nav::Replace, None)
             }
             None => need(bus, "создание"),
         },
-        KeyCode::F(8) => match (ops.delete, &item) {
-            (Some(op), Some(ctx)) => open_op(m, bus, op, ctx, &Map::new()),
+        8 => match (ops.delete, &t.item) {
+            (Some(op), Some(ctx)) => open_op(m, bus, op, ctx, &Map::new(), Nav::Replace, None),
             _ => need(bus, "удаление"),
         },
         _ => Vec::new(),
     }
 }
 
+/// Действие раскладки раздела над целью `t`.
+fn run(m: &mut Main, bus: &mut Bus, act: Act, t: &Target) -> Vec<Effect> {
+    let c = catalog();
+    let Some(op) = (match act {
+        Act::Item { op, .. }
+        | Act::Open { op, .. }
+        | Act::Switch { op, .. }
+        | Act::Account { op, .. }
+        | Act::EditPolicy(op) => c.get(op),
+        Act::AddMember | Act::RemoveMember => c.get("patch_group"),
+    }) else {
+        return Vec::new();
+    };
+    let no_row = |bus: &mut Bus| {
+        bus.say(Level::Warn, "нет выделенной записи");
+        Vec::new()
+    };
+    match act {
+        Act::Item { prefill, .. } => match (&t.item, &t.row) {
+            (Some(ctx), Some(row)) => open_op(m, bus, op, ctx, &prefill(row), Nav::Replace, None),
+            _ => no_row(bus),
+        },
+        Act::Open { layout, .. } => match &t.item {
+            Some(ctx) => open_op(m, bus, op, ctx, &Map::new(), Nav::Nest, Some(layout)),
+            None => no_row(bus),
+        },
+        Act::Switch { layout, nest, .. } => {
+            let mut ctx = req_ctx(&t.list);
+            ctx.retain(|k, _| op.path_names().contains(&k.as_str()));
+            let nav = if nest { Nav::Nest } else { Nav::Replace };
+            open_op(m, bus, op, &ctx, &Map::new(), nav, Some(layout))
+        }
+        Act::Account { layout, .. } => {
+            let mut ctx = req_ctx(&t.list);
+            ctx.retain(|k, _| k == "org");
+            open_op(m, bus, op, &ctx, &Map::new(), Nav::Nest, Some(layout))
+        }
+        Act::EditPolicy(_) => {
+            let prefill = t
+                .record
+                .get("policy")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            open_op(m, bus, op, &req_ctx(&t.list), &prefill, Nav::Replace, None)
+        }
+        Act::AddMember => {
+            let members = t
+                .record
+                .get("members")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let then = Then::AddMember {
+                group: t.list.clone(),
+                members,
+            };
+            m.overlay = lookup(&req_ctx(&t.list), then);
+            Vec::new()
+        }
+        Act::RemoveMember => {
+            let Some(id) = t
+                .row
+                .as_ref()
+                .and_then(|r| r.get("id"))
+                .and_then(Value::as_str)
+            else {
+                return no_row(bus);
+            };
+            m.overlay = patch_members(&t.list, layout::members_without(&t.record, id))
+                .map(Overlay::Confirm);
+            Vec::new()
+        }
+    }
+}
+
+/// Итог клавиши в форме.
+enum FormKey {
+    Stay,
+    Cancel,
+    Submit,
+}
+
+/// Правка полей формы: ↑↓ — поле, ←→ — выбор из вариантов, текст.
+fn form_key(f: &mut Form, key: KeyEvent) -> FormKey {
+    let n = f.fields.len();
+    match key.code {
+        KeyCode::Esc => return FormKey::Cancel,
+        KeyCode::Enter => return FormKey::Submit,
+        KeyCode::Up | KeyCode::BackTab if n > 0 => f.focus = (f.focus + n - 1) % n,
+        KeyCode::Down | KeyCode::Tab if n > 0 => f.focus = (f.focus + 1) % n,
+        KeyCode::Left | KeyCode::Right if n > 0 => {
+            let ff = &mut f.fields[f.focus];
+            let mut choices: Vec<String> = ff.field.choices.clone();
+            if ff.field.kind == Kind::Boolean {
+                choices = vec!["да".to_owned(), "нет".to_owned()];
+            }
+            if !choices.is_empty() {
+                if !ff.field.required {
+                    choices.insert(0, String::new());
+                }
+                let i = choices.iter().position(|c| *c == ff.value);
+                let k = choices.len();
+                let j = match (i, key.code) {
+                    (None, _) => 0,
+                    (Some(i), KeyCode::Left) => (i + k - 1) % k,
+                    (Some(i), _) => (i + 1) % k,
+                };
+                ff.value = choices[j].clone();
+            }
+        }
+        KeyCode::Backspace if n > 0 => {
+            let at = f.focus;
+            f.fields[at].value.pop();
+        }
+        KeyCode::Char(ch) if n > 0 && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let at = f.focus;
+            f.fields[at].value.push(ch);
+        }
+        _ => {}
+    }
+    FormKey::Stay
+}
+
 fn overlay_key(m: &mut Main, bus: &mut Bus, ov: Overlay, key: KeyEvent) -> Vec<Effect> {
     match ov {
         Overlay::Help => Vec::new(),
+        Overlay::ConfigEdit(e) => config_edit_key(m, e, key),
         Overlay::Menu { sel } => {
             let n = catalog().ops.len();
             let sel = match key.code {
@@ -1053,7 +1717,7 @@ fn overlay_key(m: &mut Main, bus: &mut Bus, ov: Overlay, key: KeyEvent) -> Vec<E
                     m.section = op.title();
                     m.focus = Panel::Main;
                     let ctx = m.ctx();
-                    return open_op(m, bus, op, &ctx, &Map::new());
+                    return open_op(m, bus, op, &ctx, &Map::new(), Nav::Replace, None);
                 }
                 _ => sel,
             };
@@ -1070,46 +1734,28 @@ fn overlay_key(m: &mut Main, bus: &mut Bus, ov: Overlay, key: KeyEvent) -> Vec<E
                 Vec::new()
             }
         },
-        Overlay::Form(mut f) => {
-            let n = f.fields.len();
-            match key.code {
-                KeyCode::Esc => return Vec::new(),
-                KeyCode::Up | KeyCode::BackTab if n > 0 => f.focus = (f.focus + n - 1) % n,
-                KeyCode::Down | KeyCode::Tab if n > 0 => f.focus = (f.focus + 1) % n,
-                KeyCode::Left | KeyCode::Right if n > 0 => {
-                    let ff = &mut f.fields[f.focus];
-                    let mut choices: Vec<String> = ff.field.choices.clone();
-                    if ff.field.kind == Kind::Boolean {
-                        choices = vec!["да".to_owned(), "нет".to_owned()];
-                    }
-                    if !choices.is_empty() {
-                        if !ff.field.required {
-                            choices.insert(0, String::new());
-                        }
-                        let i = choices.iter().position(|c| *c == ff.value);
-                        let k = choices.len();
-                        let j = match (i, key.code) {
-                            (None, _) => 0,
-                            (Some(i), KeyCode::Left) => (i + k - 1) % k,
-                            (Some(i), _) => (i + 1) % k,
-                        };
-                        ff.value = choices[j].clone();
-                    }
-                }
-                KeyCode::Backspace if n > 0 => {
-                    let at = f.focus;
-                    f.fields[at].value.pop();
-                }
-                KeyCode::Char(ch) if n > 0 && !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let at = f.focus;
-                    f.fields[at].value.push(ch);
-                }
-                KeyCode::Enter => return submit(m, bus, f),
-                _ => {}
+        Overlay::Form(mut f) => match form_key(&mut f, key) {
+            FormKey::Cancel => Vec::new(),
+            FormKey::Submit => submit(m, bus, f),
+            FormKey::Stay => {
+                m.overlay = Some(Overlay::Form(f));
+                Vec::new()
             }
-            m.overlay = Some(Overlay::Form(f));
-            Vec::new()
-        }
+        },
+        Overlay::Lookup(mut f, then) => match form_key(&mut f, key) {
+            FormKey::Cancel => Vec::new(),
+            FormKey::Submit => match f.request() {
+                Some(req) => vec![bus.call(req, Pending::Lookup { form: f, then })],
+                None => {
+                    m.overlay = Some(Overlay::Lookup(f, then));
+                    Vec::new()
+                }
+            },
+            FormKey::Stay => {
+                m.overlay = Some(Overlay::Lookup(f, then));
+                Vec::new()
+            }
+        },
     }
 }
 
@@ -1119,7 +1765,12 @@ fn submit(m: &mut Main, bus: &mut Bus, mut f: Box<Form>) -> Vec<Effect> {
         return Vec::new();
     };
     match engine::screen_kind(f.op) {
-        ScreenKind::List | ScreenKind::Card => vec![bus.load(req, Some(f), false)],
+        ScreenKind::List | ScreenKind::Card => {
+            // Фильтр текущего списка: раскладка и путь назад сохраняются.
+            let same = matches!(&m.view, View::List(l) if l.req.op.id == f.op.id);
+            let nav = if same { Nav::Reload } else { Nav::Replace };
+            vec![bus.load(req, Some(f), nav, None)]
+        }
         ScreenKind::Confirm => {
             m.overlay = Some(Overlay::Confirm(req));
             Vec::new()
@@ -1288,9 +1939,13 @@ pub(crate) mod tests {
         assert!(matches!(main(&app).view, View::Card(_)));
         let fx = app.on_key(key(KeyCode::Esc));
         assert!(matches!(fx.as_slice(), [Effect::Call(_, r)] if r.op.id == "list_accounts"));
-        // F8 — у учётных записей удаления нет.
+        // F8 — скрыть из книги: форма PATCH с hidden_from_gal = да.
         app.on_key(key(KeyCode::F(8)));
-        assert_eq!(app.status().map(|s| s.0), Some(Level::Warn));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы");
+        };
+        assert_eq!(f.value("hidden_from_gal"), Some("да"));
+        app.on_key(key(KeyCode::Esc));
         // F7 — форма создания; отказ — detail у поля.
         app.on_key(key(KeyCode::F(7)));
         // Поля тела по алфавиту: display_name, login.
@@ -1349,13 +2004,329 @@ pub(crate) mod tests {
         }
         let fx = app.on_key(key(KeyCode::Enter));
         assert!(fx.is_empty());
+        // Учётная запись — по имени входа, а не по UUID.
+        let Some(Overlay::Lookup(f, _)) = &main(&app).overlay else {
+            panic!("нет формы поиска");
+        };
+        let names: Vec<&str> = f.fields.iter().map(|x| x.field.name.as_str()).collect();
+        assert_eq!(names, ["login"]);
+        for c in "nobody@it-task.ru".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.command_line(),
+            "thepost admin account list --login nobody@it-task.ru"
+        );
+        let fx = app.on_key(key(KeyCode::Enter));
+        let id = call(&fx, "list_accounts");
+        // Не найдена — ошибка у поля, форма остаётся.
+        app.on_result(id, ok(json!([])));
+        let Some(Overlay::Lookup(f, _)) = &main(&app).overlay else {
+            panic!("форма поиска не вернулась");
+        };
+        assert_eq!(
+            f.fields[0].error.as_deref(),
+            Some("нет учётной записи с этим именем входа")
+        );
+        let fx = app.on_key(key(KeyCode::Enter));
+        let id = call(&fx, "list_accounts");
+        let fx = app.on_result(
+            id,
+            ok(json!([{"id": "acc-7", "login": "nobody@it-task.ru"}])),
+        );
+        let [Effect::Call(id, req)] = fx.as_slice() else {
+            panic!("нет запроса корзины: {fx:?}");
+        };
+        assert_eq!(req.op.id, "list_trash");
+        assert_eq!(req.param("account"), Some("acc-7"));
+        app.on_result(
+            *id,
+            ok(
+                json!({"items": [{"message": "m1", "origin": "INBOX", "size": 2048,
+                "deleted_at": "2026-11-14T09:00:00Z", "expires_at": "2026-12-14T09:00:00Z"}],
+                "next_offset": null}),
+            ),
+        );
+        let View::List(l) = &main(&app).view else {
+            panic!("не список");
+        };
+        assert_eq!(l.layout, Some(&layout::TRASH));
+        assert_eq!(app.keys()[4], "Восст");
+        // F5 — восстановить письмо: POST без тела.
+        app.on_key(key(KeyCode::F(5)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы восстановления");
+        };
+        assert_eq!(f.op.id, "restore");
+        assert_eq!(app.command_line(), "thepost admin trash restore acc-7 m1");
+    }
+
+    pub(crate) fn ok(value: Value) -> Result<Page, tp_admin_client::Error> {
+        Ok(Page { value, next: None })
+    }
+
+    /// Номер единственного запроса операции `op` среди действий.
+    pub(crate) fn call(fx: &[Effect], op: &str) -> u64 {
+        match fx {
+            [Effect::Call(id, req)] if req.op.id == op => *id,
+            other => panic!("нет запроса {op}: {other:?}"),
+        }
+    }
+
+    /// Открыть раздел дерева по подписи.
+    pub(crate) fn section(app: &mut App, label: &str) -> Vec<Effect> {
+        if main(app).focus == Panel::Main {
+            app.on_key(key(KeyCode::Tab));
+        }
+        app.on_key(key(KeyCode::Home));
+        let at = SECTIONS
+            .iter()
+            .position(|s| s.label == label)
+            .expect("раздел");
+        for _ in 0..at {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter))
+    }
+
+    /// Группы: Enter — участники; F7 — добавить по имени входа; F8 — убрать с подтверждением.
+    pub(crate) fn with_members() -> App {
+        let mut app = with_accounts();
+        let id = call(&section(&mut app, "Группы"), "list_groups");
+        app.on_result(
+            id,
+            ok(
+                json!([{"id": "g1", "name": "Продажи", "address": "sales@it-task.ru",
+                       "members": [{"account": "acc-1"}], "moderators": []}]),
+            ),
+        );
+        assert_eq!(app.keys()[2], "Состав");
+        let id = call(&app.on_key(key(KeyCode::Enter)), "get_group");
+        app.on_result(
+            id,
+            ok(json!({"id": "g1", "name": "Продажи",
+                      "members": [{"account": "acc-1"}, {"group": "g2"}],
+                      "names": {"acc-1": "user1@it-task.ru", "g2": "Инженеры"}})),
+        );
+        app
+    }
+
+    #[test]
+    fn group_members() {
+        let mut app = with_members();
+        let View::List(l) = &main(&app).view else {
+            panic!("не список");
+        };
+        assert_eq!(l.layout, Some(&layout::MEMBERS));
+        assert_eq!(l.rows.len(), 2);
+        assert_eq!(l.rows[1]["name"], "Инженеры");
+        assert_eq!(app.keys()[1], "");
+        assert_eq!(app.keys()[6], "Добав");
+        // F7 — новый участник по имени входа.
+        app.on_key(key(KeyCode::F(7)));
+        for c in "user5@it-task.ru".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let id = call(&app.on_key(key(KeyCode::Enter)), "list_accounts");
+        let fx = app.on_result(
+            id,
+            ok(json!([{"id": "acc-5", "login": "user5@it-task.ru"}])),
+        );
+        let [Effect::Call(id, req)] = fx.as_slice() else {
+            panic!("нет правки группы: {fx:?}");
+        };
+        assert_eq!(req.op.id, "patch_group");
+        assert_eq!(
+            req.body,
+            Some(json!({"members": [{"account": "acc-1"}, {"group": "g2"}, {"account": "acc-5"}]}))
+        );
+        app.on_result(*id, ok(json!({"id": "g1"})));
+        // Esc из результата — участники перечитываются, путь назад к группам сохраняется.
+        let fx = app.on_key(key(KeyCode::Esc));
+        let id = call(&fx, "get_group");
+        app.on_result(
+            id,
+            ok(json!({"id": "g1", "members": [{"group": "g2"}], "names": {"g2": "Инженеры"}})),
+        );
+        // F8 — убрать выделенного: подтверждение с остальными участниками.
+        app.on_key(key(KeyCode::F(8)));
+        let Some(Overlay::Confirm(req)) = &main(&app).overlay else {
+            panic!("нет подтверждения");
+        };
+        assert_eq!(req.body, Some(json!({"members": []})));
+        app.on_key(key(KeyCode::Esc));
+        // Esc — назад к списку групп.
+        let id = call(&app.on_key(key(KeyCode::Esc)), "list_groups");
+        app.on_result(id, ok(json!([])));
+        let View::List(l) = &main(&app).view else {
+            panic!("не список");
+        };
+        assert_eq!(l.layout, Some(&layout::GROUPS));
+    }
+
+    #[test]
+    fn policy_levels() {
+        let mut app = with_accounts();
+        let id = call(&section(&mut app, "Политики"), "get_org");
+        app.on_result(
+            id,
+            ok(json!({"id": "o1", "default": true,
+                      "policy": {"send_per_hour": 200},
+                      "effective": {"send_per_hour": 200, "quota_bytes": 1_073_741_824u64}})),
+        );
+        let View::List(l) = &main(&app).view else {
+            panic!("не список");
+        };
+        assert_eq!(l.layout, Some(&layout::POLICY_ORG));
+        assert!(
+            l.rows
+                .iter()
+                .any(|r| r["name"] == "send_per_hour" && r["policy"] == 200)
+        );
+        // F4 — правка уровня: PUT целиком, значения — заданные на уровне.
+        app.on_key(key(KeyCode::F(4)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы");
+        };
+        assert_eq!(f.op.id, "put_org_policy");
+        assert_eq!(f.value("send_per_hour"), Some("200"));
+        app.on_key(key(KeyCode::Esc));
+        // F5 — домены, Enter — политика домена, Esc — назад.
+        let id = call(&app.on_key(key(KeyCode::F(5))), "list_domains");
+        app.on_result(
+            id,
+            ok(json!({"domains": [{"id": "d1", "name": "it-task.ru"}]})),
+        );
+        let id = call(&app.on_key(key(KeyCode::Enter)), "get_domain_policy");
+        app.on_result(id, ok(json!({"policy": {}, "effective": {}})));
+        assert_eq!(main(&app).view.layout(), Some(&layout::POLICY_DOMAIN));
+        app.on_key(key(KeyCode::F(4)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы");
+        };
+        assert_eq!(f.op.id, "put_domain_policy");
+        app.on_key(key(KeyCode::Esc));
+        let id = call(&app.on_key(key(KeyCode::Esc)), "list_domains");
+        app.on_result(
+            id,
+            ok(json!({"domains": [{"id": "d1", "name": "it-task.ru"}]})),
+        );
+        let id = call(&app.on_key(key(KeyCode::Esc)), "get_org");
+        app.on_result(id, ok(json!({"policy": {}, "effective": {}})));
+        // F6 — ящик по имени входа.
+        app.on_key(key(KeyCode::F(6)));
+        for c in "user1@it-task.ru".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let id = call(&app.on_key(key(KeyCode::Enter)), "list_accounts");
+        let id = call(
+            &app.on_result(id, ok(json!([{"id": "acc-1"}]))),
+            "get_account",
+        );
+        app.on_result(
+            id,
+            ok(json!({"id": "acc-1", "policy": {"quota_bytes": 10}, "effective": {}})),
+        );
+        assert_eq!(main(&app).view.layout(), Some(&layout::POLICY_ACCOUNT));
+        app.on_key(key(KeyCode::F(4)));
         let Some(Overlay::Form(f)) = &main(&app).overlay else {
             panic!("нет формы");
         };
         assert_eq!(
-            f.fields.first().map(|x| x.field.name.as_str()),
-            Some("account")
+            (f.op.id.as_str(), f.value("quota_bytes")),
+            ("put_account_policy", Some("10"))
         );
-        assert_eq!(app.command_line(), "thepost admin trash list <account>");
+    }
+
+    #[test]
+    fn journals_switch_and_filter() {
+        let mut app = with_accounts();
+        let id = call(&section(&mut app, "Журналы"), "search_audit");
+        app.on_result(
+            id,
+            ok(json!({"entries": [{"seq": 1, "at": "2026-11-14T09:00:00Z", "actor_login": "admin@it-task.ru",
+                                   "method": "PATCH", "status": 200, "route": "/api/v1/orgs/{org}/accounts/{account}"}],
+                      "next": 1})),
+        );
+        // Листание по курсору ответа.
+        let fx = app.on_key(key(KeyCode::Down));
+        let [Effect::Call(id, req)] = fx.as_slice() else {
+            panic!("нет следующей страницы: {fx:?}");
+        };
+        assert_eq!(req.query, [("after".to_owned(), "1".to_owned())]);
+        app.on_result(*id, ok(json!({"entries": [], "next": null})));
+        // F2 — фильтр; раскладка остаётся.
+        app.on_key(key(KeyCode::F(2)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет фильтра");
+        };
+        assert!(f.fields.iter().any(|x| x.field.name == "actor"));
+        let fx = app.on_key(key(KeyCode::Enter));
+        let id = call(&fx, "search_audit");
+        app.on_result(id, ok(json!({"entries": [], "next": null})));
+        assert_eq!(main(&app).view.layout(), Some(&layout::AUDIT));
+        // F5 — журнал доставки и обратно.
+        let id = call(&app.on_key(key(KeyCode::F(5))), "search_delivery");
+        app.on_result(id, ok(json!({"events": [], "next": null})));
+        assert_eq!(main(&app).view.layout(), Some(&layout::DELIVERY));
+        assert_eq!(app.keys()[4], "Аудит");
+        call(&app.on_key(key(KeyCode::F(5))), "search_audit");
+    }
+
+    #[test]
+    fn moderation_actions() {
+        let mut app = with_accounts();
+        let id = call(&section(&mut app, "Модерация"), "list_held");
+        app.on_result(
+            id,
+            ok(json!([{"id": "h1", "sender": "x@ext.test", "held_at": "2026-11-14T09:00:00Z", "size": 1000}])),
+        );
+        app.on_key(key(KeyCode::F(5)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы");
+        };
+        assert_eq!(f.op.id, "approve");
+        let fx = app.on_key(key(KeyCode::Enter));
+        let [Effect::Call(_, req)] = fx.as_slice() else {
+            panic!("нет запроса: {fx:?}");
+        };
+        assert_eq!(
+            (req.op.id.as_str(), req.param("held")),
+            ("approve", Some("h1"))
+        );
+        app.on_key(key(KeyCode::F(8)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы");
+        };
+        assert_eq!(f.op.id, "reject");
+    }
+
+    #[test]
+    fn app_passwords_from_account() {
+        let mut app = with_accounts();
+        let id = call(&app.on_key(key(KeyCode::F(6))), "list_app_passwords");
+        app.on_result(
+            id,
+            ok(json!([{"id": "p1", "label": "Телефон", "created_at": "2026-11-01T10:00:00Z", "revoked_at": null}])),
+        );
+        assert_eq!(main(&app).view.layout(), Some(&layout::APP_PASSWORDS));
+        app.on_key(key(KeyCode::F(8)));
+        let Some(Overlay::Confirm(req)) = &main(&app).overlay else {
+            panic!("нет подтверждения отзыва");
+        };
+        assert_eq!(
+            (req.op.id.as_str(), req.param("id")),
+            ("revoke", Some("p1"))
+        );
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::F(7)));
+        let Some(Overlay::Form(f)) = &main(&app).overlay else {
+            panic!("нет формы выпуска");
+        };
+        assert_eq!(f.op.id, "issue");
+        app.on_key(key(KeyCode::Esc));
+        let id = call(&app.on_key(key(KeyCode::Esc)), "list_accounts");
+        app.on_result(id, ok(json!([])));
+        assert_eq!(main(&app).view.layout(), Some(&layout::ACCOUNTS));
     }
 }

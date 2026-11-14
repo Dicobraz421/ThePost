@@ -6,56 +6,27 @@
 pub struct Section {
     /// Подпись.
     pub label: &'static str,
-    /// `operationId` операции, открывающей раздел; `None` — в Admin API операции пока нет.
-    pub op: Option<&'static str>,
+    /// `operationId` операции, открывающей раздел.
+    pub op: &'static str,
+}
+
+const fn section(label: &'static str, op: &'static str) -> Section {
+    Section { label, op }
 }
 
 /// Разделы организации по порядку.
 pub const SECTIONS: [Section; 11] = [
-    Section {
-        label: "Учётные записи",
-        op: Some("list_accounts"),
-    },
-    Section {
-        label: "Домены",
-        op: Some("list_domains"),
-    },
-    Section {
-        label: "Группы",
-        op: Some("list_groups"),
-    },
-    Section {
-        label: "Контакты",
-        op: Some("list_contacts"),
-    },
-    Section {
-        label: "Оргструктура",
-        op: Some("list_units"),
-    },
-    Section {
-        label: "Ресурсы",
-        op: Some("list_resources"),
-    },
-    Section {
-        label: "Политики",
-        op: Some("get_org"),
-    },
-    Section {
-        label: "Журналы",
-        op: Some("search_audit"),
-    },
-    Section {
-        label: "Модерация",
-        op: Some("list_held"),
-    },
-    Section {
-        label: "Корзина",
-        op: Some("list_trash"),
-    },
-    Section {
-        label: "Очередь",
-        op: None,
-    },
+    section("Учётные записи", "list_accounts"),
+    section("Домены", "list_domains"),
+    section("Группы", "list_groups"),
+    section("Контакты", "list_contacts"),
+    section("Оргструктура", "list_units"),
+    section("Ресурсы", "list_resources"),
+    section("Политики", "get_org"),
+    section("Журналы", "search_audit"),
+    section("Модерация", "list_held"),
+    section("Корзина", "list_trash"),
+    section("Очередь", "list_queue"),
 ];
 
 /// Подпись раздела конфигурации узла.
@@ -72,13 +43,12 @@ mod tests {
     #[test]
     fn sections_open_existing_operations() {
         for s in SECTIONS {
-            if let Some(id) = s.op {
-                assert!(
-                    catalog().get(id).is_some(),
-                    "{}: нет операции {id}",
-                    s.label
-                );
-            }
+            assert!(
+                catalog().get(s.op).is_some(),
+                "{}: нет операции {}",
+                s.label,
+                s.op
+            );
         }
     }
 }

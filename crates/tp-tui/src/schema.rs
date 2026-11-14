@@ -200,7 +200,7 @@ impl Catalog {
             .pointer("/components/schemas")
             .and_then(Value::as_object)
             .unwrap_or(&empty);
-        let r = Resolver { schemas };
+        let r = Resolver::new(schemas);
         let mut ops = Vec::new();
         for (path, item) in spec
             .get("paths")
@@ -260,21 +260,27 @@ const PREFERRED: [&str; 14] = [
 ];
 
 /// Свойства объекта и имена обязательных.
-type Props<'a> = (Vec<(&'a str, &'a Value)>, Vec<&'a str>);
+pub(crate) type Props<'a> = (Vec<(&'a str, &'a Value)>, Vec<&'a str>);
 
-struct Resolver<'a> {
+/// Разбор JSON Schema: ссылки `$ref` на схемы OpenAPI (`#/components/schemas/`) и JSON Schema (`#/$defs/`),
+/// объекты с `allOf`, вид значения поля.
+pub(crate) struct Resolver<'a> {
     schemas: &'a Map<String, Value>,
 }
 
 impl<'a> Resolver<'a> {
-    /// Схема по ссылке `$ref` (`#/components/schemas/Имя`), цепочка — до 16 переходов.
-    fn deref(&self, mut v: &'a Value) -> &'a Value {
+    /// Разбор со схемами `schemas` (`components/schemas` или `$defs`).
+    pub(crate) fn new(schemas: &'a Map<String, Value>) -> Self {
+        Self { schemas }
+    }
+
+    /// Схема по ссылке `$ref`, цепочка — до 16 переходов.
+    pub(crate) fn deref(&self, mut v: &'a Value) -> &'a Value {
         for _ in 0..16 {
-            let Some(name) = v
-                .get("$ref")
-                .and_then(Value::as_str)
-                .and_then(|r| r.strip_prefix("#/components/schemas/"))
-            else {
+            let Some(name) = v.get("$ref").and_then(Value::as_str).and_then(|r| {
+                r.strip_prefix("#/components/schemas/")
+                    .or_else(|| r.strip_prefix("#/$defs/"))
+            }) else {
                 break;
             };
             match self.schemas.get(name) {
@@ -286,7 +292,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Свойства объекта (с `allOf`) и список обязательных; не объект — `None`.
-    fn object(&self, v: &'a Value) -> Option<Props<'a>> {
+    pub(crate) fn object(&self, v: &'a Value) -> Option<Props<'a>> {
         let v = self.deref(v);
         if let Some(parts) = v.get("allOf").and_then(Value::as_array) {
             let mut props = Vec::new();
@@ -309,7 +315,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Тип значения: вид, допускает ли `null`, перечисление.
-    fn kind(&self, v: &'a Value) -> (Kind, bool, Vec<String>) {
+    pub(crate) fn kind(&self, v: &'a Value) -> (Kind, bool, Vec<String>) {
         let v = self.deref(v);
         if let Some(vars) = v
             .get("oneOf")
@@ -570,7 +576,7 @@ fn json_schema(v: &Value) -> Option<&Value> {
 }
 
 /// Описание схемы: первая строка `description`.
-fn describe(v: &Value) -> Option<String> {
+pub(crate) fn describe(v: &Value) -> Option<String> {
     v.get("description")
         .and_then(Value::as_str)
         .map(|d| d.lines().next().unwrap_or_default().trim().to_owned())

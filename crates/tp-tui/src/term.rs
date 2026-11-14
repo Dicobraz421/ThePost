@@ -13,6 +13,7 @@ use tp_admin_client::{Client, ENV_TOKEN, ENV_URL, Options, base_url, setting};
 
 use crate::app::{App, Effect, LoginField, LoginForm, LoginRequest, Page, Stage};
 use crate::engine::Request;
+use crate::node::{self, ConfigFile, NodeConfig, SaveError, Saved};
 use crate::schema::Response;
 use crate::theme::Theme;
 use crate::ui;
@@ -34,6 +35,9 @@ pub struct Connect {
     /// Вход с устройства через OIDC (настройки `auth.oidc` и `cli.oidc` читает вызывающий код); нет — способа
     /// «OIDC» в форме входа нет.
     pub oidc: Option<DeviceLogin>,
+    /// Конфигурация узла, когда интерфейс запущен на самом узле с правом на `config.yaml`; нет — раздел
+    /// «Конфигурация узла» только поясняет, где её править.
+    pub node: Option<NodeConfig>,
 }
 
 enum Msg {
@@ -41,6 +45,8 @@ enum Msg {
     Login(Result<(Client, WhoAmI, String), String>),
     Device(String),
     Done(u64, Result<Page, tp_admin_client::Error>),
+    Config(Result<ConfigFile, String>),
+    ConfigSaved(Result<Saved, SaveError>),
 }
 
 /// Текстовый интерфейс `thepost admin tui`: до выхода по F10; терминал возвращается в прежний режим и при ошибке.
@@ -60,6 +66,8 @@ async fn event_loop(terminal: &mut DefaultTerminal, connect: Connect) -> Result<
         login.focus = LoginField::Secret;
     }
     let mut app = App::new(Theme::from_env(), login);
+    app.node = connect.node.is_some();
+    let node = connect.node;
     let options = connect.options;
     let oidc = connect.oidc.map(Arc::new);
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -70,7 +78,14 @@ async fn event_loop(terminal: &mut DefaultTerminal, connect: Connect) -> Result<
         if let Stage::Login(f) = &mut app.stage {
             f.busy = true;
         }
-        apply(effects, &tx, &options, &oidc, client.as_ref());
+        apply(
+            effects,
+            &tx,
+            &options,
+            &oidc,
+            client.as_ref(),
+            node.as_ref(),
+        );
     }
     loop {
         terminal
@@ -92,25 +107,67 @@ async fn event_loop(terminal: &mut DefaultTerminal, connect: Connect) -> Result<
                 Vec::new()
             }
             Msg::Done(id, r) => app.on_result(id, r),
+            Msg::Config(r) => {
+                app.on_config(r);
+                Vec::new()
+            }
+            Msg::ConfigSaved(r) => app.on_config_saved(r),
         };
         if effects.contains(&Effect::Quit) {
             return Ok(());
         }
-        apply(effects, &tx, &options, &oidc, client.as_ref());
+        apply(
+            effects,
+            &tx,
+            &options,
+            &oidc,
+            client.as_ref(),
+            node.as_ref(),
+        );
     }
 }
 
-/// Выполнить действия интерфейса: вход и запросы — задачами, ответы — сообщениями в цикл.
+/// Выполнить действия интерфейса: вход, запросы и файл конфигурации узла — задачами, ответы — сообщениями в
+/// цикл.
 fn apply(
     effects: Vec<Effect>,
     tx: &mpsc::UnboundedSender<Msg>,
     options: &Options,
     oidc: &Option<Arc<DeviceLogin>>,
     client: Option<&Client>,
+    node: Option<&NodeConfig>,
 ) {
     for e in effects {
         match e {
             Effect::Quit => {}
+            Effect::ConfigLoad => {
+                let tx = tx.clone();
+                let node = node.cloned();
+                tokio::task::spawn_blocking(move || {
+                    let r = node
+                        .ok_or_else(|| "конфигурация узла недоступна".to_owned())
+                        .and_then(|n| node::load(&n));
+                    let _ = tx.send(Msg::Config(r));
+                });
+            }
+            Effect::ConfigSave {
+                path,
+                value,
+                loaded,
+            } => {
+                let tx = tx.clone();
+                let node = node.cloned();
+                tokio::task::spawn_blocking(move || {
+                    let r = match node {
+                        Some(n) => node::save(&n, &loaded, &path, value),
+                        None => Err(SaveError {
+                            at_field: false,
+                            message: "конфигурация узла недоступна".to_owned(),
+                        }),
+                    };
+                    let _ = tx.send(Msg::ConfigSaved(r));
+                });
+            }
             Effect::Login(req) => {
                 let tx = tx.clone();
                 let options = options.clone();
