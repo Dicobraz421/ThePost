@@ -51,7 +51,7 @@ use crate::sync::{self, SyncError, SyncRequest};
 use crate::xml::{self, CALDAV, Element, HEADER, Multistatus, XMLNS};
 use crate::{deliver, imip};
 
-/// Зависимости планирования встреч ([`crate::router_with`]).
+/// Зависимости планирования встреч ([`crate::router_shared`]).
 #[derive(Clone)]
 pub struct ScheduleDeps {
     /// Учётные записи: адрес участника — основной адрес или псевдоним учётной записи организации, адрес группы

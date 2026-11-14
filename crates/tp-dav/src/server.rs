@@ -114,14 +114,10 @@ pub fn router(d: Deps, cfg: DavConfig) -> Router {
 }
 
 /// Маршруты DAV с необязательным планированием встреч `schedule` (RFC 6638: рассылка iTIP после `PUT` и `DELETE`,
-/// запрос занятости). Книгу GAL маршруты читают из хранилища, заполняет её [`crate::gal::sync`].
-pub fn router_with(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> Router {
-    build(d, schedule, None, cfg)
-}
-
-/// Маршруты DAV с планированием `schedule` и хранилищами общего доступа `stores` (DAV-17, DAV-18,
-/// [`crate::share`]): права на чужие коллекции — по [`Deps::sharing`] (как у [`router_with`]), а `stores` добавляют
-/// выдачу прав `POST` (`cs:invite`) и состав групп представителей `calendar-proxy` ([`crate::proxy`]).
+/// запрос занятости) и хранилищами общего доступа `stores` (DAV-17, DAV-18, [`crate::share`]): права на чужие
+/// коллекции — по [`Deps::sharing`], а `stores` добавляют выдачу прав `POST` (`cs:invite`) и состав групп
+/// представителей `calendar-proxy` ([`crate::proxy`]). Книгу GAL маршруты читают из хранилища, заполняет её
+/// [`crate::gal::sync`].
 pub fn router_shared(
     d: Deps,
     schedule: Option<ScheduleDeps>,
