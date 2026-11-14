@@ -848,18 +848,32 @@ object_type, owner }::matches`. Записывает вызывающий, из�
 `suite::sharing::share_notifications`; PostgreSQL — `PgMeta` (META-83, миграция 0042).
 
 ## Branding
-Решение 122; CTR-91. Код — `branding.rs`. Брендинг заказчика вместо IT TASK в веб-консоли и текстовом интерфейсе. `BrandColor` — цвет
-`#RRGGBB` (`FromStr` в любом регистре, `Display` и serde строкой — верхний регистр, иное — `Invalid`; `from_rgb`, `rgb`). `BrandLogo { hash:
-BlobHash, size, width, height }` — знак PNG в BLOB по пути `path()` = `branding/<hash>.png` (`BlobStore::put_raw`: путь по содержимому
-неизменяем, новый знак — новый путь); формат и размеры по содержимому проверяет вызывающий. `Branding { product_name, primary, accent,
-logo: Option<BrandLogo> }`, `validate()` — название 1–`MAX_PRODUCT_NAME` (64) символов без управляющих, знак 1 байт–`MAX_LOGO_SIZE`
-(256 КБ), стороны 1–`MAX_LOGO_SIDE` (1024); иначе `Invalid`. `BrandingScope::{Installation, Org(TenantId)}`. `BrandingStore`:
-`branding(scope) -> Option` — свой набор уровня (без подстановки установки); `set_branding(scope, &Branding)` — замена набора уровня
+Решение 122; CTR-91. Код — `branding.rs`. Брендинг заказчика вместо IT TASK в веб-консоли, текстовом интерфейсе и подсветке CLI.
+`BrandColor` — цвет `#RRGGBB` (`FromStr` в любом регистре, `Display` и serde строкой — верхний регистр, иное — `Invalid`; `from_rgb`,
+`from_hex`, `rgb`, `luminance`/`contrast` — WCAG 2.x, `text_on` — белый или чёрный с большим контрастом). Роли — `design/tokens.toml`:
+`Role` (`[roles]`: screen, panel, text, muted, frame, frameA, titleA, head, sel, selFg, selI, selIFg, fkBg, fkFg, ok, warn, err; по
+темам `Theme::{Light, Dark}`) и `CliRole` (`[cli.roles]`: head, accent, ok, warn, err, muted, json_key, json_number, json_bool); имена в
+JSON — как в файле. Цвета IT TASK — `Role::it_task(theme)`, `CliRole::it_task()`, `Palette::it_task()` (розовый выделения — `#E3107F`,
+решение 122; тест сверяет роли, цвета и пары с файлом токенов). `CONTRAST` — пары `[[contrast]]` (`ContrastPair { fg, bg, min }`: текст —
+4,5, рамки и заливки — 3), роли CLI — `CLI_MIN_CONTRAST` (3) на обоих `CLI_BACKGROUNDS`; исключений нет.
+`Palette { light, dark, cli }` — карты ролей (`role(theme, r)`, `cli_role(r)`: нет роли — цвет IT TASK); `contrast_issues() ->
+Vec<ContrastIssue { theme (None — CLI), fg, bg, fg_color, bg_color, contrast, min }>` — пары ниже порога.
+`BrandLogo { hash: BlobHash, size, width, height }` — знак PNG в BLOB по пути `path()` = `branding/<hash>.png` (`BlobStore::put_raw`:
+путь по содержимому неизменяем); `validate()` — 1 байт–`MAX_LOGO_SIZE` (256 КБ), стороны 1–`MAX_LOGO_SIDE` (1024); формат по
+содержимому проверяет вызывающий. `Branding { product_name?, primary?, light, dark, cli, logo? }` — набор уровня, обязательных полей нет
+(`Default` — пустой); `validate()` — название 1–`MAX_PRODUCT_NAME` (64) символов без управляющих, знак; `has_colors()`;
+`palette_over(parent) -> Palette` — чистая функция вывода: заданная роль — как задана; при основном цвете уровня роли бренда `frameA`,
+`fkBg`, `sel`, `head` (и CLI `head`, `json_key`) — из него, `titleA` — из `sel`, `selFg`/`fkFg` — `text_on` к `sel`/`fkBg` (также если
+уровень задал `sel`/`fkBg`), CLI `accent`, `json_bool` — из `sel` светлой темы; выведенные роли подгоняются смесью с чёрным (светлая
+тема) или белым (тёмная) с шагом 1 % до порогов своих пар; остальные роли — с `parent` как есть. `BrandingScope::{Installation,
+Org(TenantId)}`. `BrandingLevels { installation?, org? }::effective() -> EffectiveBranding { product_name?, logo?, palette }` — каждое
+поле с ближайшего уровня (организация → установка → встроенное); цвета — установка поверх IT TASK, затем организация поверх итога; уровень
+без цветов цвета не меняет. `BrandingStore`: `branding(scope) -> Option` — свой набор уровня; `set_branding(scope, &Branding)` — замена
 целиком (`validate()`; неверный — `Invalid`, прежний остаётся); `reset_branding(scope) -> Option` — удаляет и возвращает прежний (знак из
-BLOB удаляет вызывающий, если `logo_in_use` ложно); `effective_branding(Option<TenantId>) -> Option` — ближайший заданный уровень целиком:
-свой набор организации, иначе установки, иначе `None` (встроенный IT TASK, `design/tokens.toml`); `None` на входе — уровень установки;
-`logo_in_use(hash)` — знак упомянут хоть одним уровнем. Права уровней, журнал аудита, контраст и цвета ролей — Admin API (ADM-48), не
-контракт. Все методы обязательные; in-memory — `MemBranding`; набор `suite::branding`; PostgreSQL — `PgMeta` (META-84, миграция 0043).
+BLOB удаляет вызывающий, если `logo_in_use` ложно); `branding_levels(Option<TenantId>) -> BrandingLevels` — оба уровня одним чтением
+(`None` — только установка); `logo_in_use(hash)`. Права уровней, журнал аудита и отказ по контрасту действующего набора (`effective()`
+поверх текущего уровня выше, `contrast_issues`) — Admin API (ADM-48). Все методы обязательные; in-memory — `MemBranding`; набор
+`suite::branding`; PostgreSQL — `PgMeta` (META-84, миграция 0043).
 
 ## Sieve
 SRS 4.3; CTR-46. Код — `sieve.rs`. Интерпретатор — свой крейт `tp-sieve` (sieve-rs под AGPL-3.0); ManageSieve — в роли `imap` (как POP3),
@@ -1210,6 +1224,8 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   получателей и лиза уже в `queue`, `queue_rcpts`). In-memory — `MemQueue` (хранит конечный статус получателя); набор
   `suite::lifecycle::queue_list`. По сравнению с карточкой: оба метода принимают `now` (время передаёт вызывающий, как у `claim`);
   `retry` возвращает `bool` (`false` — запись под лизой); `MemQueue` реализует методы в этой волне — иначе набору не на чем пройти.
-- 2026-11-14 — CTR-91 (x/contracts-62, решение 122): `branding::{BrandingStore, Branding, BrandColor, BrandLogo, BrandingScope,
-  MAX_PRODUCT_NAME, MAX_LOGO_SIZE, MAX_LOGO_SIDE}` — брендинг заказчика по уровням установки и организации; раздел «Branding». In-memory —
-  `MemBranding`; набор `suite::branding`. PostgreSQL — META-84, Admin API — ADM-48.
+- 2026-11-14 — CTR-91 (x/contracts-62, решение 122): `branding::{BrandingStore, Branding, BrandingLevels, EffectiveBranding,
+  BrandingScope, BrandColor, BrandLogo, Theme, Role, CliRole, Palette, ContrastPair, ContrastIssue, CONTRAST, CLI_BACKGROUNDS,
+  CLI_MIN_CONTRAST, MAX_PRODUCT_NAME, MAX_LOGO_SIZE, MAX_LOGO_SIDE}` — брендинг заказчика: все роли `design/tokens.toml`, обязательных
+  полей нет, незаданное — с уровня выше (организация → установка → IT TASK), вывод ролей из основного цвета, контраст без исключений;
+  раздел «Branding». In-memory — `MemBranding`; набор `suite::branding`. PostgreSQL — META-84, Admin API — ADM-48.

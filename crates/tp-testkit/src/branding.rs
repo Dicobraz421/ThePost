@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tp_contracts::branding::{Branding, BrandingScope, BrandingStore};
+use tp_contracts::branding::{Branding, BrandingLevels, BrandingScope, BrandingStore};
 use tp_contracts::{BlobHash, Result, TenantId};
 
 use crate::infra::lock;
@@ -31,12 +31,12 @@ impl BrandingStore for MemBranding {
         Ok(lock(&self.state).remove(&scope))
     }
 
-    async fn effective_branding(&self, tenant: Option<TenantId>) -> Result<Option<Branding>> {
+    async fn branding_levels(&self, tenant: Option<TenantId>) -> Result<BrandingLevels> {
         let st = lock(&self.state);
-        Ok(tenant
-            .and_then(|t| st.get(&BrandingScope::Org(t)))
-            .or_else(|| st.get(&BrandingScope::Installation))
-            .cloned())
+        Ok(BrandingLevels {
+            installation: st.get(&BrandingScope::Installation).cloned(),
+            org: tenant.and_then(|t| st.get(&BrandingScope::Org(t)).cloned()),
+        })
     }
 
     async fn logo_in_use(&self, hash: &BlobHash) -> Result<bool> {

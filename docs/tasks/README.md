@@ -862,7 +862,7 @@
 | [CTR-90](CTR-90.md) | вытеснение старых `ShareNotification` сверх предела в хранилище | contracts | B | contracts-61 | todo | CTR-86,META-83 |
 | [DAV-39](DAV-39.md) | удалить `tp_dav::router_with`, тесты — на `router_shared` | dav | A | dav-18 | ready | — |
 | [APP-73](APP-73.md) | e2e узла — ответ ресурса внешнему организатору письмом iMIP | app | A | app-70 | todo | APP-71 |
-| [CTR-91](CTR-91.md) | брендинг заказчика в контракте — `BrandingStore`, уровни установки и организации | contracts | B | contracts-62 | ready | — |
+| [CTR-91](CTR-91.md) | брендинг заказчика в контракте — `BrandingStore`, роли цветов, уровни установки и организации | contracts | B | contracts-62 | ready | — |
 | [META-84](META-84.md) | брендинг заказчика в PostgreSQL — миграция 0043 и `BrandingStore` в `PgMeta` | meta | A | meta-57 | todo | CTR-91 |
 | [ADM-48](ADM-48.md) | брендинг заказчика в Admin API — чтение, запись, сброс, знак, контраст, открытый маршрут | admin | B | admin-34 | todo | CTR-91,DES-01,ADM-44 |
 | [APP-75](APP-75.md) | узел — брендинг заказчика (`BrandingStore` и BLOB в Admin API) | app | A | app-72 | todo | META-84,ADM-48 |
