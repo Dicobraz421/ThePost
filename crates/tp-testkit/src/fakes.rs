@@ -40,7 +40,8 @@ use tp_contracts::meta::{
     AccountScope, AccountStore, Message, MessageStore, PolicyResolver, QuotaUsage,
 };
 use tp_contracts::queue::{
-    Claimed, OutMessage, OutRcpt, QueueClaim, QueueStore, QueuedRcpt, RcptStatus, queue_ready,
+    Claimed, OutMessage, OutRcpt, QueueClaim, QueueFilter, QueueItem, QueueItemRcpt,
+    QueueRcptState, QueueState, QueueStore, QueuedRcpt, RcptStatus, queue_ready,
 };
 use tp_contracts::retention::{
     PurgeOutcome, Quota, Restored, TrashItem, TrashObject, TrashPurge, TrashStore, trash_changed,
@@ -929,7 +930,8 @@ struct RcptState {
     attempts: u32,
     last_error: Option<String>,
     next_attempt: OffsetDateTime,
-    done: bool,
+    /// Конечный статус; `None` — ждёт попытки.
+    status: Option<RcptStatus>,
     /// Выдан текущим захватом и ещё не завершён.
     claimed: bool,
 }
@@ -943,11 +945,55 @@ struct QueueEntry {
     rcpts: Vec<RcptState>,
 }
 
+impl RcptState {
+    fn pending(&self) -> bool {
+        self.status.is_none()
+    }
+}
+
 impl QueueEntry {
+    /// Запись для просмотра в момент `now` (CTR-85).
+    fn item(&self, id: QueueId, now: OffsetDateTime) -> QueueItem {
+        let pending = || self.rcpts.iter().filter(|r| r.pending());
+        let state = if self.lease_until.is_some_and(|u| u > now) {
+            QueueState::Active
+        } else if pending().any(|r| r.attempts > 0) {
+            QueueState::Retry
+        } else {
+            QueueState::Ready
+        };
+        QueueItem {
+            id,
+            state,
+            queued_at: self.queued_at,
+            next_attempt: pending()
+                .map(|r| r.next_attempt)
+                .min()
+                .unwrap_or(self.msg.next_attempt),
+            from: self.msg.from.clone(),
+            size: self.msg.size,
+            rcpts: self
+                .rcpts
+                .iter()
+                .map(|r| QueueItemRcpt {
+                    rcpt: r.rcpt.clone(),
+                    state: match &r.status {
+                        None => QueueRcptState::Pending {
+                            next_attempt: r.next_attempt,
+                        },
+                        Some(s) => QueueRcptState::Done(s.clone()),
+                    },
+                    attempts: r.attempts,
+                    last_error: r.last_error.clone(),
+                })
+                .collect(),
+        }
+    }
+
     fn due(&self, now: OffsetDateTime) -> Option<OffsetDateTime> {
         self.rcpts
             .iter()
-            .filter(|r| !r.done && r.next_attempt <= now)
+            .filter(|r| r.pending() && r.next_attempt <= now)
             .map(|r| r.next_attempt)
             .min()
     }
@@ -956,7 +1002,8 @@ impl QueueEntry {
 /// [`QueueStore`] в памяти. Время захвата передаёт вызывающий; `queued_at` — по часам [`Clock`], для отложенного
 /// письма — срок выпуска, если он позже. Отмена ([`QueueStore::cancel_queued`]) — до первого захвата.
 /// Когда все выданные захватом получатели завершены (`reschedule`/`postpone`/`complete`), лиза снимается.
-/// С шиной ([`MemQueue::with_bus`]) `enqueue`, `reschedule` и `postpone` публикуют сигнал `QueueReady` (CTR-73), как
+/// Просмотр и повтор (`list`, `retry`, CTR-85) — по правилам контракта.
+/// С шиной ([`MemQueue::with_bus`]) `enqueue`, `reschedule`, `postpone` и `retry` публикуют сигнал `QueueReady` (CTR-73), как
 /// реализация `tp-meta`.
 #[derive(Clone)]
 pub struct MemQueue {
@@ -1028,14 +1075,14 @@ impl MemQueue {
         let r = e
             .rcpts
             .iter_mut()
-            .find(|r| r.rcpt.address == rcpt && !r.done)
+            .find(|r| r.rcpt.address == rcpt && r.pending())
             .ok_or(Error::NotFound)?;
         let out = f(r);
         r.claimed = false;
         if !e.rcpts.iter().any(|r| r.claimed) {
             e.lease_until = None;
         }
-        let finished = e.rcpts.iter().all(|r| r.done);
+        let finished = !e.rcpts.iter().any(RcptState::pending);
         if finished {
             st.remove(&claim.id);
         }
@@ -1064,7 +1111,7 @@ impl QueueStore for MemQueue {
                 attempts: 0,
                 last_error: None,
                 next_attempt: msg.next_attempt,
-                done: false,
+                status: None,
                 claimed: false,
             })
             .collect();
@@ -1088,7 +1135,7 @@ impl QueueStore for MemQueue {
                 let at = e
                     .rcpts
                     .iter()
-                    .filter(|r| !r.done)
+                    .filter(|r| r.pending())
                     .map(|r| r.next_attempt)
                     .min()?;
                 Some(e.lease_until.map_or(at, |u| at.max(u)))
@@ -1117,7 +1164,7 @@ impl QueueStore for MemQueue {
             e.lease_until = Some(until);
             let mut rcpts = Vec::new();
             for r in &mut e.rcpts {
-                r.claimed = !r.done && r.next_attempt <= now;
+                r.claimed = r.pending() && r.next_attempt <= now;
                 if r.claimed {
                     rcpts.push(QueuedRcpt {
                         rcpt: r.rcpt.clone(),
@@ -1178,10 +1225,10 @@ impl QueueStore for MemQueue {
 
     async fn complete(&self, claim: &QueueClaim, rcpt: &str, status: RcptStatus) -> Result<bool> {
         self.with_claim(claim, rcpt, |r| {
-            r.done = true;
-            if let RcptStatus::Failed { reply } = status {
-                r.last_error = Some(reply);
+            if let RcptStatus::Failed { reply } = &status {
+                r.last_error = Some(reply.clone());
             }
+            r.status = Some(status);
         })
         .map(|(_, finished, _)| finished)
     }
@@ -1198,6 +1245,48 @@ impl QueueStore for MemQueue {
         let blob = e.msg.blob;
         st.remove(&id);
         Ok(blob)
+    }
+
+    async fn list(
+        &self,
+        tenant: TenantId,
+        filter: &QueueFilter,
+        after: Option<QueueId>,
+        limit: usize,
+        now: OffsetDateTime,
+    ) -> Result<Vec<QueueItem>> {
+        if limit == 0 {
+            return Err(Error::invalid("queue list: limit must be positive"));
+        }
+        let st = lock(&self.entries);
+        let mut items: Vec<_> = st
+            .iter()
+            .filter(|(id, e)| e.msg.tenant == tenant && after.is_none_or(|a| **id > a))
+            .map(|(id, e)| e.item(*id, now))
+            .filter(|i| filter.matches(i))
+            .collect();
+        items.sort_unstable_by_key(|i| i.id);
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn retry(&self, tenant: TenantId, id: QueueId, now: OffsetDateTime) -> Result<bool> {
+        {
+            let mut st = lock(&self.entries);
+            let e = st
+                .get_mut(&id)
+                .filter(|e| e.msg.tenant == tenant)
+                .ok_or(Error::NotFound)?;
+            if e.lease_until.is_some_and(|u| u > now) {
+                return Ok(false);
+            }
+            e.queued_at = e.queued_at.min(now);
+            for r in e.rcpts.iter_mut().filter(|r| r.pending()) {
+                r.next_attempt = now;
+            }
+        }
+        self.signal(tenant).await;
+        Ok(true)
     }
 }
 
@@ -2211,6 +2300,16 @@ mod tests {
         let bus = Arc::new(crate::MemEventBus::new(64));
         let queue = MemQueue::new(clock.shared()).with_bus(bus.clone());
         crate::suite::lifecycle::queue_next_due(&queue, bus.as_ref(), TenantId::new()).await;
+    }
+
+    /// CTR-85: просмотр и повтор.
+    #[tokio::test]
+    async fn queue_passes_list_suite() {
+        let clock = ManualClock::default();
+        let bus = Arc::new(crate::MemEventBus::new(64));
+        let queue = MemQueue::new(clock.shared()).with_bus(bus.clone());
+        crate::suite::lifecycle::queue_list(&queue, bus.as_ref(), TenantId::new(), TenantId::new())
+            .await;
     }
 
     #[tokio::test]

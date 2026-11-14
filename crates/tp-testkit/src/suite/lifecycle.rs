@@ -1,5 +1,5 @@
-//! Наборы проверок жизненного цикла ящика и очереди без опроса (CTR-73, CTR-76…78): ближайший срок и сигнал
-//! очереди, архив ящика (выборка «пора в архив», раздельная квота), сигнал и атомарная отметка удаления отключённого
+//! Наборы проверок жизненного цикла ящика и очереди без опроса (CTR-73, CTR-76…78, CTR-85): ближайший срок и сигнал
+//! очереди, просмотр и повтор записей очереди, архив ящика (выборка «пора в архив», раздельная квота), сигнал и атомарная отметка удаления отключённого
 //! ящика. In-memory хранилища `tp-testkit` и `PgMeta` проходят одни и те же проверки.
 
 use std::time::Duration;
@@ -12,9 +12,14 @@ use tp_contracts::meta::{
     MessageMeta, MessageStore, NewMailbox, NewMessage, Policy, PolicyStore, PolicyTarget,
     SpecialUse, disabled_mailbox_changed,
 };
-use tp_contracts::queue::{DsnParams, OutMessage, OutRcpt, QueueStore, RcptStatus, queue_ready};
+use tp_contracts::queue::{
+    DsnParams, OutMessage, OutRcpt, QueueFilter, QueueItem, QueueRcptState, QueueState, QueueStore,
+    RcptStatus, queue_ready,
+};
 use tp_contracts::retention::Quota;
-use tp_contracts::{AccountId, BlobHash, BlobKey, Error, Gen, MailboxId, MessageId, TenantId};
+use tp_contracts::{
+    AccountId, BlobHash, BlobKey, Error, Gen, MailboxId, MessageId, QueueId, TenantId,
+};
 
 use super::{AccountStateFixture, fresh_hash, next_signal, role_folder};
 
@@ -122,6 +127,265 @@ pub async fn queue_next_due(queue: &dyn QueueStore, bus: &dyn EventBus, tenant: 
         Ok(true)
     );
     assert_eq!(queue.next_due().await, Ok(None), "очередь снова пуста");
+}
+
+// ---------- QueueStore: просмотр и повтор (CTR-85) ----------
+
+/// Набор проверок просмотра и повтора `QueueStore` (CTR-85): `list` — записи своей организации по `id` порциями,
+/// состояние (`Ready`, `Active` под лизой, `Retry` после временной неудачи), получатели со статусами, фильтр по
+/// состоянию и адресу; `retry` переносит срок на «сейчас» (и выпускает отложенное письмо), будит `next_due` и
+/// публикует `QueueReady` в `bus` (шину своей реализации), под лизой — `false` без изменений. Записи и `retry`
+/// другой организации не видны: `foreign` — вторая существующая организация.
+pub async fn queue_list(
+    queue: &dyn QueueStore,
+    bus: &dyn EventBus,
+    tenant: TenantId,
+    foreign: TenantId,
+) {
+    let t0 = OffsetDateTime::UNIX_EPOCH + time::Duration::days(300);
+    let sec = time::Duration::seconds;
+    let lease = Duration::from_secs(30);
+    let message = |tenant: TenantId, from: &str, rcpts: &[&str], at: OffsetDateTime| OutMessage {
+        tenant,
+        blob: BlobKey {
+            tenant,
+            hash: fresh_hash(),
+            generation: Gen::INITIAL,
+        },
+        size: 100 + rcpts.len() as u64,
+        from: from.into(),
+        dsn: DsnParams::default(),
+        rcpts: rcpts.iter().map(|r| OutRcpt::new(*r)).collect(),
+        next_attempt: at,
+    };
+    let all = QueueFilter::default();
+    let ids = |items: &[QueueItem]| items.iter().map(|i| i.id).collect::<Vec<_>>();
+    let by = |state: Option<QueueState>, address: Option<&str>| QueueFilter {
+        state,
+        address: address.map(str::to_owned),
+    };
+    let delivered = RcptStatus::Delivered {
+        reply: "250 ok".into(),
+    };
+
+    let other = queue
+        .enqueue(
+            None,
+            message(foreign, "x@example.org", &["y@example.net"], t0 + sec(7200)),
+        )
+        .await
+        .expect("enqueue foreign");
+    let a = queue
+        .enqueue(
+            None,
+            message(
+                tenant,
+                "a@example.org",
+                &["b@example.net", "c@example.com"],
+                t0,
+            ),
+        )
+        .await
+        .expect("enqueue a");
+    let d = queue
+        .enqueue(
+            None,
+            message(tenant, "d@example.org", &["e@example.net"], t0 + sec(3600)),
+        )
+        .await
+        .expect("enqueue deferred");
+    let mut own = vec![a, d];
+    own.sort_unstable();
+
+    let listed = queue.list(tenant, &all, None, 10, t0).await.expect("list");
+    assert_eq!(ids(&listed), own, "свои записи по id, чужой нет");
+    let item = listed.iter().find(|i| i.id == a).expect("a");
+    assert_eq!(
+        (item.state, item.next_attempt, item.from.as_str(), item.size),
+        (QueueState::Ready, t0, "a@example.org", 102)
+    );
+    let pending = QueueRcptState::Pending { next_attempt: t0 };
+    assert_eq!(
+        item.rcpts
+            .iter()
+            .map(|r| (r.rcpt.address.as_str(), &r.state, r.attempts))
+            .collect::<Vec<_>>(),
+        [
+            ("b@example.net", &pending, 0),
+            ("c@example.com", &pending, 0)
+        ]
+    );
+    let deferred = listed.iter().find(|i| i.id == d).expect("d");
+    assert_eq!(
+        (deferred.state, deferred.next_attempt),
+        (QueueState::Ready, t0 + sec(3600)),
+        "отложенное письмо ждёт срока выпуска"
+    );
+
+    let first = queue.list(tenant, &all, None, 1, t0).await.expect("page 1");
+    assert_eq!(ids(&first), own[..1]);
+    let second = queue
+        .list(tenant, &all, Some(own[0]), 1, t0)
+        .await
+        .expect("page 2");
+    assert_eq!(ids(&second), own[1..]);
+    let tail = queue
+        .list(tenant, &all, Some(own[1]), 1, t0)
+        .await
+        .expect("page 3");
+    assert!(tail.is_empty(), "после последней — пусто");
+    assert!(matches!(
+        queue.list(tenant, &all, None, 0, t0).await,
+        Err(Error::Invalid(_))
+    ));
+    let foreign_list = queue.list(foreign, &all, None, 10, t0).await.expect("list");
+    assert_eq!(
+        ids(&foreign_list),
+        [other],
+        "чужая организация видит только своё"
+    );
+    let unknown = queue
+        .list(TenantId::new(), &all, None, 10, t0)
+        .await
+        .expect("list unknown");
+    assert!(unknown.is_empty(), "организация без записей — пусто");
+
+    // Захват: под лизой — Active, retry ничего не меняет.
+    let got = queue.claim(t0, 1000, lease).await.expect("claim");
+    let c = got.iter().find(|c| c.claim.id == a).expect("a claimed");
+    let active = queue
+        .list(
+            tenant,
+            &by(Some(QueueState::Active), None),
+            None,
+            10,
+            t0 + sec(1),
+        )
+        .await
+        .expect("list active");
+    assert_eq!(ids(&active), [a]);
+    assert_eq!(queue.retry(tenant, a, t0 + sec(1)).await, Ok(false));
+    queue
+        .reschedule(&c.claim, "b@example.net", t0 + sec(600), "451 later")
+        .await
+        .expect("reschedule");
+    assert_eq!(
+        queue
+            .complete(&c.claim, "c@example.com", delivered.clone())
+            .await,
+        Ok(false)
+    );
+
+    // После лизы: Retry, получатели со статусами, фильтры.
+    let t1 = t0 + sec(60);
+    let retry = queue
+        .list(tenant, &by(Some(QueueState::Retry), None), None, 10, t1)
+        .await
+        .expect("list retry");
+    assert_eq!(ids(&retry), [a]);
+    let item = &retry[0];
+    assert_eq!(item.next_attempt, t0 + sec(600));
+    assert_eq!(item.rcpts.len(), 2);
+    let b = &item.rcpts[0];
+    assert_eq!(
+        (&b.state, b.attempts, b.last_error.as_deref()),
+        (
+            &QueueRcptState::Pending {
+                next_attempt: t0 + sec(600)
+            },
+            1,
+            Some("451 later")
+        )
+    );
+    assert_eq!(item.rcpts[1].state, QueueRcptState::Done(delivered.clone()));
+    let ready = queue
+        .list(tenant, &by(Some(QueueState::Ready), None), None, 10, t1)
+        .await
+        .expect("list ready");
+    assert_eq!(ids(&ready), [d]);
+    for (needle, want) in [
+        ("E@EXAMPLE.NET", vec![d]),
+        ("example.com", vec![a]),
+        ("a@example.org", vec![a]),
+        ("nobody", vec![]),
+    ] {
+        let found = queue
+            .list(tenant, &by(None, Some(needle)), None, 10, t1)
+            .await
+            .expect("list by address");
+        assert_eq!(ids(&found), want, "адрес {needle}");
+    }
+    let none = queue
+        .list(
+            tenant,
+            &by(Some(QueueState::Ready), Some("b@")),
+            None,
+            10,
+            t1,
+        )
+        .await
+        .expect("list both");
+    assert!(none.is_empty(), "фильтры вместе");
+
+    // Повтор: срок «сейчас», сигнал, next_due не позже, захват выдаёт незавершённого получателя.
+    assert_eq!(queue.retry(foreign, a, t1).await, Err(Error::NotFound));
+    assert_eq!(
+        queue.retry(tenant, QueueId::new(), t1).await,
+        Err(Error::NotFound)
+    );
+    let mut sys = bus.subscribe_system().await.expect("subscribe_system");
+    assert_eq!(queue.retry(tenant, a, t1).await, Ok(true));
+    let e = next_kind(&mut sys, |k| *k == EventKind::QueueReady).await;
+    assert_eq!(e, queue_ready(tenant), "сигнал после повтора");
+    let due = queue.next_due().await.expect("next_due").expect("due");
+    assert!(due <= t1, "retry будит next_due: {due}");
+    let item = queue
+        .list(tenant, &all, None, 10, t1)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|i| i.id == a)
+        .expect("a");
+    assert_eq!((item.state, item.next_attempt), (QueueState::Retry, t1));
+    assert_eq!(item.rcpts[0].attempts, 1, "attempts не меняется");
+    assert_eq!(item.rcpts[1].state, QueueRcptState::Done(delivered.clone()));
+    assert_eq!(queue.retry(tenant, d, t1).await, Ok(true), "отложенное");
+
+    let got = queue.claim(t1, 1000, lease).await.expect("claim");
+    let c = got
+        .iter()
+        .find(|c| c.claim.id == a)
+        .expect("a после повтора");
+    assert_eq!(
+        c.rcpts
+            .iter()
+            .map(|r| r.rcpt.address.as_str())
+            .collect::<Vec<_>>(),
+        ["b@example.net"]
+    );
+    let cd = got.iter().find(|c| c.claim.id == d).expect("d выпущено");
+    assert!(cd.queued_at <= t1, "queued_at выпущенного не позже повтора");
+    assert_eq!(
+        queue
+            .complete(&c.claim, "b@example.net", delivered.clone())
+            .await,
+        Ok(true)
+    );
+    assert_eq!(
+        queue.complete(&cd.claim, "e@example.net", delivered).await,
+        Ok(true)
+    );
+    assert_eq!(
+        queue.retry(tenant, a, t1).await,
+        Err(Error::NotFound),
+        "завершённая запись"
+    );
+    let left = queue.list(tenant, &all, None, 10, t1).await.expect("list");
+    assert!(left.is_empty(), "все записи завершены");
+    queue
+        .cancel_queued(foreign, other)
+        .await
+        .expect("cancel foreign");
 }
 
 // ---------- Отключённые ящики (CTR-77, CTR-78) ----------

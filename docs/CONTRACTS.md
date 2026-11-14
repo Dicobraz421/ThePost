@@ -569,8 +569,17 @@ SRS 4.1. Код — `queue.rs`. `QueueStore` (общая для организа
 набор `suite::queue_release`. Выпуск по таймеру ближайшего срока — SMTP-24, PostgreSQL — META-33.
 Без опроса (CTR-73, SRS 2.8): `next_due() -> Option<OffsetDateTime>` — ближайший момент, когда `claim` выдаст запись (наименьший срок
 попытки незавершённых получателей, у записи под лизой — не раньше конца лизы; все организации; пусто — `None`); после фиксации
-`enqueue`, `reschedule`, `postpone` — сигнал `QueueReady` организации записи (`queue::queue_ready`). smtp-out ждёт сигнала или срока
+`enqueue`, `reschedule`, `postpone`, `retry` — сигнал `QueueReady` организации записи (`queue::queue_ready`). smtp-out ждёт сигнала или срока
 `next_due` (SMTP-42). Обязателен; `MemQueue::with_bus`; набор `suite::lifecycle::queue_next_due`.
+Просмотр и повтор (CTR-85; консоль и TUI, раздел «Очередь»): `list(tenant, &QueueFilter { state, address }, after: Option<QueueId>, limit,
+now) -> Vec<QueueItem { id, state, queued_at, next_attempt, from, size, rcpts: Vec<QueueItemRcpt { rcpt, state, attempts, last_error }> }>`
+— записи организации по `id` строго после `after`, не более `limit` (порция короче — последняя; `limit` = 0 — `Invalid`); состояние
+в момент `now` — `QueueState::{Ready, Retry, Active}` (`Active` — действующая лиза, `Retry` — у незавершённого получателя `attempts` > 0);
+получатель — `QueueRcptState::{Pending { next_attempt }, Done(RcptStatus)}`; `next_attempt` записи — наименьший у незавершённых.
+Фильтр — `QueueFilter::matches` (состояние; подстрока адреса отправителя или получателя без учёта регистра). `retry(tenant, id, now) -> bool`
+— срок попытки `now` у незавершённых получателей (`attempts` не меняется; отложенное письмо выпускается, `queued_at` не позже `now`),
+после фиксации — `QueueReady`; под действующей лизой — `false` без изменений; нет записи (другой организации, завершена) — `NotFound`.
+Оба по умолчанию — `Internal`; in-memory — `MemQueue`; набор `suite::lifecycle::queue_list`. PostgreSQL — отдельная волна meta.
 Устаревший захват — `Conflict`; не завершённые до истечения лизы получатели возвращаются в очередь без `attempts` + 1.
 Тело — один объект BLOB: ссылку учитывает вызывающий до `enqueue` и освобождает после `complete` = `true`.
 Расписание повторов, срок доставки и DSN — `tp-smtp` (DSN ставится в очередь до `complete(.., Failed)`).
@@ -1142,3 +1151,9 @@ JSON в JMAP (`session_object`, аргументы и результат `call`)
   `suite::sharing_authorizer` (проверки AUTH-12) — прогон в `tp-auth` на `MemDav` и `MemMetadata` вместо временных хранилищ тестов;
   `FakeSharingAuthorizer`. Несовместимо: вызовы методов `CollectionAuthorizer` требуют трейта в области видимости (вызовов вне
   `tp-auth` не было).
+- 2026-11-14 — CTR-85 (волна contracts-57): `QueueStore::list` и `QueueStore::retry` — просмотр очереди организации порциями с фильтром
+  по состоянию и адресу (`QueueFilter`, `QueueItem`, `QueueItemRcpt`, `QueueState`, `QueueRcptState`) и повтор доставки «сейчас» с
+  сигналом `QueueReady`. Методы по умолчанию — `Internal` до реализации в `tp-meta` (отдельная волна, миграция не нужна: статусы
+  получателей и лиза уже в `queue`, `queue_rcpts`). In-memory — `MemQueue` (хранит конечный статус получателя); набор
+  `suite::lifecycle::queue_list`. По сравнению с карточкой: оба метода принимают `now` (время передаёт вызывающий, как у `claim`);
+  `retry` возвращает `bool` (`false` — запись под лизой); `MemQueue` реализует методы в этой волне — иначе набору не на чем пройти.
