@@ -185,6 +185,7 @@ impl Env {
         jmap.sharing = Some(SharingDeps {
             authz: Arc::new(env.collections.clone()),
             acl: Arc::new(env.dav.clone()),
+            notifications: Arc::new(tp_testkit::MemShareNotifications::new()),
         });
         env
     }

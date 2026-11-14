@@ -600,10 +600,12 @@ impl Services {
             .with_freebusy(Some(Arc::new(self.meta.clone())))
             // Приглашения из JMAP (`sendSchedulingMessages`, JMAP-31) — теми же зависимостями, что у CalDAV.
             .with_schedule(Some(self.schedule(outbound)))
-            // Общий доступ к календарям и книгам (JMAP-32): права — единый слой `collections`, записи — `PgMeta`.
+            // Общий доступ к календарям и книгам (JMAP-32): права — единый слой `collections`, записи прав и
+            // уведомления о доступе (JMAP-46) — `PgMeta`.
             .with_sharing(Some(tp_jmap::SharingDeps {
                 authz: self.collections.clone(),
                 acl: Arc::new(self.meta.clone()),
+                notifications: Arc::new(self.meta.clone()),
             })))
     }
 
