@@ -898,6 +898,7 @@ mod tests {
             aliases: Vec::new(),
             kind: AccountKind::User,
             hidden_from_gal: false,
+            resource_type: None,
         };
         let tenant = TenantId::DEFAULT;
         let account = stand

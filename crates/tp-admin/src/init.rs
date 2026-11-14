@@ -341,6 +341,7 @@ impl Admin {
                         aliases: Vec::new(),
                         kind: AccountKind::User,
                         hidden_from_gal: false,
+                        resource_type: None,
                     },
                 )
                 .await?
@@ -490,6 +491,7 @@ fn enabled(a: Account) -> AccountUpsert {
         aliases: a.aliases,
         kind: a.kind,
         hidden_from_gal: a.hidden_from_gal,
+        resource_type: a.resource_type,
     }
 }
 

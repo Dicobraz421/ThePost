@@ -72,6 +72,7 @@ impl Share {
                         aliases: Vec::new(),
                         kind,
                         hidden_from_gal: false,
+                        resource_type: None,
                     },
                 )
                 .await

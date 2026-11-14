@@ -55,6 +55,33 @@ pub enum AccountKind {
     Resource,
 }
 
+/// Тип ресурса бронирования (CTR-88, решение 121): клиентам — CalDAV `calendar-user-type` (`CUTYPE`) `ROOM` или
+/// `RESOURCE`, JMAP `Principal.type` `location` или `resource` (RFC 9670). Правила бронирования от типа не зависят.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceType {
+    /// Помещение (переговорная) — по умолчанию.
+    #[default]
+    Room,
+    /// Оборудование (проектор, автомобиль).
+    Equipment,
+}
+
+/// Тип ресурса учётной записи вида `kind` по запросу `requested` (CTR-88; [`AccountUpsert::resource_type`]): у ресурса —
+/// запрошенный, без запроса — [`ResourceType::Room`]; у пользователя — `None`, тип в запросе — `Error::Invalid`.
+pub fn account_resource_type(
+    kind: AccountKind,
+    requested: Option<ResourceType>,
+) -> Result<Option<ResourceType>> {
+    match (kind, requested) {
+        (AccountKind::Resource, r) => Ok(Some(r.unwrap_or_default())),
+        (AccountKind::User, None) => Ok(None),
+        (AccountKind::User, Some(_)) => Err(Error::invalid(
+            "resource type is only allowed for resource accounts",
+        )),
+    }
+}
+
 /// Учётная запись.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -82,6 +109,9 @@ pub struct Account {
     /// приём почты — как обычно. Задаёт [`AccountUpsert::hidden_from_gal`]; каталог PostgreSQL (узел без LDAP)
     /// передаёт его в `DirAccount::hidden_from_gal`.
     pub hidden_from_gal: bool,
+    /// Тип ресурса (CTR-88): у ресурса ([`AccountKind::Resource`]) — всегда `Some`, у пользователя — `None`. Задаёт
+    /// [`AccountUpsert::resource_type`] (правило [`account_resource_type`]).
+    pub resource_type: Option<ResourceType>,
 }
 
 impl Account {
@@ -125,6 +155,9 @@ pub struct AccountUpsert {
     /// Скрыта из книги «Организация» (CTR-83); при обновлении заменяет прежний признак. Синхронизация каталога
     /// переносит `DirAccount::hidden_from_gal` (LDAP — `msExchHideFromAddressLists`, AUTH-16).
     pub hidden_from_gal: bool,
+    /// Тип ресурса (CTR-88); при обновлении заменяет прежний. У ресурса `None` — [`ResourceType::Room`], у
+    /// пользователя тип — `Error::Invalid`; смена вида на пользователя снимает тип ([`account_resource_type`]).
+    pub resource_type: Option<ResourceType>,
 }
 
 /// Состояние ящика учётной записи (CTR-35, решение 2026-11-04-exchange-parity «Удалённые ящики»).
@@ -292,7 +325,8 @@ pub trait AccountStore: Send + Sync + 'static {
         ))
     }
 
-    /// Создаёт или обновляет учётную запись (из LDAP); при создании — системные папки.
+    /// Создаёт или обновляет учётную запись (из LDAP); при создании — системные папки. Тип ресурса — правило
+    /// [`account_resource_type`] (тип у пользователя — `Error::Invalid`, CTR-88).
     async fn upsert(&self, tenant: TenantId, data: AccountUpsert) -> Result<Account>;
 
     /// Использование основной квоты: письма вне ветки архива ([`QuotaUsage`]; CTR-76), `limit_bytes` — `None`
@@ -965,6 +999,32 @@ mod tests {
     use super::*;
     use crate::ids::{BlobHash, Gen};
     use std::sync::Arc;
+
+    /// Тип ресурса (CTR-88): у ресурса по умолчанию помещение, у пользователя тип недопустим; serde `room`, `equipment`.
+    #[test]
+    fn resource_type_rule() {
+        use AccountKind::{Resource, User};
+        use ResourceType::{Equipment, Room};
+        assert_eq!(account_resource_type(Resource, None), Ok(Some(Room)));
+        assert_eq!(
+            account_resource_type(Resource, Some(Equipment)),
+            Ok(Some(Equipment))
+        );
+        assert_eq!(account_resource_type(User, None), Ok(None));
+        assert!(matches!(
+            account_resource_type(User, Some(Room)),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(
+            serde_json::to_string(&Equipment).expect("ser"),
+            "\"equipment\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ResourceType>("\"room\"").expect("de"),
+            Room
+        );
+        assert_eq!(ResourceType::default(), Room);
+    }
 
     #[test]
     fn object_safe() {

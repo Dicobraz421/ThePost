@@ -513,6 +513,7 @@ pub(crate) async fn create_local(
                 aliases: Vec::new(),
                 kind,
                 hidden_from_gal: false,
+                resource_type: None,
             },
         )
         .await
@@ -692,6 +693,7 @@ async fn patch_account(
                     aliases,
                     kind: acc.kind,
                     hidden_from_gal: p.hidden_from_gal.unwrap_or(acc.hidden_from_gal),
+                    resource_type: acc.resource_type,
                 },
             )
             .await?;
@@ -1397,6 +1399,7 @@ mod tests {
                     aliases: Vec::new(),
                     kind: tp_contracts::meta::AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await
@@ -1571,6 +1574,7 @@ mod tests {
                     aliases: vec!["d@example.org".into()],
                     kind: AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await

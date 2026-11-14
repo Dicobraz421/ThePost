@@ -123,6 +123,7 @@ async fn own_address_and_alias_reach_calendar() {
             aliases: vec!["A.Smith@example.org".into()],
             kind: AccountKind::User,
             hidden_from_gal: false,
+            resource_type: None,
         },
     )
     .await

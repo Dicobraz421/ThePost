@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use tp_contracts::meta::{
     Account, AccountKind, AccountScope, AccountState, AccountStore, AccountUpsert, AddressTarget,
     DisabledAccount, ExistingContent, QuotaUsage, account_aliases, account_disabled,
-    disabled_mailbox_changed,
+    account_resource_type, disabled_mailbox_changed,
 };
 use tp_contracts::{AccountId, DomainId, Error, Result, TenantId};
 use uuid::Uuid;
@@ -137,6 +137,8 @@ impl TryFrom<AccountRow> for Account {
             external_id: r.external_id,
             enabled: r.enabled,
             aliases: r.aliases,
+            // Тип ресурса в БД — META-81; до неё ресурс читается помещением (CTR-88).
+            resource_type: account_resource_type(kind, None)?,
             kind,
             hidden_from_gal: r.hidden_from_gal,
         })
@@ -188,6 +190,8 @@ impl PgMeta {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
         }
+        // Тип ресурса (CTR-88) проверяется; хранение — META-81.
+        account_resource_type(data.kind, data.resource_type)?;
         // Шард новой учётной записи — до транзакции каталога (справочник читает свой пул).
         let place = match self.shard_resolver() {
             Some(r) => r.place(tenant).await?,

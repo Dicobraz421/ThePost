@@ -449,6 +449,7 @@ async fn set_kind(accounts: &dyn AccountStore, scope: AccountScope, kind: Accoun
                 aliases: a.aliases,
                 kind,
                 hidden_from_gal: a.hidden_from_gal,
+                resource_type: None,
             },
         )
         .await

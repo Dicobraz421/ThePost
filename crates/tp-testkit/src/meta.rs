@@ -21,7 +21,7 @@ use tp_contracts::meta::{
     ChangeLog, Changes, DisabledAccount, ExistingContent, Flag, FlagOp, Flags, FlagsUpdate,
     Inserted, Mailbox, MailboxStatus, MailboxStore, Message, MessageChange, MessageQuery,
     MessageStore, NewMailbox, NewMessage, QuotaUsage, SpecialUse, account_aliases,
-    disabled_mailbox_changed,
+    account_resource_type, disabled_mailbox_changed,
 };
 use tp_contracts::retention::{PurgeOutcome, Restored};
 use tp_contracts::sharing::{BookingPolicy, Delegate, SharingPolicy};
@@ -730,6 +730,7 @@ impl MemMetadata {
                     aliases: Vec::new(),
                     kind: AccountKind::User,
                     hidden_from_gal: false,
+                    resource_type: None,
                 },
             )
             .await?;
@@ -1225,6 +1226,7 @@ impl AccountStore for MemMetadata {
         if data.login.is_empty() {
             return Err(Error::invalid("пустое имя входа"));
         }
+        let resource_type = account_resource_type(data.kind, data.resource_type)?;
         let now = self.now_unix();
         let mut st = lock(&self.state);
         let in_tenant = |a: &&AccountData| a.account.tenant == tenant;
@@ -1275,6 +1277,7 @@ impl AccountStore for MemMetadata {
             a.aliases = account_aliases(&data.login, data.aliases.iter().map(String::as_str));
             a.kind = data.kind;
             a.hidden_from_gal = data.hidden_from_gal;
+            a.resource_type = resource_type;
             a.login = data.login;
             a.display_name = data.display_name;
             a.external_id = data.external_id.or(a.external_id.take());
@@ -1303,6 +1306,7 @@ impl AccountStore for MemMetadata {
             external_id: data.external_id,
             enabled: data.enabled,
             hidden_from_gal: data.hidden_from_gal,
+            resource_type,
         };
         let mut acc = AccountData {
             account: account.clone(),
@@ -2882,6 +2886,7 @@ mod tests {
             aliases: Vec::new(),
             kind: AccountKind::User,
             hidden_from_gal: false,
+            resource_type: None,
         };
         let t = TenantId::DEFAULT;
         let x = meta
