@@ -425,7 +425,7 @@ fn parse_tokens(src: &str) -> Result<Tokens, String> {
 
 /// Роли truecolor-палитры `base` под бренд и признак «роль — цвет бренда». Набор с цветами `[brand]` (IT TASK)
 /// ничего не меняет. Иначе роли, равные в токенах основному цвету или акценту, получают цвет бренда, рамка
-/// активной панели следует основному, заголовок — акценту; затем по `[[contrast]]` перекрашенные текст и рамки
+/// активной панели следует основному, заголовок и выделение — акценту; затем по `[[contrast]]` перекрашенные текст и рамки
 /// смешиваются с белым (тёмный фон) или чёрным (светлый) до нужного контраста, а текст на фоне бренда
 /// становится белым или чёрным.
 fn branded(base: &[Rgb; N], brand: &Brand) -> ([Rgb; N], [bool; N]) {
@@ -433,8 +433,8 @@ fn branded(base: &[Rgb; N], brand: &Brand) -> ([Rgb; N], [bool; N]) {
     let mut c = *base;
     let mut touched = [false; N];
     for (from, to, derived) in [
-        (t.blue, brand.primary, T::FrameA),
-        (t.pink, brand.accent, T::TitleA),
+        (t.blue, brand.primary, &[T::FrameA][..]),
+        (t.pink, brand.accent, &[T::TitleA, T::Sel][..]),
     ] {
         if from == to {
             continue;
@@ -444,7 +444,9 @@ fn branded(base: &[Rgb; N], brand: &Brand) -> ([Rgb; N], [bool; N]) {
                 (*c, *touched) = (to, true);
             }
         }
-        (c[derived as usize], touched[derived as usize]) = (to, true);
+        for &r in derived {
+            (c[r as usize], touched[r as usize]) = (to, true);
+        }
     }
     let toward = if base[T::Panel as usize].luminance() < 0.5 {
         Rgb::WHITE
@@ -820,9 +822,9 @@ mod tests {
         assert_eq!(branded(&t.light, &b).0, t.light);
         let th = Theme::new(Mode::Dark, b.clone());
         assert_eq!(th.console_palette(), &t.palette16);
-        // Выделение — ровно акцент, текст жирный (решение владельца).
+        // Выделение — #E3107F (белый на нём 4,5:1), текст жирный (решение владельца).
         let sel = th.style(Role::Sel);
-        assert_eq!(sel.bg, Some(Color::Rgb(0xE4, 0x10, 0x7F)));
+        assert_eq!(sel.bg, Some(Color::Rgb(0xE3, 0x10, 0x7F)));
         assert!(sel.add_modifier.contains(Modifier::BOLD));
         assert_eq!(th.style(Role::Fk).bg, Some(Color::Rgb(0x17, 0x7C, 0xAA)));
         // 16 цветов: неактивное выделение — цвет 8, текст 15.
@@ -907,7 +909,7 @@ mod tests {
         drop(guard);
         let s = String::from_utf8(out).expect("utf-8");
         assert!(s.starts_with("\x1b]P00F1317"), "{s:?}");
-        assert!(s.contains("\x1b]P5E4107F"), "{s:?}");
+        assert!(s.contains("\x1b]P5E3107F"), "{s:?}");
         assert!(s.contains("\x1b]PFFFFFFF"), "{s:?}");
         assert!(s.ends_with("\x1b]R"), "{s:?}");
         assert_eq!(s.matches("\x1b]P").count(), 16);
