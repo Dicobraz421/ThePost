@@ -28,6 +28,7 @@ mod propfind;
 mod query;
 mod resource;
 mod schedule;
+mod sharing;
 mod sync;
 
 /// Вошедший пользователь.

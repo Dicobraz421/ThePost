@@ -272,6 +272,9 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
         return Ok(status(StatusCode::PRECONDITION_FAILED));
     };
     let old_ical = old.and_then(|o| ICalendar::parse(&o.body).ok());
+    if let Some(denied) = delegate_denied(cx, target, old_ical.as_ref(), ical.as_ref()) {
+        return Ok(denied);
+    }
     // Участник меняет в своей копии только своё участие и личные свойства (RFC 6638 §3.2.2.1).
     if cx.dav.schedule.is_some()
         && let (Some(o), Some(n)) = (&old_ical, &ical)
@@ -299,24 +302,24 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
             {
                 // Итоги рассылки и раскрытые группы — в объект; одновременная правка клиентом важнее, её не
                 // перезаписываем. Участники групп меняют `Schedule-Tag` — индекс пересчитывается.
-                Some(updated) => {
-                    let opts = cx.dav.cfg.index_options(OffsetDateTime::now_utc());
-                    let idx = index::for_write(&updated, &opts).unwrap_or(idx);
-                    let new_tag = idx.schedule_tag.clone();
-                    let pre = Precondition::IfMatch(put.etag.clone());
-                    let stored = cx
-                        .store()
-                        .put_object(cx.scope, c.id, name, updated.to_string(), idx, pre)
-                        .await
-                        .inspect_err(|e| {
-                            tracing::warn!(error = %e, "DAV PUT: SCHEDULE-STATUS не записан");
-                        })
-                        .is_ok_and(|o| matches!(o, PutOutcome::Stored(_)));
-                    if stored {
+                Some(done) => match rewrite(cx, c.id, name, &done.updated, &put.etag).await {
+                    Rewrite::Stored(new_tag) => {
                         tag = new_tag;
+                        true
                     }
-                    stored
-                }
+                    // Объект изменён во время рассылки (ответ ресурса, DAV-19): итоги — поверх нового тела.
+                    Rewrite::Changed => {
+                        if let Ok(Some(cur)) = cx.store().get_object(cx.scope, c.id, name).await
+                            && let Ok(ical) = ICalendar::parse(&cur.body)
+                            && let Rewrite::Stored(new_tag) =
+                                rewrite(cx, c.id, name, &done.onto(&ical), &cur.etag).await
+                        {
+                            tag = new_tag;
+                        }
+                        true
+                    }
+                    Rewrite::Failed => false,
+                },
                 None => false,
             };
             if !rewritten
@@ -346,6 +349,59 @@ pub(crate) async fn put(cx: &Cx<'_>, target: &Target, body: Body) -> Result<Resp
 }
 
 /// `DELETE` объекта или коллекции.
+/// Итог перезаписи объекта итогами рассылки.
+enum Rewrite {
+    /// Записано: новый `Schedule-Tag`.
+    Stored(Option<String>),
+    /// Объект изменён после записи (ETag не совпал).
+    Changed,
+    /// Сбой хранилища (в журнал).
+    Failed,
+}
+
+/// Перезаписывает объект `name` телом `ical` при ETag `etag`.
+async fn rewrite(
+    cx: &Cx<'_>,
+    coll: CollectionId,
+    name: &str,
+    ical: &ICalendar,
+    etag: &str,
+) -> Rewrite {
+    let opts = cx.dav.cfg.index_options(OffsetDateTime::now_utc());
+    let Ok(idx) = index::for_write(ical, &opts) else {
+        return Rewrite::Failed;
+    };
+    let tag = idx.schedule_tag.clone();
+    let pre = Precondition::IfMatch(etag.to_owned());
+    match cx
+        .store()
+        .put_object(cx.scope, coll, name, ical.to_string(), idx, pre)
+        .await
+    {
+        Ok(PutOutcome::Stored(_)) => Rewrite::Stored(tag),
+        Ok(_) => Rewrite::Changed,
+        Err(e) => {
+            tracing::warn!(error = %e, "DAV PUT: SCHEDULE-STATUS не записан");
+            Rewrite::Failed
+        }
+    }
+}
+
+/// Представитель без права планирования от имени владельца (`schedule`, DAV-18) не меняет встречи владельца: 403
+/// `need-privileges` (`schedule-send`). Свой ресурс и объект без планирования — `None`.
+fn delegate_denied(
+    cx: &Cx<'_>,
+    target: &Target,
+    old: Option<&ICalendar>,
+    new: Option<&ICalendar>,
+) -> Option<Response> {
+    (!cx.own()
+        && cx.dav.schedule.is_some()
+        && !cx.rights.schedule
+        && schedule::touches_scheduling(old, new))
+    .then(|| crate::share::need_privileges(target, cx.login(), "<c:schedule-send/>"))
+}
+
 pub(crate) async fn delete(cx: &Cx<'_>, target: &Target) -> Result<Response> {
     match target {
         Target::Object(kind, _, coll, name) => {
@@ -362,12 +418,16 @@ pub(crate) async fn delete(cx: &Cx<'_>, target: &Target) -> Result<Response> {
             let Some(pre) = schedule_condition(cx, old.as_ref(), pre) else {
                 return Ok(status(StatusCode::PRECONDITION_FAILED));
             };
+            let old_ical = old.as_ref().and_then(|o| ICalendar::parse(&o.body).ok());
+            if let Some(denied) = delegate_denied(cx, target, old_ical.as_ref(), None) {
+                return Ok(denied);
+            }
             Ok(
                 match cx.store().delete_object(cx.scope, c.id, name, pre).await? {
                     DeleteOutcome::Deleted(_) => {
                         // Организатор удалил встречу — CANCEL участникам; участник — REPLY с отказом.
-                        if let Some(ical) = old.and_then(|o| ICalendar::parse(&o.body).ok()) {
-                            schedule::after_change(cx, Some(&ical), None).await;
+                        if let Some(ical) = &old_ical {
+                            schedule::after_change(cx, Some(ical), None).await;
                         }
                         status(StatusCode::NO_CONTENT)
                     }

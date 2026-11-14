@@ -2,9 +2,9 @@
 //!
 //! Вход — `Authorization: Basic` (пароль приложения) или `Bearer` (OAuth 2.0) через [`Authenticator`], как в JMAP;
 //! без данных или с неверными — 401 с `WWW-Authenticate: Basic realm="dav"`. `OPTIONS` отвечает без входа
-//! (клиенты узнают возможности сервера до запроса пароля). Доступ — только к своим ресурсам: логин в URL не
-//! совпадает с вошедшим — 403 (общий доступ — DAV-17). Глобальная адресная книга ([`crate::gal`]) — только чтение:
-//! запись в неё — 403 `need-privileges` до обращения к хранилищу.
+//! (клиенты узнают возможности сервера до запроса пароля). Логин в URL не совпадает с вошедшим — доступ к чужим
+//! ресурсам по правам общего доступа ([`Deps::sharing`], [`crate::share`]); без него — 403. Глобальная адресная книга
+//! ([`crate::gal`]) — только чтение: запись в неё — 403 `need-privileges` до обращения к хранилищу.
 //!
 //! `/.well-known/caldav` и `/.well-known/carddav` перенаправляет на `/dav/` `tp-jmap` (секция `jmap.autoconfig`,
 //! по умолчанию `caldav: /dav/`, `carddav: /dav/`); здесь эти пути не обслуживаются.
@@ -24,18 +24,27 @@ use base64::engine::general_purpose::STANDARD;
 use tp_contracts::Error;
 use tp_contracts::auth::{Authenticator, Credentials, Principal};
 use tp_contracts::dav::DavStore;
-use tp_contracts::meta::AccountScope;
-use tp_contracts::sharing::SharingAuthorizer;
+use tp_contracts::meta::{Account, AccountScope, AccountStore};
+use tp_contracts::sharing::{CollectionRights, SharingAuthorizer};
 
 use crate::config::DavConfig;
 use crate::path::Target;
 use crate::schedule::{self, ScheduleDeps};
+use crate::share::{self, Sharing, SharingStores};
 use crate::xml::{self, Element};
-use crate::{gal, props, resource, sync};
+use crate::{gal, principals, props, proxy, resource, sync};
 
 /// Значение заголовка `DAV` (RFC 4918 §10.1, RFC 3744, RFC 4791 §5.1, RFC 6638 §2, RFC 6352 §6.1, RFC 5689).
 pub const DAV_HEADER: &str =
     "1, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol";
+
+/// Значение заголовка `DAV` с общим доступом ([`Deps::sharing`]): представители (`calendar-proxy`), выдача прав
+/// CalendarServer (`calendarserver-sharing`), поиск принципалов (`calendarserver-principal-search`).
+pub const DAV_HEADER_SHARING: &str = concat!(
+    "1, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol, ",
+    "calendar-proxy, calendarserver-sharing, calendarserver-principal-search, ",
+    "calendarserver-principal-property-search"
+);
 
 /// Методы ресурсов DAV (`Allow`).
 pub const ALLOW: &str =
@@ -69,6 +78,25 @@ pub(crate) struct Dav {
     pub cfg: DavConfig,
     /// Планирование встреч; `None` — объекты хранятся без рассылки iTIP.
     pub schedule: Option<ScheduleDeps>,
+    /// Хранилища общего доступа: выдача прав и представители; `None` — только чтение прав.
+    pub stores: Option<SharingStores>,
+}
+
+impl Dav {
+    /// Общий доступ: права — [`Deps::sharing`], учётные записи — планирования ([`ScheduleDeps::accounts`]); без
+    /// любого из них — `None` (только свои ресурсы).
+    pub(crate) fn sharing(&self) -> Option<Sharing<'_>> {
+        Some(Sharing {
+            authz: self.d.sharing.as_deref()?,
+            accounts: self.schedule.as_ref()?.accounts.as_ref(),
+            stores: self.stores.as_ref(),
+        })
+    }
+
+    /// Учётные записи организации (планирование); без планирования — `None`.
+    pub(crate) fn accounts(&self) -> Option<&dyn AccountStore> {
+        self.schedule.as_ref().map(|s| s.accounts.as_ref())
+    }
 }
 
 impl Dav {
@@ -82,17 +110,39 @@ impl Dav {
 
 /// Маршруты DAV под `/dav/`; TLS, PROXY и слушатель — у вызывающего (`tp-platform`).
 pub fn router(d: Deps, cfg: DavConfig) -> Router {
-    build(d, None, cfg)
+    build(d, None, None, cfg)
 }
 
 /// Маршруты DAV с необязательным планированием встреч `schedule` (RFC 6638: рассылка iTIP после `PUT` и `DELETE`,
 /// запрос занятости). Книгу GAL маршруты читают из хранилища, заполняет её [`crate::gal::sync`].
 pub fn router_with(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> Router {
-    build(d, schedule, cfg)
+    build(d, schedule, None, cfg)
 }
 
-fn build(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> Router {
-    let dav = Arc::new(Dav { d, cfg, schedule });
+/// Маршруты DAV с планированием `schedule` и хранилищами общего доступа `stores` (DAV-17, DAV-18,
+/// [`crate::share`]): права на чужие коллекции — по [`Deps::sharing`] (как у [`router_with`]), а `stores` добавляют
+/// выдачу прав `POST` (`cs:invite`) и состав групп представителей `calendar-proxy` ([`crate::proxy`]).
+pub fn router_shared(
+    d: Deps,
+    schedule: Option<ScheduleDeps>,
+    stores: Option<SharingStores>,
+    cfg: DavConfig,
+) -> Router {
+    build(d, schedule, stores, cfg)
+}
+
+fn build(
+    d: Deps,
+    schedule: Option<ScheduleDeps>,
+    stores: Option<SharingStores>,
+    cfg: DavConfig,
+) -> Router {
+    let dav = Arc::new(Dav {
+        d,
+        cfg,
+        schedule,
+        stores,
+    });
     Router::new()
         .route("/dav", any(handle))
         .route("/dav/", any(handle))
@@ -103,8 +153,14 @@ fn build(d: Deps, schedule: Option<ScheduleDeps>, cfg: DavConfig) -> Router {
 /// Контекст запроса после входа.
 pub(crate) struct Cx<'a> {
     pub dav: &'a Dav,
+    /// Вошедший.
     pub principal: &'a Principal,
+    /// Учётная запись владельца ресурса запроса (логин из URL; без логина — вошедший): с ней работает хранилище.
     pub scope: AccountScope,
+    /// Логин владельца — в ссылках ответов.
+    pub owner: String,
+    /// Права вошедшего на коллекцию запроса ([`share::access`]): свои ресурсы — все.
+    pub rights: CollectionRights,
     pub headers: &'a HeaderMap,
 }
 
@@ -113,27 +169,35 @@ impl Cx<'_> {
         self.dav.d.store.as_ref()
     }
 
-    /// Логин вошедшего (в ссылках ответов).
+    /// Логин владельца ресурса запроса (в ссылках ответов).
     pub(crate) fn login(&self) -> &str {
-        &self.principal.login
+        &self.owner
     }
 
-    /// Адреса календарного пользователя вошедшего ([`crate::itip::address`]; `calendar-user-address-set`, свои
-    /// при разборе участников): с планированием — все адреса учётной записи (`Account::addresses`, основной первым,
-    /// затем псевдонимы), без него или без учётной записи — имя входа, если оно — адрес.
+    /// Ресурс запроса — свой.
+    pub(crate) fn own(&self) -> bool {
+        self.scope.account == self.principal.account
+    }
+
+    /// Учётная запись владельца — из планирования; без него — `None`.
+    pub(crate) async fn account(&self) -> tp_contracts::Result<Option<Account>> {
+        let Some(accounts) = self.dav.accounts() else {
+            return Ok(None);
+        };
+        accounts.get(self.scope.tenant, self.scope.account).await
+    }
+
+    /// Адреса календарного пользователя владельца ([`crate::itip::address`]; `calendar-user-address-set`, свои
+    /// при разборе участников): с учётной записью — все её адреса (`Account::addresses`, основной первым, затем
+    /// псевдонимы), без неё — логин владельца, если он — адрес.
     pub(crate) async fn addresses(&self) -> tp_contracts::Result<Vec<String>> {
-        if let Some(s) = &self.dav.schedule
-            && let Some(account) = s
-                .accounts
-                .get(self.scope.tenant, self.scope.account)
-                .await?
-        {
+        if let Some(account) = self.account().await? {
             let all = account.addresses();
             if !all.is_empty() {
                 return Ok(all);
             }
         }
-        let login = crate::itip::address(&self.principal.login);
+        let login = crate::itip::address(&self.owner);
         Ok(if login.contains('@') {
             vec![login]
         } else {
@@ -175,7 +239,7 @@ pub(crate) async fn read(body: Body, limit: usize) -> Result<Bytes, StatusCode> 
 async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     if parts.method == Method::OPTIONS {
-        return options();
+        return options(dav.sharing().is_some());
     }
     // Адрес клиента соединения ставит сервер HTTP (`tp_platform::service_http`); без соединения — неизвестен.
     let peer = parts
@@ -189,21 +253,19 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
     let Some(target) = Target::parse(parts.uri.path()) else {
         return status(StatusCode::NOT_FOUND);
     };
-    if let Some(login) = target.login()
-        && !login.eq_ignore_ascii_case(&principal.login)
-    {
-        return status(StatusCode::FORBIDDEN);
-    }
+    let method = parts.method.as_str();
+    let access = match share::access(&dav, &principal, &target, method).await {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
     let cx = Cx {
         dav: &dav,
         principal: &principal,
-        scope: AccountScope {
-            tenant: principal.tenant,
-            account: principal.account,
-        },
+        scope: access.scope,
+        owner: access.owner,
+        rights: access.rights,
         headers: &parts.headers,
     };
-    let method = parts.method.as_str();
     if matches!(
         method,
         "PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR"
@@ -218,10 +280,19 @@ async fn handle(State(dav): State<Arc<Dav>>, req: Request) -> Response {
             .await
             .unwrap_or_else(|e| store_error(&e));
     }
+    let principal_target = matches!(
+        target,
+        Target::Principals | Target::Principal(_) | Target::Proxy(..)
+    );
     let result = match method {
         "PROPFIND" => props::propfind(&cx, &target, body).await,
+        "PROPPATCH" if matches!(target, Target::Proxy(..)) => {
+            proxy::proppatch(&cx, &target, body).await
+        }
         "PROPPATCH" => props::proppatch(&cx, &target, body).await,
+        "REPORT" if principal_target => principals::report(&cx, &target, body).await,
         "REPORT" => sync::report(&cx, &target, body).await,
+        "POST" => share::post(&cx, &target, body).await,
         "GET" => resource::get(&cx, &target, false).await,
         "HEAD" => resource::get(&cx, &target, true).await,
         "PUT" => resource::put(&cx, &target, body).await,
@@ -273,10 +344,15 @@ fn auth_error(e: &Error) -> Response {
     resp
 }
 
-fn options() -> Response {
+fn options(sharing: bool) -> Response {
     let mut resp = status(StatusCode::OK);
     let h = resp.headers_mut();
-    h.insert("dav", HeaderValue::from_static(DAV_HEADER));
+    let dav = if sharing {
+        DAV_HEADER_SHARING
+    } else {
+        DAV_HEADER
+    };
+    h.insert("dav", HeaderValue::from_static(dav));
     h.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
     h.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     resp

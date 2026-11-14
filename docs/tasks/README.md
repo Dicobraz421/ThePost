@@ -617,6 +617,9 @@
 | [CTR-86](CTR-86.md) | хранилище уведомлений о доступе (`ShareNotification`) в контракте | contracts | B | contracts-58 | ready | — |
 | [CTR-87](CTR-87.md) | `Directory::contacts_since` без тела по умолчанию | contracts | B | contracts-58 | ready | — |
 | [APP-69](APP-69.md) | представители (`DelegateStore`) в доставке — приглашения «от имени» по `schedule_on_behalf` | app | B | app-66 | ready | — |
+| [DEPS-16](DEPS-16.md) | зависимости подсветки вывода CLI — `anstream`, `anstyle`, `toml` | deps | B | deps-16 | todo | ADM-44 |
+| [ADM-46](ADM-46.md) | подсветка вывода `thepost admin` — таблицы, ошибки, изменения, JSON; модуль стилей `tp-admin-client::style` | admin | A | admin-32 | todo | ADM-44,DES-01,DEPS-16 |
+| [APP-70](APP-70.md) | подсветка справки всех команд `thepost`, цветные `doctor` и `config check` | app | A | app-67 | todo | ADM-46 |
 | [APP-54](APP-54.md) | e2e узла: локальный домен — принятый домен в БД | app | A | app-47 | done | — |
 | [CTR-25](CTR-25.md) | контракты Admin API — политики уровней и журнал аудита | contracts | B | contracts-46 | done | ADM-02,CTR-24,META-22 |
 | [CTR-67](CTR-67.md) | политика организации для SMTP — потребители полей | contracts | B | contracts-46 | done | — |
