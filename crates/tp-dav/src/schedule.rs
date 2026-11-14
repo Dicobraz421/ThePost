@@ -294,15 +294,57 @@ pub fn expand_groups(ical: &mut ICalendar, groups: &[(String, Vec<String>)]) {
     }
 }
 
-/// Рассылка после изменения объекта календаря вошедшим: `old` → `new`. У организатора группы рассылки среди
-/// участников раскрываются в объекте ([`expand_groups`]); самим группам сообщения не отправляются. Возвращает новый
-/// объект с раскрытыми группами и `SCHEDULE-STATUS`, если что-то отправлено (`None` — рассылки не было или объект
-/// удалён).
+/// Итог рассылки для записи в объект: раскрытые группы и `SCHEDULE-STATUS` по адресам.
+pub(crate) struct Dispatched {
+    /// Новый объект с раскрытыми группами и итогами.
+    pub updated: ICalendar,
+    groups: Vec<(String, Vec<String>)>,
+    statuses: Vec<(String, String)>,
+}
+
+impl Dispatched {
+    /// Итоги поверх объекта `current`, изменённого после записи (ответ участника, применённый во время рассылки, —
+    /// например, ресурса, DAV-19): группы раскрываются, `SCHEDULE-STATUS` — кроме уже полученных ответов (`2.x`).
+    pub(crate) fn onto(&self, current: &ICalendar) -> ICalendar {
+        let mut out = current.clone();
+        expand_groups(&mut out, &self.groups);
+        let answered = replied(&out);
+        let statuses: Vec<(String, String)> = self
+            .statuses
+            .iter()
+            .filter(|(a, _)| !answered.contains(a))
+            .cloned()
+            .collect();
+        itip::set_schedule_status(&mut out, &statuses);
+        out
+    }
+}
+
+/// Адреса участников с `SCHEDULE-STATUS` `2.x` (ответ получен).
+fn replied(ical: &ICalendar) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in ical.components.iter().filter(|c| itip::is_sched(c)) {
+        for e in c.properties(&ICalendarProperty::Attendee) {
+            let ok = e.params.iter().any(|p| {
+                p.name == ICalendarParameterName::ScheduleStatus
+                    && p.value.as_text().is_some_and(|v| v.starts_with("2."))
+            });
+            if ok && let Some(a) = itip::entry_address(e) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+/// Рассылка после изменения объекта календаря: `old` → `new`. У организатора группы рассылки среди участников
+/// раскрываются в объекте ([`expand_groups`]); самим группам сообщения не отправляются. Возвращает новый объект с
+/// раскрытыми группами и `SCHEDULE-STATUS`, если что-то отправлено (`None` — рассылки не было или объект удалён).
 pub(crate) async fn after_change(
     cx: &Cx<'_>,
     old: Option<&ICalendar>,
     new: Option<&ICalendar>,
-) -> Option<ICalendar> {
+) -> Option<Dispatched> {
     let deps = cx.dav.schedule.as_ref()?;
     let addresses = match cx.addresses().await {
         Ok(a) => a,
@@ -340,10 +382,50 @@ pub(crate) async fn after_change(
     if messages.is_empty() {
         return None;
     }
+    // Представитель планирует от имени владельца (DAV-18): адрес отправителя — владельца, `SENT-BY` — представителя.
+    if !cx.own() {
+        let by = itip::address(&cx.principal.login);
+        for m in &mut messages {
+            sent_by(&mut m.ical, &from, &by);
+        }
+    }
     let statuses = deps.dispatch(cx.scope, &from, &messages).await;
     let mut updated = new?;
     itip::set_schedule_status(&mut updated, &statuses);
-    Some(updated)
+    Some(Dispatched {
+        updated,
+        groups,
+        statuses,
+    })
+}
+
+/// Изменение объекта затрагивает планирование: прежний `old` или новый `new` — объект планирования (организатор и
+/// участники). Представителю без права планирования от имени владельца такое изменение запрещено (DAV-18).
+pub(crate) fn touches_scheduling(old: Option<&ICalendar>, new: Option<&ICalendar>) -> bool {
+    [old, new]
+        .into_iter()
+        .flatten()
+        .any(|i| itip::meeting(i).is_some_and(|m| m.is_scheduling()))
+}
+
+/// `SENT-BY` (RFC 5545 §3.2.18) представителя `by` у свойства отправителя `from` (`ORGANIZER` или его `ATTENDEE`)
+/// во всех компонентах планирования сообщения.
+pub fn sent_by(ical: &mut ICalendar, from: &str, by: &str) {
+    for c in ical.components.iter_mut().filter(|c| itip::is_sched(c)) {
+        for e in c.entries.iter_mut().filter(|e| {
+            matches!(
+                e.name,
+                ICalendarProperty::Organizer | ICalendarProperty::Attendee
+            ) && itip::entry_address(e).as_deref() == Some(from)
+        }) {
+            e.params
+                .retain(|p| p.name != ICalendarParameterName::SentBy);
+            e.params
+                .push(ICalendarParameter::sent_by(Uri::Location(format!(
+                    "mailto:{by}"
+                ))));
+        }
+    }
 }
 
 /// Объекты планирования календаря `coll` (с `Schedule-Tag`) — для рассылки после удаления календаря целиком

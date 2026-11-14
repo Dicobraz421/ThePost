@@ -16,6 +16,9 @@
 //! участника события и только организатору; меньший `SEQUENCE` — устаревшее сообщение. Отказ — `Ok(Ignored)` с причиной без содержимого.
 //! Повторная доставка ничего не меняет. Запись — с условием по ETag: одновременное изменение — повтор
 //! (`dav.schedule_write_attempts`), затем `Unavailable`.
+//!
+//! Приглашение ресурсу (переговорной) при [`ItipInbox::with_booking`] — решение по правилам бронирования и ответ
+//! организатору ([`crate::booking`], DAV-19).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,9 +34,13 @@ use tp_contracts::dav::{
     default_of, valid_name,
 };
 use tp_contracts::meta::AccountScope;
-use tp_contracts::schedule::{InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome};
+use tp_contracts::schedule::{
+    InboxMessage, ItipDelivery, ItipMessage, ItipMethod, ItipOutcome, ItipOutgoing, ItipSource,
+};
+use tp_contracts::sharing::BookingDecision;
 use tp_contracts::{Error, Result};
 
+use crate::booking::{self, Booking, BookingDeps};
 use crate::config::DavConfig;
 use crate::index;
 use crate::itip::{self, Itip};
@@ -44,6 +51,8 @@ use crate::props;
 pub struct ItipInbox {
     store: Arc<dyn DavStore>,
     cfg: DavConfig,
+    /// Бронирование ресурсов; `None` — приглашения ресурсам принимаются как обычные.
+    booking: Option<Arc<BookingDeps>>,
 }
 
 impl std::fmt::Debug for ItipInbox {
@@ -55,7 +64,18 @@ impl std::fmt::Debug for ItipInbox {
 impl ItipInbox {
     /// Приём в хранилище `store` с настройками секции `dav`.
     pub fn new(store: Arc<dyn DavStore>, cfg: DavConfig) -> Self {
-        Self { store, cfg }
+        Self {
+            store,
+            cfg,
+            booking: None,
+        }
+    }
+
+    /// С бронированием ресурсов по правилам ([`crate::booking`], DAV-19): приглашение ресурсу принимается,
+    /// отклоняется или остаётся под вопросом, организатору уходит ответ.
+    pub fn with_booking(mut self, deps: BookingDeps) -> Self {
+        self.booking = Some(Arc::new(deps));
+        self
     }
 
     /// Шаг очистки роли maintenance (DAV-32; подключение — APP-53): удаляет из входящих планирования учётной записи
@@ -306,6 +326,7 @@ impl ItipInbox {
         }
     }
 
+    /// `forced` — свой `PARTSTAT` вместо прежнего или `NEEDS-ACTION` (решение ресурса).
     async fn request(
         &self,
         scope: AccountScope,
@@ -313,6 +334,7 @@ impl ItipInbox {
         to: &str,
         existing: Option<&DavObject>,
         attempt: usize,
+        forced: Option<&ICalendarParticipationStatus>,
     ) -> Result<Step> {
         let old = match existing {
             None => None,
@@ -369,7 +391,10 @@ impl ItipInbox {
                 })
             };
             if let Some(e) = itip::attendee_entry_mut(&mut new.components[i], to) {
-                let value = kept.unwrap_or_else(needs_action);
+                let value = forced
+                    .map(|ps| ICalendarParameter::partstat(ps.clone()))
+                    .or(kept)
+                    .unwrap_or_else(needs_action);
                 itip::replace_param(e, &ICalendarParameterName::Partstat, Some(value));
             }
         }
@@ -573,6 +598,7 @@ impl ItipInbox {
         from: &str,
         to: &str,
         attempt: usize,
+        forced: Option<&ICalendarParticipationStatus>,
     ) -> Result<Step> {
         let scope = msg.recipient;
         let auto = matches!(
@@ -585,7 +611,7 @@ impl ItipInbox {
         let existing = find_uid(self.store.as_ref(), scope, &it.meeting.uid).await?;
         let step = match it.method {
             ItipMethod::Request => {
-                self.request(scope, it, to, existing.as_ref(), attempt)
+                self.request(scope, it, to, existing.as_ref(), attempt, forced)
                     .await?
             }
             ItipMethod::Reply => self.reply(msg, it, from, to, existing.as_ref()).await?,
@@ -631,14 +657,94 @@ impl ItipDelivery for ItipInbox {
         if !sender_ok {
             return refuse("отправитель не организатор и не участник");
         }
+        let booked = match (&self.booking, it.method) {
+            (Some(b), ItipMethod::Request) => {
+                b.decide(self.store.as_ref(), &self.cfg, msg, &it, &to)
+                    .await?
+            }
+            _ => None,
+        };
+        if let Some(b) = &booked
+            && matches!(b.decision, BookingDecision::Decline(_))
+        {
+            self.answer(msg, &it, &to, b).await;
+            return Ok(ItipOutcome::Applied);
+        }
+        let forced = booked.as_ref().map(Booking::partstat);
         for attempt in 0..self.cfg.schedule_write_attempts.max(1) {
-            match self.apply(msg, &it, &from, &to, attempt).await? {
+            match self
+                .apply(msg, &it, &from, &to, attempt, forced.as_ref())
+                .await?
+            {
                 Step::Done(ItipOutcome::Ignored(reason)) => return refuse(&reason),
-                Step::Done(outcome) => return Ok(outcome),
+                Step::Done(outcome) => {
+                    if let Some(b) = &booked {
+                        self.answer(msg, &it, &to, b).await;
+                    }
+                    return Ok(outcome);
+                }
                 Step::Inboxed => return Ok(ItipOutcome::Applied),
                 Step::Retry => {}
             }
         }
         Err(Error::UNAVAILABLE)
+    }
+}
+
+impl ItipInbox {
+    /// Ответ ресурса `to` организатору приглашения `it` по решению `b` ([`crate::booking`]): учётной записи
+    /// организации — в календарь, внешнему — письмом iMIP. Сбой ответа — в журнал, решение остаётся.
+    async fn answer(&self, msg: &ItipMessage, it: &Itip, to: &str, b: &Booking) {
+        let Some(deps) = &self.booking else {
+            return;
+        };
+        let Some(organizer) = it.meeting.organizer.clone() else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc();
+        let Some(mut reply) = itip::reply(&it.ical, to, Some(b.partstat()), now) else {
+            return;
+        };
+        if let BookingDecision::Decline(reason) = b.decision {
+            for c in reply.components.iter_mut().filter(|c| itip::is_sched(c)) {
+                c.add_property(ICalendarProperty::Comment, booking::reason_text(reason));
+            }
+        }
+        let ics = reply.to_string();
+        let result = match b.organizer {
+            Some(account) => {
+                let m = ItipMessage {
+                    recipient: AccountScope {
+                        tenant: msg.recipient.tenant,
+                        account,
+                    },
+                    to: organizer,
+                    from: to.to_owned(),
+                    method: ItipMethod::Reply,
+                    ics,
+                    source: ItipSource::Internal,
+                };
+                self.deliver(&m).await.map(|_| ())
+            }
+            None => match &deps.sender {
+                Some(sender) => {
+                    let (subject, text) = crate::imip::describe(ItipMethod::Reply, &reply);
+                    let mail = ItipOutgoing {
+                        sender: msg.recipient,
+                        from: to.to_owned(),
+                        to: vec![organizer],
+                        method: ItipMethod::Reply,
+                        ics,
+                        subject,
+                        text,
+                    };
+                    sender.send(&mail).await.map(|_| ())
+                }
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "iTIP: ответ ресурса организатору не отправлен");
+        }
     }
 }
