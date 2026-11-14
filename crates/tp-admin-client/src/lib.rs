@@ -4,7 +4,9 @@
 //! - Вход — `Authorization: Bearer`: сессия Admin API (`tps_…`, [`Client::login`] — вход по паролю,
 //!   `POST /api/v1/session`, решение 117) или токен OIDC ([`oidc::DeviceLogin`] — вход с устройства, RFC 8628).
 //!   Одноразовый токен `admin init` (`tpa_…`) клиент не принимает ([`token`]).
-//! - Отказ Admin API — [`Error::Api`]: код и сообщение из problem details (RFC 9457).
+//! - Отказ Admin API — [`Error::Api`]: код и сообщение из problem details (RFC 9457); подсказка — отдельной
+//!   строкой «подсказка: …» ([`Error::hint`]).
+//! - Подсветка вывода CLI — [`style`] (решение 120): роли и знаки из `design/tokens.toml`.
 //! - Листание — по ссылке `Link: <…>; rel="next"` (RFC 8288, [`Client::call_page`], [`Client::pages`]); у журналов
 //!   курсор `next` — поле ответа tp-admin.
 //!
@@ -15,6 +17,7 @@
 
 pub mod oidc;
 pub mod ops;
+pub mod style;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -60,6 +63,27 @@ pub enum Error {
     /// Прочее: адрес, настройки, сеть, ответ не по спецификации, поставщик OIDC.
     #[error("{0}")]
     Client(String),
+}
+
+impl Error {
+    /// Отказ Admin API с кодом `status` — с подсказкой `hint` (обычно команда) отдельной строкой; прочее — как есть.
+    pub fn hint(self, status: u16, hint: impl AsRef<str>) -> Self {
+        match self {
+            Self::Api {
+                status: s,
+                problem,
+                mut message,
+            } if s == status => {
+                message.push_str(&format!("\n{} {}", style::HINT, hint.as_ref()));
+                Self::Api {
+                    status: s,
+                    problem,
+                    message,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 impl From<String> for Error {
@@ -404,21 +428,23 @@ fn problem(op: Op, status: StatusCode, body: &[u8]) -> Error {
         }
     }
     let hint = match (op == SESSION, status) {
-        (true, StatusCode::UNAUTHORIZED) => {
-            " (неверное имя входа или пароль, либо вход временно заблокирован после неудачных попыток)"
-        }
+        (true, StatusCode::UNAUTHORIZED) => Some(
+            "неверное имя входа или пароль, либо вход временно заблокирован после неудачных попыток",
+        ),
         (true, StatusCode::FORBIDDEN) => {
-            " (у учётной записи нет ролей администрирования: admin.roles)"
+            Some("у учётной записи нет ролей администрирования: admin.roles")
         }
-        (true, StatusCode::NOT_FOUND) => {
-            " (вход по паролю выключен: admin.password_login; вход через OIDC — thepost admin login --oidc)"
-        }
-        (false, StatusCode::UNAUTHORIZED) => {
-            " (токен не принят: сессия истекла или токен OIDC неверен; новая сессия — thepost admin login)"
-        }
-        _ => "",
+        (true, StatusCode::NOT_FOUND) => Some(
+            "вход по паролю выключен: admin.password_login; вход через OIDC — thepost admin login --oidc",
+        ),
+        (false, StatusCode::UNAUTHORIZED) => Some(
+            "токен не принят: сессия истекла или токен OIDC неверен; новая сессия — thepost admin login",
+        ),
+        _ => None,
     };
-    message.push_str(hint);
+    if let Some(hint) = hint {
+        message.push_str(&format!("\n{} {hint}", style::HINT));
+    }
     Error::Api {
         status: status.as_u16(),
         problem: p,
@@ -533,12 +559,20 @@ mod tests {
         };
         assert_eq!(status, 401);
         assert_eq!(p.and_then(|p| p.detail).as_deref(), Some("bad credentials"));
-        assert!(
-            message.starts_with("POST /api/v1/session: 401 Unauthorized: bad credentials")
-                && message.contains("неверное имя входа или пароль"),
-            "{message}"
+        assert_eq!(
+            message,
+            "POST /api/v1/session: 401 Unauthorized: bad credentials\n\
+             подсказка: неверное имя входа или пароль, либо вход временно заблокирован после неудачных попыток"
         );
         let e = problem(WHOAMI, StatusCode::BAD_GATEWAY, b"<html>");
+        assert_eq!(e.to_string(), "GET /api/v1/whoami: 502 Bad Gateway");
+        // Подсказка — только отказу с тем же кодом.
+        let e = problem(WHOAMI, StatusCode::CONFLICT, b"").hint(409, "thepost admin whoami");
+        assert_eq!(
+            e.to_string(),
+            "GET /api/v1/whoami: 409 Conflict\nподсказка: thepost admin whoami"
+        );
+        let e = problem(WHOAMI, StatusCode::BAD_GATEWAY, b"").hint(409, "x");
         assert_eq!(e.to_string(), "GET /api/v1/whoami: 502 Bad Gateway");
     }
 }
