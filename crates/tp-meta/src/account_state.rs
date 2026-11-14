@@ -58,7 +58,7 @@ struct StateRow {
     removing: bool,
 }
 
-const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, disabled_until, removing";
+const STATE_COLUMNS: &str = "account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal, resource_type, disabled_until, removing";
 
 fn state((until, removing): (Option<OffsetDateTime>, bool)) -> AccountState {
     match until {
@@ -418,9 +418,10 @@ async fn swap_catalog(
     let ident = t.account;
     let row: AccountRow = sqlx::query_as(
         "UPDATE accounts SET domain_id = $3, login = $4, display_name = $5, external_id = $6, enabled = $7,
-                             aliases = $8, kind = $9, disabled_until = NULL, updated_at = now()
+                             aliases = $8, kind = $9, resource_type = $10, disabled_until = NULL, updated_at = now()
          WHERE tenant_id = $1 AND account_id = $2
-         RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal",
+         RETURNING account_id, tenant_id, domain_id, login, display_name, external_id, enabled, aliases, kind, hidden_from_gal,
+                   resource_type",
     )
     .bind(tu)
     .bind(du)
@@ -431,6 +432,7 @@ async fn swap_catalog(
     .bind(ident.enabled)
     .bind(&ident.aliases)
     .bind(&ident.kind)
+    .bind(&ident.resource_type)
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
