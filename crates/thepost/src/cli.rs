@@ -4,15 +4,19 @@
 //!
 //! Справка, `doctor` и `config check` — в цвете по ролям [`tp_admin_client::style`] (APP-70, решение 120):
 //! `--color auto|always|never`, как у `thepost admin`; данные — в stdout, ошибки — в stderr.
+//!
+//! `thepost admin tui` на самом узле правит его config.yaml (APP-80): схема — как у `thepost config schema`, YAML —
+//! разбором загрузчика ([`tp_platform::config::yaml_to_json`]), проверка — [`config_check`].
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tp_admin_client::style::{self, ColorChoice, Role, State, Theme};
 use tp_contracts::Error;
 use tp_contracts::role::CancellationToken;
-use tp_platform::config::ENV_CONFIG_PATH;
+use tp_platform::config::{ENV_CONFIG_PATH, json_to_yaml, yaml_to_json};
 
 use crate::admin_cli::ColorArg;
 use crate::{admin_cli, doctor, help, local_admin, openapi, secrets, sections, serve, verify};
@@ -105,7 +109,13 @@ pub enum AdminAction {
     },
     /// Текстовый интерфейс администратора (TUI): те же ключи подключения, что у `thepost admin`
     /// (`--url`, `--ca-file`, `--insecure`, `--token` или THEPOST_ADMIN_TOKEN); выход — F10.
-    Tui,
+    /// На узле с config.yaml (`--config`) — и правка его конфигурации.
+    Tui {
+        /// Тема: auto, dark, light, 256, 16, mono (по умолчанию — THEPOST_TUI_THEME, иначе auto: по NO_COLOR,
+        /// COLORTERM, TERM).
+        #[arg(long, value_parser = ["auto", "dark", "light", "256", "16", "mono"])]
+        theme: Option<String>,
+    },
     /// Команды Admin API: `thepost admin <ресурс> <действие>`.
     #[command(flatten)]
     Api(admin_cli::ApiAction),
@@ -212,10 +222,7 @@ pub fn config_check(path: &Path, out: Theme, err: Theme) -> (i32, String) {
             (0, text)
         }
         Err(e) => {
-            let msg = match e {
-                Error::Invalid(m) => m,
-                other => other.to_string(),
-            };
+            let msg = error_text(&e);
             let mut text = format!(
                 "{}: {}\n",
                 err.state(State::Err, "ошибки конфигурации"),
@@ -323,8 +330,8 @@ pub async fn run(cli: Cli) -> i32 {
         } => admin_cli::command(&path, api, action).await,
         Command::Admin {
             api,
-            action: AdminAction::Tui,
-        } => admin_tui(api).await,
+            action: AdminAction::Tui { theme },
+        } => admin_tui(&path, api, theme).await,
         Command::Serve => serve_until_signal(path).await,
         Command::SearchExtract => {
             // Подпроцесс запускается до рантайма (`main`): сюда приходит только вызов из кода.
@@ -334,9 +341,10 @@ pub async fn run(cli: Cli) -> i32 {
     }
 }
 
-/// `thepost admin tui`: подключение — те же ключи, что у остальных команд `thepost admin`.
-async fn admin_tui(api: admin_cli::ApiArgs) -> i32 {
-    match tp_tui::run(tui_connect(api)).await {
+/// `thepost admin tui`: подключение — те же ключи, что у остальных команд `thepost admin`; `config` — config.yaml
+/// узла, тема — `--theme`.
+async fn admin_tui(config: &Path, api: admin_cli::ApiArgs, theme: Option<String>) -> i32 {
+    match tp_tui::run(tui_connect(config, api, theme)).await {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("thepost: admin tui: {e}");
@@ -345,8 +353,9 @@ async fn admin_tui(api: admin_cli::ApiArgs) -> i32 {
     }
 }
 
-/// Ключи `thepost admin` → подключение текстового интерфейса (токен и адрес без ключей — из THEPOST_ADMIN_*).
-fn tui_connect(api: admin_cli::ApiArgs) -> tp_tui::Connect {
+/// Ключи `thepost admin` → подключение текстового интерфейса (токен и адрес без ключей — из THEPOST_ADMIN_*);
+/// есть файл `config` — раздел «Конфигурация узла» правит его; `theme` нет — THEPOST_TUI_THEME (решает tp-tui).
+fn tui_connect(config: &Path, api: admin_cli::ApiArgs, theme: Option<String>) -> tp_tui::Connect {
     tp_tui::Connect {
         url: api.url,
         token: api.token,
@@ -355,7 +364,74 @@ fn tui_connect(api: admin_cli::ApiArgs) -> tp_tui::Connect {
             insecure: api.insecure,
             timeout: std::time::Duration::from_secs(api.timeout),
         },
+        node: node_config(config),
+        theme,
         ..tp_tui::Connect::default()
+    }
+}
+
+/// Конфигурация узла для текстового интерфейса: файла нет (интерфейс запущен не на узле) — `None`.
+fn node_config(path: &Path) -> Option<tp_tui::NodeConfig> {
+    if !path.is_file() {
+        return None;
+    }
+    match sections::registry() {
+        Ok(r) => Some(tp_tui::NodeConfig {
+            path: path.to_owned(),
+            host: Arc::new(NodeHost {
+                schema: r.schema().as_value().clone(),
+            }),
+        }),
+        Err(e) => {
+            eprintln!("thepost: admin tui: схема конфигурации: {}", error_text(&e));
+            None
+        }
+    }
+}
+
+/// Схема, YAML и проверка config.yaml для текстового интерфейса — те же, что у `thepost config schema|check`.
+#[derive(Debug)]
+struct NodeHost {
+    /// JSON Schema config.yaml.
+    schema: serde_json::Value,
+}
+
+impl tp_tui::ConfigHost for NodeHost {
+    fn schema(&self) -> serde_json::Value {
+        self.schema.clone()
+    }
+
+    fn parse(&self, text: &str) -> Result<serde_json::Value, String> {
+        yaml_to_json(text).map_err(|e| error_text(&e))
+    }
+
+    fn render(&self, doc: &serde_json::Value) -> Result<String, String> {
+        json_to_yaml(doc).map_err(|e| error_text(&e))
+    }
+
+    /// `thepost config check` без цвета; строки ошибок — без знака ошибки: `путь.параметра: причина`.
+    fn check(&self, path: &Path) -> Result<(), String> {
+        let (code, text) = config_check(path, Theme::PLAIN, Theme::PLAIN);
+        if code == 0 {
+            return Ok(());
+        }
+        let sign = State::Err.sign();
+        Err(text
+            .lines()
+            .map(|l| {
+                let l = l.trim();
+                l.strip_prefix(sign).map_or(l, str::trim_start)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+/// Текст ошибки для человека: `Invalid` — само сообщение.
+fn error_text(e: &Error) -> String {
+    match e {
+        Error::Invalid(m) => m.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -396,10 +472,7 @@ async fn serve_until_signal(path: PathBuf) -> i32 {
 }
 
 fn fail(e: &Error) -> i32 {
-    match e {
-        Error::Invalid(m) => eprintln!("thepost: {m}"),
-        other => eprintln!("thepost: {other}"),
-    }
+    eprintln!("thepost: {}", error_text(e));
     1
 }
 
@@ -457,12 +530,15 @@ mod tests {
         .expect("admin tui");
         let Command::Admin {
             api,
-            action: AdminAction::Tui,
+            action: AdminAction::Tui { theme },
         } = cli.command
         else {
             panic!("ждали admin tui");
         };
-        let connect = tui_connect(api);
+        assert_eq!(theme, None);
+        let connect = tui_connect(Path::new("/нет/config.yaml"), api, theme);
+        assert!(connect.node.is_none(), "файла нет — интерфейс не на узле");
+        assert_eq!(connect.theme, None);
         assert_eq!(connect.url.as_deref(), Some("https://127.0.0.1:8443"));
         assert_eq!(connect.token.as_deref(), Some("tps_x"));
         assert!(connect.options.insecure);
@@ -474,6 +550,106 @@ mod tests {
         let cli =
             try_parse_from(["thepost", tp_search::extract::WORKER_SUBCOMMAND]).expect("worker");
         assert!(matches!(cli.command, Command::SearchExtract));
+    }
+
+    /// `--theme` — в `Connect.theme`; неизвестная тема — ошибка разбора.
+    #[test]
+    fn tui_theme_flag() {
+        let cli = try_parse_from(["thepost", "admin", "tui", "--theme", "mono"]).expect("theme");
+        let Command::Admin {
+            api,
+            action: AdminAction::Tui { theme },
+        } = cli.command
+        else {
+            panic!("ждали admin tui");
+        };
+        assert_eq!(theme.as_deref(), Some("mono"));
+        let connect = tui_connect(Path::new("/нет/config.yaml"), api, theme);
+        assert_eq!(connect.theme.as_deref(), Some("mono"));
+        for t in ["auto", "dark", "light", "256", "16"] {
+            assert!(
+                try_parse_from(["thepost", "admin", "tui", "--theme", t]).is_ok(),
+                "{t}"
+            );
+        }
+        let err = try_parse_from(["thepost", "admin", "tui", "--theme", "neon"]).expect_err("neon");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        let help = try_parse_from(["thepost", "admin", "tui", "--help"]).expect_err("--help");
+        assert!(help.to_string().contains("THEPOST_TUI_THEME"));
+    }
+
+    /// `ConfigHost` узла на временном config.yaml: схема, YAML туда-обратно, проверка; запись через tp-tui —
+    /// неверный параметр отвергается у поля, верный записывается с резервной копией.
+    #[test]
+    fn tui_node_config_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        let base = "# Узел 1\ndomain: example.org\nprofile: dev\ndatabase:\n  url: postgres://thepost@db/thepost?sslmode=disable\n  password: { secret: \"thepost/db#password\" }\n  tls: { allow_plaintext: true }\nblob:\n  url: file:///var/lib/thepost/blob\n";
+        std::fs::write(&path, base).expect("write");
+        let api = match try_parse_from(["thepost", "admin", "tui"])
+            .expect("tui")
+            .command
+        {
+            Command::Admin { api, .. } => api,
+            other => panic!("ждали admin tui: {other:?}"),
+        };
+        let node = tui_connect(&path, api, None)
+            .node
+            .expect("файл есть — конфигурация узла");
+        assert_eq!(node.path, path);
+        let host = &node.host;
+
+        let schema = host.schema();
+        assert!(schema["properties"]["telemetry"].is_object(), "{schema}");
+        assert!(schema.get("$defs").is_some());
+
+        let doc = host.parse(base).expect("parse");
+        assert_eq!(doc["domain"], "example.org");
+        assert_eq!(doc["database"]["password"]["secret"], "thepost/db#password");
+        let text = host.render(&doc).expect("render");
+        assert_eq!(host.parse(&text).expect("parse"), doc);
+        let Err(e) = host.parse("domain: [x\n") else {
+            panic!("ждали ошибку разбора");
+        };
+        assert!(e.contains("line"), "{e}");
+
+        assert_eq!(host.check(&path), Ok(()));
+        let bad = dir.path().join("bad.yaml");
+        std::fs::write(&bad, format!("{base}telemetry:\n  log_levl: info\n")).expect("write");
+        let e = host.check(&bad).expect_err("неизвестный параметр");
+        assert!(
+            e.lines().any(|l| l.starts_with("telemetry.log_levl: ")),
+            "{e}"
+        );
+
+        // Запись через tp-tui: неизвестный параметр — ошибка у поля, файл тот же.
+        let file = tp_tui::node::load(&node).expect("load");
+        assert_eq!(file.doc, doc);
+        let key = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let err = tp_tui::node::save(
+            &node,
+            &file.text,
+            &key(&["telemetry", "log_levl"]),
+            Some(serde_json::json!("info")),
+        )
+        .expect_err("отказ");
+        assert!(err.at_field, "{err:?}");
+        assert!(err.message.starts_with("telemetry.log_levl:"), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), base);
+        // Верное значение: записано, заголовок-комментарий сохранён, прежний файл — в .bak.
+        let saved = tp_tui::node::save(
+            &node,
+            &file.text,
+            &key(&["domain"]),
+            Some(serde_json::json!("example.com")),
+        )
+        .expect("запись");
+        assert_eq!(std::fs::read_to_string(&saved.backup).expect("bak"), base);
+        let new = tp_tui::node::load(&node).expect("load");
+        assert!(new.text.starts_with("# Узел 1\n"), "{}", new.text);
+        assert_eq!(new.doc["domain"], "example.com");
+        let (code, out) = config_check(&path, Theme::PLAIN, Theme::PLAIN);
+        assert_eq!(code, 0, "{out}");
     }
 
     #[test]
